@@ -296,6 +296,9 @@ def main() -> None:
         db_path=args.db,
     )
 
+    config.apply_provider_defaults()
+    logger.info("Detected provider: %s", config.provider)
+
     admission = AdmissionController(config.max_concurrency)
     rate_limiter = RateLimiter()
     backpressure = BackpressureController(config.max_concurrency)

@@ -1,12 +1,25 @@
 [project]
-name = "hivemind"
+name = "hivemind-scheduler"
 version = "0.1.0"
-description = "OS-inspired scheduler for concurrent LLM coding agents. Local API proxy with admission control, rate limit awareness, backpressure, and token budgets."
+description = "OS-inspired scheduler for concurrent LLM coding agents. Transparent API proxy with admission control, rate limit awareness, AIMD backpressure, token budgets, and priority scheduling."
 readme = "README.md"
+license = {text = "MIT"}
 authors = [
     { name = "Jay", email = "jay@sperixlabs.org" }
 ]
 requires-python = ">=3.11"
+keywords = ["llm", "agents", "scheduler", "proxy", "rate-limit", "mcp", "anthropic", "openai"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: System :: Networking",
+]
 dependencies = [
     "mcp>=1.0.0",
     "httpx>=0.28.0",
@@ -16,6 +29,11 @@ dependencies = [
     "rich>=13.0.0",
     "tomli>=2.0.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/sperixlabs/hivemind"
+Repository = "https://github.com/sperixlabs/hivemind"
+Issues = "https://github.com/sperixlabs/hivemind/issues"
 
 [project.scripts]
 hivemind = "hivemind.__main__:main"
@@ -35,13 +53,20 @@ distributed = [
     "redis>=5.0.0",
 ]
 all = [
-    "hivemind[tokenizer,distributed]",
+    "hivemind-scheduler[tokenizer,distributed]",
 ]
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.hatch.build.targets.wheel]
+packages = ["src/hivemind"]
+
 [tool.ruff]
 target-version = "py311"
 line-length = 120
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

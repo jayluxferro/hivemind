@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 import uvicorn
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
+from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
 logger = logging.getLogger(__name__)
@@ -202,12 +202,51 @@ class MockAPIServer:
             remaining_tokens = max(0, self.config.tokens_per_minute - self._rate_state.token_count)
             reset_time = self._rate_state.window_start + self._rate_state.window_seconds
 
+            msg_id = f"msg_{random.randint(10000, 99999)}"
+            model = req_data.get("model", "claude-sonnet-4-20250514")
+            rl_headers = {
+                "anthropic-ratelimit-requests-limit": str(self.config.requests_per_minute),
+                "anthropic-ratelimit-requests-remaining": str(remaining_requests),
+                "anthropic-ratelimit-requests-reset": str(round(reset_time, 1)),
+                "anthropic-ratelimit-tokens-limit": str(self.config.tokens_per_minute),
+                "anthropic-ratelimit-tokens-remaining": str(remaining_tokens),
+                "anthropic-ratelimit-tokens-reset": str(round(reset_time, 1)),
+            }
+
+            # Streaming response
+            if req_data.get("stream", False):
+                async def sse_generator():
+                    # message_start with input usage
+                    yield f"event: message_start\ndata: {json.dumps({'type': 'message_start', 'message': {'id': msg_id, 'type': 'message', 'role': 'assistant', 'model': model, 'usage': {'input_tokens': input_tokens}}})}\n\n"
+                    # content_block_start
+                    yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+                    # content deltas — split output into chunks
+                    text = "x " * output_tokens
+                    chunk_size = max(1, len(text) // 5)
+                    for i in range(0, len(text), chunk_size):
+                        chunk_text = text[i:i + chunk_size]
+                        yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': chunk_text}})}\n\n"
+                        await asyncio.sleep(0.01)
+                    # content_block_stop
+                    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
+                    # message_delta with output usage
+                    yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'end_turn'}, 'usage': {'output_tokens': output_tokens}})}\n\n"
+                    # message_stop
+                    yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
+
+                return StreamingResponse(
+                    sse_generator(),
+                    media_type="text/event-stream",
+                    headers={**rl_headers, "cache-control": "no-cache"},
+                )
+
+            # Non-streaming response
             response_data = {
-                "id": f"msg_{random.randint(10000, 99999)}",
+                "id": msg_id,
                 "type": "message",
                 "role": "assistant",
                 "content": [{"type": "text", "text": "x " * output_tokens}],
-                "model": req_data.get("model", "claude-sonnet-4-20250514"),
+                "model": model,
                 "stop_reason": "end_turn",
                 "usage": {
                     "input_tokens": input_tokens,
@@ -215,17 +254,7 @@ class MockAPIServer:
                 },
             }
 
-            return JSONResponse(
-                response_data,
-                headers={
-                    "anthropic-ratelimit-requests-limit": str(self.config.requests_per_minute),
-                    "anthropic-ratelimit-requests-remaining": str(remaining_requests),
-                    "anthropic-ratelimit-requests-reset": str(round(reset_time, 1)),
-                    "anthropic-ratelimit-tokens-limit": str(self.config.tokens_per_minute),
-                    "anthropic-ratelimit-tokens-remaining": str(remaining_tokens),
-                    "anthropic-ratelimit-tokens-reset": str(round(reset_time, 1)),
-                },
-            )
+            return JSONResponse(response_data, headers=rl_headers)
 
         finally:
             async with self._lock:

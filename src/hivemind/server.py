@@ -36,6 +36,7 @@ class HiveMindServer:
 
     def __init__(self, config: HiveMindConfig | None = None) -> None:
         self.config = config or HiveMindConfig()
+        self.config.apply_provider_defaults()
 
         # Core components
         self.db = Database(self.config.db_path)

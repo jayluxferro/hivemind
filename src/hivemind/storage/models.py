@@ -168,12 +168,37 @@ class HiveMindConfig:
     # Storage
     db_path: str = "hivemind.db"
 
+    # Provider (auto-detected from upstream_url if not set)
+    provider: str | None = None  # anthropic, openai, ollama, etc.
+
     # MCP
     mcp_host: str = "127.0.0.1"
     mcp_port: int = 8766
 
+    def apply_provider_defaults(self) -> None:
+        """Auto-detect provider from upstream URL and apply its defaults.
+
+        Only sets values that are still at their generic defaults,
+        so explicit user config always wins.
+        """
+        from ..scheduler.providers import detect_provider
+
+        profile = detect_provider(self.upstream_url)
+        self.provider = profile.provider_type.value
+
+        # Only override defaults — if the user explicitly set these, leave them
+        if self.max_concurrency == 5:
+            self.max_concurrency = profile.default_max_concurrent
+        if self.latency_target_ms == 2000.0:
+            self.latency_target_ms = profile.latency_target_ms
+        if self.aimd_additive_increase == 0.5:
+            self.aimd_additive_increase = profile.aimd_additive_increase
+        if self.aimd_multiplicative_decrease == 0.5:
+            self.aimd_multiplicative_decrease = profile.aimd_multiplicative_decrease
+
     def to_dict(self) -> dict[str, Any]:
         return {
+            "provider": self.provider,
             "proxy_host": self.proxy_host,
             "proxy_port": self.proxy_port,
             "upstream_url": self.upstream_url,

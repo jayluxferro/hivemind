@@ -1,51 +1,107 @@
 # HiveMind
 
-OS-inspired scheduler for concurrent LLM coding agents. A transparent HTTP proxy with admission control, rate limit awareness, AIMD backpressure, token budgets, and priority scheduling.
+[![CI](https://github.com/sperixlabs/hivemind/actions/workflows/ci.yml/badge.svg)](https://github.com/sperixlabs/hivemind/actions/workflows/ci.yml)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+
+**OS-inspired scheduler for concurrent LLM coding agents.**
+
+When you spawn 10 agents, they shouldn't all stampede the API at once. HiveMind sits between the agents and the LLM provider as a transparent HTTP proxy, managing concurrency, rate limits, priority, and resource allocation — the way an OS kernel manages processes competing for CPU.
+
+## Quickstart
+
+```bash
+# Install
+pip install hivemind-scheduler
+
+# Start the proxy
+hivemind proxy
+
+# In another terminal, run your agents through it
+ANTHROPIC_BASE_URL=http://127.0.0.1:8765 claude code
+```
+
+That's it. Your agents now go through HiveMind. Zero code changes.
 
 ## The Problem
 
-11 parallel agents, one API key. 3 died from ECONNRESET/502 — classic connection exhaustion. The surviving 8 worked fine. If they'd been staggered by 5 seconds, all 11 would have succeeded. The problem isn't capacity — it's coordination.
+11 parallel agents, one API key. 3 died from ECONNRESET/502 — classic connection exhaustion. The surviving 8 worked fine. If they'd been staggered by 5 seconds, all 11 would have succeeded.
+
+**The problem isn't capacity — it's coordination.**
 
 ## How It Works
 
 ```
-Agent → http://localhost:8765/v1/messages → HiveMind Proxy → https://api.anthropic.com/v1/messages
+Agent → http://localhost:8765/v1/messages → HiveMind Proxy → https://api.anthropic.com
                                                 ↑
                                     Admission control (semaphore)
                                     Rate limit tracking (header parsing)
                                     AIMD backpressure (latency-based)
                                     Token counting (budget enforcement)
                                     Transparent retry (429/502/ECONNRESET)
+                                    SSE streaming pass-through
 ```
 
 Agents don't know HiveMind exists. They make normal API calls. HiveMind sits in the middle.
 
+## Results
+
+Evaluated across 7 scenarios with 5–50 concurrent agents:
+
+| Scenario | Without HiveMind | With HiveMind |
+|----------|:----------------:|:-------------:|
+| 10 agents, 50 req/min | 100% failure | **0% failure** |
+| 11 agents, realistic errors | 73% failure | **0% failure** |
+| 20 agents, stress test | 100% failure | **10% failure** |
+| 50 agents, extreme | 100% failure | **0% failure** |
+
 ## Install
 
 ```bash
+pip install hivemind-scheduler          # Core
+pip install hivemind-scheduler[all]     # + tiktoken + redis
+```
+
+Or from source:
+
+```bash
+git clone https://github.com/sperixlabs/hivemind.git
+cd hivemind
 pip install -e ".[dev]"
 ```
 
 ## Usage
 
-### Standalone Proxy
+### Transparent Proxy (recommended)
 
 ```bash
-# Start the proxy (agents point ANTHROPIC_BASE_URL at this)
-hivemind proxy --port 8765 --upstream https://api.anthropic.com --max-concurrency 5
+# Start the proxy — auto-detects provider from URL
+hivemind proxy --upstream https://api.anthropic.com
+hivemind proxy --upstream https://api.openai.com/v1
+hivemind proxy --upstream http://localhost:11434  # Ollama
 
-# Then run agents with:
-ANTHROPIC_BASE_URL=http://127.0.0.1:8765 claude-code ...
+# Point agents at it
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8765
+export OPENAI_BASE_URL=http://127.0.0.1:8765/v1
 ```
 
 ### MCP Server
 
 ```bash
-# Run as MCP stdio server
-hivemind serve --max-concurrency 5
+hivemind serve
+```
 
-# Or just:
-hivemind
+### IDE Integration
+
+Generate config for your IDE/tool:
+
+```bash
+hivemind setup claude-code
+hivemind setup cursor
+hivemind setup windsurf
+hivemind setup codex
+hivemind setup copilot
+hivemind setup all         # Show all configs
 ```
 
 ### MCP Tools
@@ -59,21 +115,59 @@ hivemind
 | `hm.budget` | Set/check token budgets (per-agent and global) |
 | `hm.metrics` | Scheduler performance stats |
 | `hm.config` | Tune scheduler parameters at runtime |
+| `hm.setup` | Generate IDE/tool integration configs |
 
 ## Architecture
 
 ### Five Scheduling Primitives
 
-1. **Admission Control** — Concurrency semaphore. Don't let more than N requests hit the API at once.
-2. **Rate Limit Tracking** — Parse `x-ratelimit-*` headers and proactively pause before hitting limits.
-3. **AIMD Backpressure** — Like TCP congestion control. Low latency → increase concurrency. High latency → cut it.
-4. **Token Budget Management** — Per-agent ceilings and global pool. Warning at 85%, checkpoint on exhaust.
-5. **Priority Queue with DAG** — Shortest-job-first, dependency tracking, dynamic reprioritization.
+| # | Primitive | What it does | OS Analogy |
+|---|-----------|-------------|------------|
+| 1 | **Admission Control** | Concurrency semaphore — max N requests in-flight | Process scheduler |
+| 2 | **Rate Limit Tracking** | Parse `x-ratelimit-*` headers, pause proactively | I/O scheduling |
+| 3 | **AIMD Backpressure** | Latency-based concurrency: low → increase, high → cut | TCP congestion control |
+| 4 | **Token Budgets** | Per-agent + global ceilings, warn at 85%, checkpoint at 100% | OOM killer |
+| 5 | **Priority Queue + DAG** | Shortest-job-first, dependency tracking, reprioritization | Nice levels + cgroups |
+
+### Provider Support
+
+Auto-detected from upstream URL:
+
+| Provider | Rate Limit Headers | Default Concurrency | Streaming |
+|----------|:-:|:-:|:-:|
+| Anthropic | Yes | 5 | Yes |
+| OpenAI | Yes | 10 | Yes |
+| Azure OpenAI | Yes | 10 | Yes |
+| Google (Gemini) | - | 8 | Yes |
+| Ollama (local) | - | 2 (GPU) | Yes |
+
+### Optional Features
+
+```bash
+pip install hivemind-scheduler[tokenizer]     # tiktoken for accurate token counting
+pip install hivemind-scheduler[distributed]   # Redis for multi-machine coordination
+```
+
+## Evaluation
+
+Run benchmarks against a mock API (no real API credits needed):
+
+```bash
+python -m evaluation.run_benchmark --quick     # 5 agents, 30 seconds
+python -m evaluation.run_benchmark --replay    # 11-agent original scenario
+python -m evaluation.run_benchmark --ablation  # Test each primitive individually
+python -m evaluation.run_benchmark             # Full suite (all scenarios)
+```
 
 ## Testing
 
 ```bash
-python3 -m pytest tests/ -v -p no:pytest_ethereum -p no:xonsh
+pip install -e ".[dev]"
+python -m pytest tests/ -v
 ```
 
-100 tests covering all scheduler primitives, proxy interceptor, database layer, token counter, and MCP tools.
+158 tests covering all scheduler primitives, proxy, streaming, providers, tokenizer, distributed backend, and MCP tools.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
