@@ -1,0 +1,191 @@
+"""Data models for HiveMind scheduler."""
+
+from __future__ import annotations
+
+import time
+import uuid
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any
+
+
+class TaskState(str, Enum):
+    PENDING = "pending"
+    QUEUED = "queued"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CHECKPOINTED = "checkpointed"
+
+
+class TaskPriority(int, Enum):
+    LOW = 0
+    NORMAL = 1
+    HIGH = 2
+    CRITICAL = 3
+
+
+@dataclass
+class Task:
+    id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    command: str = ""
+    state: TaskState = TaskState.PENDING
+    priority: TaskPriority = TaskPriority.NORMAL
+
+    # Token budget
+    token_budget: int | None = None
+    tokens_used: int = 0
+
+    # Scheduling
+    dependencies: list[str] = field(default_factory=list)
+    estimated_tokens: int | None = None
+
+    # Timing (unix timestamps)
+    created_at: float = field(default_factory=time.time)
+    started_at: float | None = None
+    completed_at: float | None = None
+
+    # Metadata
+    agent_id: str | None = None
+    error: str | None = None
+    result: str | None = None
+    checkpoint_path: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    # For priority queue comparison — higher priority first, then earlier creation
+    def __lt__(self, other: Task) -> bool:
+        if self.priority != other.priority:
+            return self.priority.value > other.priority.value
+        return self.created_at < other.created_at
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "command": self.command,
+            "state": self.state.value,
+            "priority": self.priority.value,
+            "token_budget": self.token_budget,
+            "tokens_used": self.tokens_used,
+            "dependencies": self.dependencies,
+            "estimated_tokens": self.estimated_tokens,
+            "created_at": self.created_at,
+            "started_at": self.started_at,
+            "completed_at": self.completed_at,
+            "agent_id": self.agent_id,
+            "error": self.error,
+            "result": self.result,
+            "checkpoint_path": self.checkpoint_path,
+            "metadata": self.metadata,
+        }
+
+
+@dataclass
+class AgentMetrics:
+    agent_id: str
+    task_id: str
+    tokens_in: int = 0
+    tokens_out: int = 0
+    requests_made: int = 0
+    requests_failed: int = 0
+    retries: int = 0
+    avg_latency_ms: float = 0.0
+    recorded_at: float = field(default_factory=time.time)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "agent_id": self.agent_id,
+            "task_id": self.task_id,
+            "tokens_in": self.tokens_in,
+            "tokens_out": self.tokens_out,
+            "requests_made": self.requests_made,
+            "requests_failed": self.requests_failed,
+            "retries": self.retries,
+            "avg_latency_ms": self.avg_latency_ms,
+            "recorded_at": self.recorded_at,
+        }
+
+
+@dataclass
+class RateLimitSnapshot:
+    provider: str
+    remaining_requests: int | None = None
+    remaining_tokens: int | None = None
+    reset_at: float | None = None
+    recorded_at: float = field(default_factory=time.time)
+
+
+@dataclass
+class SchedulerSnapshot:
+    active_agents: int = 0
+    max_concurrency: int = 5
+    queued_tasks: int = 0
+    total_tokens_used: int = 0
+    total_token_budget: int | None = None
+    current_latency_ms: float = 0.0
+    backpressure_factor: float = 1.0
+    recorded_at: float = field(default_factory=time.time)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "active_agents": self.active_agents,
+            "max_concurrency": self.max_concurrency,
+            "queued_tasks": self.queued_tasks,
+            "total_tokens_used": self.total_tokens_used,
+            "total_token_budget": self.total_token_budget,
+            "current_latency_ms": self.current_latency_ms,
+            "backpressure_factor": self.backpressure_factor,
+            "recorded_at": self.recorded_at,
+        }
+
+
+@dataclass
+class HiveMindConfig:
+    """Runtime configuration for the HiveMind scheduler."""
+
+    # Proxy
+    proxy_host: str = "127.0.0.1"
+    proxy_port: int = 8765
+    upstream_url: str = "https://api.anthropic.com"
+
+    # Admission control
+    max_concurrency: int = 5
+
+    # Token budgets
+    total_token_budget: int | None = None
+    default_agent_budget: int | None = None
+
+    # Backpressure (AIMD)
+    aimd_additive_increase: float = 0.5
+    aimd_multiplicative_decrease: float = 0.5
+    latency_target_ms: float = 2000.0
+    min_concurrency: int = 1
+
+    # Retry
+    max_retries: int = 3
+    retry_base_delay: float = 1.0
+    retry_max_delay: float = 30.0
+
+    # Storage
+    db_path: str = "hivemind.db"
+
+    # MCP
+    mcp_host: str = "127.0.0.1"
+    mcp_port: int = 8766
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "proxy_host": self.proxy_host,
+            "proxy_port": self.proxy_port,
+            "upstream_url": self.upstream_url,
+            "max_concurrency": self.max_concurrency,
+            "total_token_budget": self.total_token_budget,
+            "default_agent_budget": self.default_agent_budget,
+            "aimd_additive_increase": self.aimd_additive_increase,
+            "aimd_multiplicative_decrease": self.aimd_multiplicative_decrease,
+            "latency_target_ms": self.latency_target_ms,
+            "min_concurrency": self.min_concurrency,
+            "max_retries": self.max_retries,
+            "retry_base_delay": self.retry_base_delay,
+            "retry_max_delay": self.retry_max_delay,
+            "db_path": self.db_path,
+        }
