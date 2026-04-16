@@ -28,6 +28,14 @@ hivemind.db
 # Evaluation artifacts
 evaluation/results.json
 
+# LaTeX build artifacts
+paper/*.aux
+paper/*.log
+paper/*.out
+paper/*.bbl
+paper/*.blg
+paper/*.synctex.gz
+
 # Testing
 .pytest_cache/
 .coverage

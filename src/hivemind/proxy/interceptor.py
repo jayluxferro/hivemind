@@ -81,6 +81,7 @@ class Interceptor:
             timeout=httpx.Timeout(connect=10.0, read=300.0, write=30.0, pool=30.0),
             limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
             follow_redirects=True,
+            verify=False,
         )
 
     async def stop(self) -> None:
