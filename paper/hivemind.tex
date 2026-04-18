@@ -134,18 +134,19 @@ is not capacity---it is coordination.
 
 \begin{table}[t]
 \centering
+\footnotesize
 \caption{Results of 11~uncoordinated concurrent agents
 (April~15, 2026).}
 \label{tab:motivation}
 \begin{tabular}{@{}lrr@{}}
 \toprule
-Outcome & Count & Percentage \\
+Outcome & Count & \% \\
 \midrule
-Completed successfully & 8 & 73\% \\
-Died (\texttt{ECONNRESET}) & 2 & 18\% \\
-Died (HTTP 502) & 1 & 9\% \\
+Completed successfully & 8 & 73 \\
+Died (\texttt{ECONNRESET}) & 2 & 18 \\
+Died (HTTP 502) & 1 & 9 \\
 \midrule
-Tokens wasted by dead agents & \multicolumn{2}{r}{${\sim}$135\,000} \\
+Tokens wasted (dead agents) & \multicolumn{2}{r}{${\sim}$135\,K} \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -280,19 +281,19 @@ full set of primitives needed to manage concurrent API access.
 
 \begin{table}[t]
 \centering
-\small
+\footnotesize
 \caption{Scheduling capabilities of existing frameworks.
-\checkmark\ = full support, $\sim$ = partial.}
+\checkmark\ = full, $\sim$ = partial.}
 \label{tab:comparison}
-\begin{tabular}{@{}lccccc@{}}
+\begin{tabular}{@{}l ccccc@{}}
 \toprule
-System & Adm. & Rate & BP & Budget & Prio. \\
+System & Adm. & Rate & BP & Bud. & Pri. \\
 \midrule
-Claude Code & -- & -- & -- & -- & -- \\
-LangChain~\cite{langchain2022} & -- & $\sim$ & -- & -- & -- \\
-CrewAI~\cite{crewai2024} & -- & -- & -- & -- & $\sim$ \\
-AutoGen~\cite{autogen2023} & -- & -- & -- & -- & -- \\
-Sem.\ Kernel~\cite{semantickernel2023} & -- & $\sim$ & -- & -- & -- \\
+Claude Code          & -- & -- & -- & -- & -- \\
+LangChain~\cite{langchain2022}  & -- & $\sim$ & -- & -- & -- \\
+CrewAI~\cite{crewai2024}        & -- & -- & -- & -- & $\sim$ \\
+AutoGen~\cite{autogen2023}      & -- & -- & -- & -- & -- \\
+Sem.~Kernel~\cite{semantickernel2023} & -- & $\sim$ & -- & -- & -- \\
 \textbf{\hm{}} & \checkmark & \checkmark & \checkmark & \checkmark & \checkmark \\
 \bottomrule
 \end{tabular}
@@ -378,17 +379,16 @@ The admission controller limits the number of concurrent
 in-flight API requests.  We model it as a gated counter
 protected by a condition variable.
 
-Let $C_{\max}$ be the maximum concurrency, $A$ be the count of
-currently active requests, and let \texttt{slot\_available} be
-an \texttt{asyncio.Condition}.  A request is admitted when
-$A < C_{\max}$:
+Let $C_{\max}$ be the maximum concurrency and $A$ the count
+of active requests.  A request is admitted when
+$A < C_{\max}$; otherwise it waits on a condition variable:
 
 \begin{equation}
 \label{eq:admission}
 \text{admit}(r) =
 \begin{cases}
-  \text{true},  & \text{if } A < C_{\max} \\
-  \text{wait on } \texttt{slot\_available}, & \text{otherwise}
+  \text{true},  & A < C_{\max} \\
+  \text{wait},  & \text{otherwise}
 \end{cases}
 \end{equation}
 
@@ -960,7 +960,7 @@ correctly tuned for each API provider out of the box.
 
 A 174-test suite validates correctness across all scheduling
 primitives, and the system is open-source under the MIT license
-at \url{https://github.com/sperixlabs/hivemind}.
+at \url{https://github.com/jayluxferro/hivemind}.
 
 \balance
 \begingroup
