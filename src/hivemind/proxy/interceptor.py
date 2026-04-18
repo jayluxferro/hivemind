@@ -247,6 +247,7 @@ class Interceptor:
                 self.latency_tracker.record(result.latency_total_ms, result.status_code)
                 await self.backpressure.record_latency(result.latency_total_ms)
                 await self.backpressure.record_success()
+                self.rate_limiter.record_tokens(result.tokens_in + result.tokens_out)
 
                 # Record budget
                 if agent_id and (result.tokens_in or result.tokens_out):
@@ -344,6 +345,7 @@ class Interceptor:
                         # Still return the response — budget enforcement is advisory at proxy level
 
                 await self.backpressure.record_success()
+                self.rate_limiter.record_tokens(tokens_in + tokens_out)
 
                 return InterceptResult(
                     status_code=response.status_code,

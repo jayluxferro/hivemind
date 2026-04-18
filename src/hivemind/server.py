@@ -42,6 +42,9 @@ class HiveMindServer:
         self.db = Database(self.config.db_path)
         self.admission = AdmissionController(self.config.max_concurrency)
         self.rate_limiter = RateLimiter()
+        if self.config.provider:
+            from .scheduler.providers import get_profile
+            self.rate_limiter.configure_from_profile(get_profile(self.config.provider))
         self.backpressure = BackpressureController(
             max_concurrency=self.config.max_concurrency,
             additive_increase=self.config.aimd_additive_increase,

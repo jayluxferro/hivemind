@@ -80,7 +80,7 @@ Don't let all agents hit the API at once. Measure the provider's actual concurre
 
 ```
 Observed: Anthropic allows ~5 concurrent streaming connections per key.
-HiveMind: Maintains a semaphore of size 5. Agent 6 waits until agent 1 releases.
+HiveMind: Maintains an admission gate of size 5. Agent 6 waits until agent 1 releases.
 ```
 
 This alone would have fixed today's failures.
@@ -142,10 +142,11 @@ Agent 7 at 45K tokens → checkpoint + kill + spawn continuation agent
 | CPU time | API request slots (rate-limited) |
 | Memory | Context window (fixed per model) |
 | I/O | Network calls to API provider |
-| Scheduler | HiveMind admission control + fair queue |
+| Scheduler | HiveMind admission control + fair queue + circuit breaker |
 | Virtual memory / swap | Checkpointing agent state to disk when context is full |
 | OOM killer | Token budget enforcement |
 | TCP congestion control | Backpressure from API latency |
+| Circuit breaker | Trip on sustained errors, half-open probe, auto-reset |
 | Fork bomb protection | Max concurrent agents per user/key |
 
 Nobody has formalized this analogy for LLM agents. Existing frameworks (LangChain, CrewAI, AutoGen) spawn agents without resource management. They're running a multi-process OS without a scheduler.
@@ -183,7 +184,7 @@ Nobody has formalized this analogy for LLM agents. Existing frameworks (LangChai
      |          Scheduler              |
      |                                 |
      |  Admission Controller           |
-     |    - Concurrency semaphore      |
+     |    - Concurrency gate (condition var)      |
      |    - Measured, not configured   |
      |                                 |
      |  Priority Queue                 |
@@ -198,8 +199,8 @@ Nobody has formalized this analogy for LLM agents. Existing frameworks (LangChai
      |                                 |
      |  Backpressure Controller        |
      |    - Latency-based AIMD         |
-     |    - Exponential backoff        |
-     |    - Jitter                     |
+     |    - Circuit breaker            |
+     |    - Direct admission wiring    |
      |                                 |
      |  Token Budget Manager           |
      |    - Per-agent ceiling           |
@@ -315,7 +316,7 @@ hivemind/
       budget.py                # hm.budget
       metrics.py               # hm.metrics
     scheduler/
-      admission.py             # Concurrency semaphore
+      admission.py             # Concurrency gate (condition var)
       queue.py                 # Priority queue with dependency DAG
       rate_limiter.py          # Rate limit header parsing + proactive throttle
       backpressure.py          # AIMD latency-based concurrency control
@@ -340,7 +341,7 @@ hivemind/
 
 ## Build Plan
 1. API proxy (the core — intercept, count, retry)
-2. Admission controller (semaphore)
+2. Admission controller (condition variable gate)
 3. Rate limit tracker (parse headers)
 4. Backpressure (AIMD)
 5. Token budget manager

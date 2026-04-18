@@ -338,17 +338,17 @@ async def run_validation(config: RealWorldConfig) -> ValidationResult:
                 await asyncio.sleep(0.1)
 
         agent_base_url = f"http://127.0.0.1:{port}"
-        if config.provider == "openai":
-            agent_base_url = f"http://127.0.0.1:{port}/v1"
+        # Don't append /v1 for OpenAI — the agent path already includes it.
+        # The proxy concatenates upstream_url + request_path, so adding /v1
+        # here would produce /v1/v1/chat/completions.
         logger.info("HiveMind proxy at %s → %s", agent_base_url, config.base_url)
 
     # Select agent runner
     if config.provider == "openai":
         runner = _run_agent_openai
-        url = agent_base_url if not config.use_hivemind else agent_base_url
     else:
         runner = _run_agent_anthropic
-        url = agent_base_url
+    url = agent_base_url
 
     result = ValidationResult(config=config, started_at=time.time())
 

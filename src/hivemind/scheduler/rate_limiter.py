@@ -1,7 +1,8 @@
 """Rate limit tracker — parses provider headers and proactively throttles.
 
 Reads x-ratelimit-* headers from API responses and pauses requests
-before hitting limits, not after.
+before hitting limits, not after. Can be pre-seeded from a provider
+profile so throttling works before the first response arrives.
 """
 
 from __future__ import annotations
@@ -9,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import deque
 from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
@@ -28,7 +30,15 @@ class RateLimitWindow:
 
 
 class RateLimiter:
-    """Tracks rate limit state from API response headers and gates requests."""
+    """Tracks rate limit state from API response headers and gates requests.
+
+    Two layers of protection:
+    1. Header-based: parses x-ratelimit-* / anthropic-ratelimit-* headers
+       from API responses and throttles proactively when near limits.
+    2. Request counter: a sliding-window RPM counter seeded from the
+       provider profile. Acts as a safety net when the provider sends
+       no rate-limit headers (e.g. Ollama) or before the first response.
+    """
 
     def __init__(self) -> None:
         self._windows: dict[str, RateLimitWindow] = {}
@@ -37,13 +47,74 @@ class RateLimiter:
         self._throttle_threshold = 0.1
         self._pause_until: float = 0.0
 
+        # Sliding-window RPM counter (provider-seeded)
+        self._rpm_limit: int | None = None  # None = no RPM enforcement
+        self._tpm_limit: int | None = None
+        self._request_timestamps: deque[float] = deque()
+        self._token_usage: deque[tuple[float, int]] = deque()  # (timestamp, tokens)
+        self._provider_name: str | None = None
+
+    def configure_from_profile(self, profile) -> None:
+        """Pre-seed rate limits from a ProviderProfile.
+
+        Sets up the sliding-window RPM/TPM counters so the rate limiter
+        can throttle before any response headers arrive.
+        """
+        self._rpm_limit = profile.default_requests_per_minute
+        self._tpm_limit = profile.default_tokens_per_minute
+        self._provider_name = profile.name
+        logger.info(
+            "Rate limiter: configured for %s — %d RPM, %d TPM",
+            profile.name, self._rpm_limit, self._tpm_limit,
+        )
+
+    def record_request(self) -> None:
+        """Record that a request was sent (for RPM counting)."""
+        self._request_timestamps.append(time.monotonic())
+
+    def record_tokens(self, count: int) -> None:
+        """Record token usage (for TPM counting)."""
+        if count > 0:
+            self._token_usage.append((time.monotonic(), count))
+
+    def _rpm_wait_seconds(self) -> float:
+        """How long to wait based on RPM counter. 0 = no wait needed."""
+        if self._rpm_limit is None:
+            return 0.0
+        now = time.monotonic()
+        window = 60.0
+        # Evict old entries
+        while self._request_timestamps and now - self._request_timestamps[0] > window:
+            self._request_timestamps.popleft()
+        if len(self._request_timestamps) >= self._rpm_limit:
+            # Wait until the oldest request in the window expires
+            oldest = self._request_timestamps[0]
+            return (oldest + window) - now
+        return 0.0
+
+    def _tpm_wait_seconds(self) -> float:
+        """How long to wait based on TPM counter. 0 = no wait needed."""
+        if self._tpm_limit is None:
+            return 0.0
+        now = time.monotonic()
+        window = 60.0
+        # Evict old entries
+        while self._token_usage and now - self._token_usage[0][0] > window:
+            self._token_usage.popleft()
+        total = sum(t for _, t in self._token_usage)
+        if total >= self._tpm_limit:
+            oldest_ts = self._token_usage[0][0]
+            return (oldest_ts + window) - now
+        return 0.0
+
     @property
     def is_throttled(self) -> bool:
-        return time.time() < self._pause_until
+        return time.time() < self._pause_until or self._rpm_wait_seconds() > 0 or self._tpm_wait_seconds() > 0
 
     @property
     def throttle_remaining_seconds(self) -> float:
-        return max(0.0, self._pause_until - time.time())
+        header_wait = max(0.0, self._pause_until - time.time())
+        return max(header_wait, self._rpm_wait_seconds(), self._tpm_wait_seconds())
 
     def get_window(self, provider: str = "default") -> RateLimitWindow | None:
         return self._windows.get(provider)
@@ -119,12 +190,20 @@ class RateLimiter:
                 )
 
     async def wait_if_throttled(self) -> float:
-        """Block until we're allowed to make a request. Returns seconds waited."""
-        wait_time = self.throttle_remaining_seconds
-        if wait_time > 0:
+        """Block until we're allowed to make a request. Returns seconds waited.
+
+        Also records the request in the RPM sliding window.
+        """
+        total_waited = 0.0
+        while True:
+            wait_time = self.throttle_remaining_seconds
+            if wait_time <= 0:
+                break
             logger.info("Rate limiter: waiting %.1fs before next request", wait_time)
             await asyncio.sleep(wait_time)
-        return wait_time
+            total_waited += wait_time
+        self.record_request()
+        return total_waited
 
     def _parse_reset(self, value: str) -> float | None:
         """Parse a reset timestamp. Could be ISO8601 or seconds-from-now."""
@@ -143,9 +222,21 @@ class RateLimiter:
 
     @property
     def stats(self) -> dict:
+        now = time.monotonic()
+        # Count requests in the last 60s
+        while self._request_timestamps and now - self._request_timestamps[0] > 60:
+            self._request_timestamps.popleft()
+        while self._token_usage and now - self._token_usage[0][0] > 60:
+            self._token_usage.popleft()
+
         result: dict = {
             "is_throttled": self.is_throttled,
             "throttle_remaining_seconds": round(self.throttle_remaining_seconds, 2),
+            "provider": self._provider_name,
+            "rpm_limit": self._rpm_limit,
+            "rpm_current": len(self._request_timestamps),
+            "tpm_limit": self._tpm_limit,
+            "tpm_current": sum(t for _, t in self._token_usage),
             "providers": {},
         }
         for provider, window in self._windows.items():

@@ -303,6 +303,9 @@ def main() -> None:
 
     admission = AdmissionController(config.max_concurrency)
     rate_limiter = RateLimiter()
+    if config.provider:
+        from ..scheduler.providers import get_profile
+        rate_limiter.configure_from_profile(get_profile(config.provider))
     backpressure = BackpressureController(config.max_concurrency)
     budget_manager = BudgetManager()
 
