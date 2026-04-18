@@ -248,25 +248,26 @@ that has a direct counterpart in the LLM agent domain.
 
 \begin{table*}[t]
 \centering
+\footnotesize
 \caption{Structural mapping between OS resource management and
 LLM agent scheduling.  Each row identifies an OS mechanism,
 its \hm{} counterpart, and the failure mode it addresses.}
 \label{tab:analogy}
-\begin{tabular}{@{}llll@{}}
+\begin{tabular}{@{}l l l p{4.8cm}@{}}
 \toprule
 OS Concept & \hm{} Equivalent & Resource & Failure Mode \\
 \midrule
 Process & LLM agent & -- & Stateful, long-running, resource-consuming \\
-CPU time slice & API request slot & Rate-limited RPM/TPM & Starvation under contention \\
+CPU time slice & API request slot & RPM/TPM & Starvation under contention \\
 Memory & Context window & Fixed per model & Cannot be shared or paged \\
-I/O bandwidth & Network connections & Concurrent conn.\ limits & \texttt{ECONNRESET}, HTTP 502 \\
+I/O bandwidth & Network connections & Conn.\ limits & \texttt{ECONNRESET}, HTTP 502 \\
 Process scheduler & Admission gate + queue & Concurrency slots & Thrashing, stampede \\
-Virtual memory / swap & Checkpointing & Disk & Context loss on eviction \\
+Virtual memory & Checkpointing & Disk & Context loss on eviction \\
 OOM killer & Token budget enforcer & Token pool & Runaway agent monopolises API \\
-TCP congestion control & AIMD backpressure & Latency signal & Throughput collapse \\
-Circuit breaker & Backpressure circuit & Error rate signal & Cascading failure \\
+TCP congestion ctrl. & AIMD backpressure & Latency signal & Throughput collapse \\
+Circuit breaker & Backpressure circuit & Error rate & Cascading failure \\
 Fork bomb protection & Max agent limit & Key quota & Unbounded spawn \\
-Nice levels & Task priority & Scheduling order & Low-value work blocks high-value \\
+Nice levels & Task priority & Sched.\ order & Low-value work blocks high-value \\
 \bottomrule
 \end{tabular}
 \end{table*}
@@ -279,6 +280,7 @@ full set of primitives needed to manage concurrent API access.
 
 \begin{table}[t]
 \centering
+\small
 \caption{Scheduling capabilities of existing frameworks.
 \checkmark\ = full support, $\sim$ = partial.}
 \label{tab:comparison}
@@ -655,49 +657,32 @@ Table~\ref{tab:scenarios} describes the seven evaluation
 scenarios, and Table~\ref{tab:results} compares direct
 (uncoordinated) execution against \hm{}-managed execution.
 
-\begin{table}[t]
+\begin{table*}[t]
 \centering
-\caption{Evaluation scenarios.  Error rates are specified as
-$p_{502} + p_{\text{reset}}$.}
+\small
+\caption{Evaluation scenarios and results.  Error rates are
+$p_{502} + p_{\text{reset}}$.  $\Delta_{\text{f}}$ is the
+change in failure rate (percentage points);
+$\Delta_{\text{w}}$ is the reduction in tokens consumed by
+dead agents.}
 \label{tab:scenarios}
-\scriptsize
-\begin{tabular}{@{}lrrlrl@{}}
-\toprule
-Scenario & Agents & RPM & Error Rate & $C_{\max}$ & Purpose \\
-\midrule
-micro-5  & 5  & 50 & 0\%       & -- & Baseline \\
-micro-10 & 10 & 50 & 0\%       & -- & Onset \\
-micro-20 & 20 & 50 & 0\%       & -- & Contention \\
-micro-50 & 50 & 50 & 0\%       & -- & Extreme \\
-replay-11 & 11 & 60 & 8\%+5\%  & 5  & Original case \\
-stress   & 20 & 20 & 10\%+5\%  & 3  & Exhaustion \\
-lat.-spike & 10 & 60 & 0\%     & -- & AIMD test \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\begin{table}[t]
-\centering
-\caption{Direct vs.\ \hm{}: failure rates and waste reduction.
-$\Delta_{\text{fail}}$ is the change in failure rate (percentage
-points).  $\Delta_{\text{waste}}$ is the reduction in tokens
-consumed by dead agents.}
 \label{tab:results}
-\scriptsize
-\begin{tabular}{@{}lrrrr@{}}
+\begin{tabular}{@{}lrrl rr rr@{}}
 \toprule
-Scenario & Direct & \hm{} & $\Delta_{\text{fail}}$ & $\Delta_{\text{waste}}$ \\
+ & & & Error & \multicolumn{2}{c}{Failure Rate} & & \\
+\cmidrule(lr){5-6}
+Scenario & Agents & RPM & Rate & Direct & \hm{} & $\Delta_{\text{f}}$ & $\Delta_{\text{w}}$ \\
 \midrule
-micro-5    &   0.0\% &  0.0\% & 0.0    & --      \\
-micro-10   & 100.0\% & 10.0\% & $-$90  & $-$100\% \\
-micro-20   & 100.0\% & 10.0\% & $-$90  & $-$94\%  \\
-micro-50   & 100.0\% &  0.0\% & $-$100 & $-$100\% \\
-replay-11  &  72.7\% & 18.2\% & $-$55  & $-$48\%  \\
-stress     & 100.0\% & 10.0\% & $-$90  & $-$100\% \\
-lat.-spike & 100.0\% &  0.0\% & $-$100 & $-$100\% \\
+micro-5    & 5  & 50 & 0\%      &   0\% &  0\% & 0    & --      \\
+micro-10   & 10 & 50 & 0\%      & 100\% & 10\% & $-$90  & $-$100\% \\
+micro-20   & 20 & 50 & 0\%      & 100\% & 10\% & $-$90  & $-$94\%  \\
+micro-50   & 50 & 50 & 0\%      & 100\% &  0\% & $-$100 & $-$100\% \\
+replay-11  & 11 & 60 & 8\%+5\%  &  73\% & 18\% & $-$55  & $-$48\%  \\
+stress     & 20 & 20 & 10\%+5\% & 100\% & 10\% & $-$90  & $-$100\% \\
+lat.-spike & 10 & 60 & 0\%      & 100\% &  0\% & $-$100 & $-$100\% \\
 \bottomrule
 \end{tabular}
-\end{table}
+\end{table*}
 
 At 5~agents, both modes succeed---there is no contention.
 At 10+~agents, uncoordinated execution fails catastrophically
@@ -719,22 +704,22 @@ To measure the individual contribution of each scheduling
 primitive, we run the replay-11 scenario with various primitives
 disabled (Table~\ref{tab:ablation}).
 
-\begin{table}[t]
+\begin{table}[!htb]
 \centering
+\footnotesize
 \caption{Ablation study on the replay-11 scenario.
 Each row disables one primitive; ``Full'' enables all.}
 \label{tab:ablation}
-\scriptsize
-\begin{tabular}{@{}lrrrl@{}}
+\begin{tabular}{@{}l rrr p{1.6cm}@{}}
 \toprule
-Configuration & Alive & Dead & Fail\% & Key Finding \\
+Configuration & Alive & Dead & Fail\% & Finding \\
 \midrule
-Full \hm{}    & 11 & 0 &  0.0 & Baseline \\
-No admission  & 11 & 0 &  0.0 & Compensated \\
-No rate limit & 11 & 0 &  0.0 & Compensated \\
-No backpressure & 10 & 1 & 9.1 & Marginal \\
+Full \hm{}      & 11 & 0 &  0.0 & Baseline \\
+No admission    & 11 & 0 &  0.0 & Compensated \\
+No rate limit   & 11 & 0 &  0.0 & Compensated \\
+No backpressure & 10 & 1 &  9.1 & Marginal \\
 \textbf{No retry} & \textbf{4} & \textbf{7} & \textbf{63.6} & \textbf{Most critical} \\
-\textbf{Admission only} & \textbf{2} & \textbf{9} & \textbf{81.8} & \textbf{Insufficient} \\
+\textbf{Adm.\ only} & \textbf{2} & \textbf{9} & \textbf{81.8} & \textbf{Insufficient} \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -761,20 +746,21 @@ serving Qwen~3.5-4B-4bit.  Each test used 10~agents making
 3~turns each, with the \texttt{--compare} flag running direct
 mode first, then \hm{} mode.
 
-\begin{table}[t]
+\begin{table}[!htb]
 \centering
+\small
 \caption{Real-world validation against local model servers
 (10~agents $\times$ 3~turns).}
 \label{tab:realworld}
-\begin{tabular}{@{}llrrr@{}}
+\begin{tabular}{@{}llcrr@{}}
 \toprule
-Server & Mode & Alive & Fail\% & Wall Time \\
+Server & Mode & Alive & Fail\% & Time \\
 \midrule
 Ollama & Direct  & 10/10 & 0\% & 30.5\,s \\
 Ollama & \hm{}   & 10/10 & 0\% & 28.5\,s \\
 \midrule
-MLX    & Direct  & 10/10 & 0\% & 4.4\,s \\
-MLX    & \hm{}   &  9/10 & 10\% & 4.3\,s \\
+MLX    & Direct  & 10/10 & 0\% & 3.9\,s \\
+MLX    & \hm{}   & 10/10 & 0\% & 3.6\,s \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -787,11 +773,11 @@ actually 7\%~faster than direct access because its admission gate
 ($C_{\max} = 2$) matched Ollama's natural concurrency and reduced
 internal queuing contention.
 
-The single MLX failure (10\% in \hm{} mode) was caused by a
-\texttt{RemoteProtocolError} (``server disconnected'') that was
-not classified as retryable at the time of testing.  This was
-subsequently fixed by adding the pattern to the retryable-error
-list (Section~\ref{sec:retry}).
+An earlier test run produced one MLX failure (10\%) caused by a
+\texttt{RemoteProtocolError} (``server disconnected'').  Adding
+this pattern to the retryable-error list
+(Section~\ref{sec:retry}) resolved the issue; subsequent runs
+achieve 10/10 across both servers.
 
 % ============================================================
 \section{Related Work}
