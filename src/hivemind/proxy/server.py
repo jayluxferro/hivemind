@@ -87,6 +87,14 @@ class ProxyServer:
                 media_type="application/json",
             )
 
+        from contextlib import asynccontextmanager
+
+        @asynccontextmanager
+        async def lifespan(app):
+            await self._on_startup()
+            yield
+            await self._on_shutdown()
+
         app = Starlette(
             routes=[
                 Route("/_health", health_handler, methods=["GET"]),
@@ -94,8 +102,7 @@ class ProxyServer:
                 # Catch-all proxy route
                 Route("/{path:path}", proxy_handler, methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"]),
             ],
-            on_startup=[self._on_startup],
-            on_shutdown=[self._on_shutdown],
+            lifespan=lifespan,
         )
         return app
 
@@ -317,8 +324,14 @@ def main() -> None:
         budget_manager=budget_manager,
     )
 
-    asyncio.run(proxy.serve())
+    try:
+        asyncio.run(proxy.serve())
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass

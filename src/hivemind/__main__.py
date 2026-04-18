@@ -116,8 +116,14 @@ def main() -> None:
 
         from .server import run_server
 
-        asyncio.run(run_server(config))
+        try:
+            asyncio.run(run_server(config))
+        except KeyboardInterrupt:
+            pass
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
