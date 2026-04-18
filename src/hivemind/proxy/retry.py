@@ -16,8 +16,9 @@ logger = logging.getLogger(__name__)
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 529}
 
 
-def is_retryable_status(status_code: int) -> bool:
-    return status_code in RETRYABLE_STATUS_CODES
+def is_retryable_status(status_code: int, retryable_codes: set[int] | None = None) -> bool:
+    codes = retryable_codes if retryable_codes is not None else RETRYABLE_STATUS_CODES
+    return status_code in codes
 
 
 def is_retryable_error(error: Exception) -> bool:
@@ -75,10 +76,16 @@ class RetryPolicy:
         self._total_retries = 0
         self._total_retry_time = 0.0
 
-    def should_retry(self, attempt: int, status_code: int | None = None, error: Exception | None = None) -> bool:
+    def should_retry(
+        self,
+        attempt: int,
+        status_code: int | None = None,
+        error: Exception | None = None,
+        retryable_codes: set[int] | None = None,
+    ) -> bool:
         if attempt >= self.max_retries:
             return False
-        if status_code is not None and is_retryable_status(status_code):
+        if status_code is not None and is_retryable_status(status_code, retryable_codes):
             return True
         if error is not None and is_retryable_error(error):
             return True

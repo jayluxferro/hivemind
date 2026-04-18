@@ -22,6 +22,7 @@ import httpx
 from ..scheduler.admission import AdmissionController
 from ..scheduler.backpressure import BackpressureController
 from ..scheduler.budget import BudgetExhausted, BudgetManager
+from ..scheduler.providers import ProviderProfile
 from ..scheduler.rate_limiter import RateLimiter
 from .latency_tracker import LatencyTracker
 from .retry import RetryPolicy, is_retryable_error, is_retryable_status
@@ -67,6 +68,7 @@ class Interceptor:
         budget_manager: BudgetManager,
         latency_tracker: LatencyTracker,
         retry_policy: RetryPolicy,
+        provider: ProviderProfile | None = None,
     ) -> None:
         self.upstream_url = upstream_url.rstrip("/")
         self.admission = admission
@@ -75,6 +77,7 @@ class Interceptor:
         self.budget_manager = budget_manager
         self.latency_tracker = latency_tracker
         self.retry_policy = retry_policy
+        self.provider = provider
         self._client: httpx.AsyncClient | None = None
 
     async def start(self) -> None:
@@ -316,8 +319,9 @@ class Interceptor:
                 resp_headers = dict(response.headers)
                 await self.rate_limiter.update_from_headers(resp_headers)
 
-                # 6. Check if retryable
-                if is_retryable_status(response.status_code) and self.retry_policy.should_retry(attempt, response.status_code):
+                # 6. Check if retryable (use provider-specific codes when available)
+                provider_codes = self.provider.retryable_status_codes if self.provider else None
+                if is_retryable_status(response.status_code, provider_codes) and self.retry_policy.should_retry(attempt, response.status_code, retryable_codes=provider_codes):
                     await self.backpressure.record_error()
                     retry_after = None
                     if "retry-after" in resp_headers:

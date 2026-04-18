@@ -116,9 +116,11 @@ def _cursor_config(proxy_url: str, python: str, upstream: str, concurrency: int)
             "Add to .cursor/mcp.json in your project root:",
             json.dumps(config, indent=2),
             "",
-            "Or use transparent proxy mode:",
-            "  1. Start: hivemind proxy",
+            "Or use transparent proxy mode (Cursor uses OpenAI-compatible API):",
+            "  1. Start: hivemind proxy --upstream https://api.openai.com",
             f"  2. In Cursor settings, set API base URL to {proxy_url}",
+            "",
+            "HiveMind auto-detects the API format from the upstream URL.",
         ],
     }
 
@@ -144,14 +146,14 @@ def _windsurf_config(proxy_url: str, python: str, upstream: str, concurrency: in
 
 def _codex_config(proxy_url: str, host: str, port: int) -> dict:
     return {
-        "config": {"ANTHROPIC_BASE_URL": proxy_url},
+        "config": {"OPENAI_BASE_URL": f"{proxy_url}/v1"},
         "path": "Environment variable",
         "instructions": [
-            "1. Start HiveMind proxy:",
-            f"   hivemind proxy --host {host} --port {port}",
+            "1. Start HiveMind proxy (Codex uses OpenAI-compatible API):",
+            f"   hivemind proxy --host {host} --port {port} --upstream https://api.openai.com",
             "",
             "2. Run Codex with proxy:",
-            f"   ANTHROPIC_BASE_URL={proxy_url} codex",
+            f"   OPENAI_BASE_URL={proxy_url}/v1 codex",
             "",
             "All Codex agents will route through HiveMind automatically.",
         ],
@@ -163,8 +165,8 @@ def _copilot_config(proxy_url: str, host: str, port: int) -> dict:
         "config": {"proxy_url": proxy_url},
         "path": "VS Code settings.json",
         "instructions": [
-            "1. Start HiveMind proxy:",
-            f"   hivemind proxy --host {host} --port {port}",
+            "1. Start HiveMind proxy (Copilot uses OpenAI-compatible API):",
+            f"   hivemind proxy --host {host} --port {port} --upstream https://api.openai.com",
             "",
             "2. In VS Code settings.json, add:",
             '   "http.proxy": "%s"' % proxy_url,

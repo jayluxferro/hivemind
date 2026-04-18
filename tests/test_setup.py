@@ -39,7 +39,7 @@ def test_generate_windsurf_config():
 def test_generate_codex_config():
     result = generate_config("codex")
     assert "instructions" in result
-    assert any("ANTHROPIC_BASE_URL" in line for line in result["instructions"])
+    assert any("OPENAI_BASE_URL" in line for line in result["instructions"])
 
 
 def test_generate_copilot_config():

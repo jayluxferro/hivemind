@@ -244,19 +244,21 @@ HiveMind doesn't modify the agents. It runs a **local HTTP proxy** that the agen
 The agent doesn't know HiveMind exists. It just makes normal API calls. HiveMind sits in the middle like a reverse proxy.
 
 ```
-Agent → http://localhost:8765/v1/messages → HiveMind Proxy → https://api.anthropic.com/v1/messages
-                                                ↑
-                                    Admission control
-                                    Rate limit tracking  
-                                    Backpressure
-                                    Token counting
-                                    Transparent retry
+Agent → http://localhost:8765/v1/... → HiveMind Proxy → Anthropic / OpenAI / Ollama / Azure
+                                            ↑
+                                Admission control
+                                Rate limit tracking (provider-aware headers)
+                                Backpressure (AIMD + circuit breaker)
+                                Token counting (both API formats)
+                                Provider-specific retry (429/502/529)
 ```
+
+The provider is auto-detected from the upstream URL. Each provider has its own profile with rate limit header names, retry codes, concurrency defaults, and latency targets.
 
 This is the cleanest implementation path because:
 - Zero changes to agent code
-- Works with any LLM provider (Anthropic, OpenAI, Ollama)
-- Works with any agent framework (Claude Code, LangChain, raw SDK)
+- Works with any LLM provider (Anthropic, OpenAI, Azure, Ollama, Google)
+- Works with any agent framework (Claude Code, Cursor, Copilot, Codex, LangChain, raw SDK)
 - Easy to measure — all traffic flows through one point
 
 ---
@@ -323,9 +325,10 @@ hivemind/
       budget.py                # Token budget allocation + enforcement
     proxy/
       server.py                # Local HTTP proxy (the core)
-      interceptor.py           # Request/response interception
-      token_counter.py         # Count tokens from API payloads
-      retry.py                 # Transparent 429/502 retry
+      interceptor.py           # Request/response interception (provider-aware)
+      token_counter.py         # Count tokens from API payloads (Anthropic + OpenAI)
+      streaming.py             # SSE streaming pass-through + token extraction
+      retry.py                 # Provider-specific retry (429/502/529)
       latency_tracker.py       # Rolling latency measurement
     execution/
       pool.py                  # Agent subprocess pool

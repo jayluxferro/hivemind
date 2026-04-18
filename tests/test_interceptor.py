@@ -10,6 +10,7 @@ from hivemind.proxy.retry import RetryPolicy
 from hivemind.scheduler.admission import AdmissionController
 from hivemind.scheduler.backpressure import BackpressureController
 from hivemind.scheduler.budget import BudgetManager
+from hivemind.scheduler.providers import ANTHROPIC, OPENAI
 from hivemind.scheduler.rate_limiter import RateLimiter
 
 
@@ -216,3 +217,135 @@ async def test_rate_limit_headers_parsed(interceptor, components):
     window = rl.get_window("default")
     assert window is not None
     assert window.remaining_requests == 10
+
+
+def _make_openai_response(status_code=200, body=None, headers=None):
+    """Create a mock httpx.Response in OpenAI format."""
+    if body is None:
+        body = json.dumps({
+            "id": "chatcmpl-abc123",
+            "object": "chat.completion",
+            "model": "gpt-4o",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hello!"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 80, "completion_tokens": 30, "total_tokens": 110},
+        }).encode()
+    resp = MagicMock()
+    resp.status_code = status_code
+    resp.content = body
+    resp.headers = headers or {
+        "content-type": "application/json",
+        "x-ratelimit-remaining-requests": "55",
+        "x-ratelimit-remaining-tokens": "90000",
+    }
+    return resp
+
+
+@pytest.fixture
+def openai_interceptor(components):
+    return Interceptor(
+        upstream_url="https://api.openai.com",
+        provider=OPENAI,
+        **components,
+    )
+
+
+@pytest.mark.asyncio
+async def test_openai_token_counting(openai_interceptor):
+    """Verify token counts are correctly extracted from OpenAI responses."""
+    mock_response = _make_openai_response()
+    mock_client = AsyncMock()
+    mock_client.request = AsyncMock(return_value=mock_response)
+    openai_interceptor._client = mock_client
+
+    result = await openai_interceptor.handle_request(
+        method="POST",
+        path="/v1/chat/completions",
+        headers={"content-type": "application/json", "authorization": "Bearer test"},
+        body=json.dumps({"model": "gpt-4o", "messages": [{"role": "user", "content": "Hi"}]}).encode(),
+        agent_id="openai-agent",
+    )
+
+    assert result.status_code == 200
+    assert result.tokens_in == 80
+    assert result.tokens_out == 30
+
+
+@pytest.mark.asyncio
+async def test_openai_rate_limit_headers(openai_interceptor, components):
+    """Verify OpenAI rate limit headers are parsed correctly."""
+    rl = components["rate_limiter"]
+    mock_response = _make_openai_response(
+        headers={
+            "content-type": "application/json",
+            "x-ratelimit-remaining-requests": "20",
+            "x-ratelimit-remaining-tokens": "50000",
+        }
+    )
+    mock_client = AsyncMock()
+    mock_client.request = AsyncMock(return_value=mock_response)
+    openai_interceptor._client = mock_client
+
+    await openai_interceptor.handle_request(
+        method="POST",
+        path="/v1/chat/completions",
+        headers={},
+        body=b"{}",
+    )
+
+    window = rl.get_window("default")
+    assert window is not None
+    assert window.remaining_requests == 20
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_no_529_retry(components):
+    """OpenAI provider should NOT retry 529 (Anthropic-only status code)."""
+    interceptor = Interceptor(
+        upstream_url="https://api.openai.com",
+        provider=OPENAI,
+        **components,
+    )
+
+    resp_529 = _make_openai_response(status_code=529, body=b'{"error": "overloaded"}')
+
+    mock_client = AsyncMock()
+    mock_client.request = AsyncMock(return_value=resp_529)
+    interceptor._client = mock_client
+
+    result = await interceptor.handle_request(
+        method="POST",
+        path="/v1/chat/completions",
+        headers={},
+        body=b"{}",
+    )
+
+    # 529 is NOT in OpenAI's retryable codes, so no retries
+    assert result.status_code == 529
+    assert result.retries == 0
+
+
+@pytest.mark.asyncio
+async def test_anthropic_provider_retries_529(components):
+    """Anthropic provider SHOULD retry 529."""
+    interceptor = Interceptor(
+        upstream_url="https://api.anthropic.com",
+        provider=ANTHROPIC,
+        **components,
+    )
+
+    resp_529 = _make_response(status_code=529, body=b'{"error": "overloaded"}')
+    resp_200 = _make_response(status_code=200)
+
+    mock_client = AsyncMock()
+    mock_client.request = AsyncMock(side_effect=[resp_529, resp_200])
+    interceptor._client = mock_client
+
+    result = await interceptor.handle_request(
+        method="POST",
+        path="/v1/messages",
+        headers={},
+        body=b"{}",
+    )
+
+    assert result.status_code == 200
+    assert result.retries == 1

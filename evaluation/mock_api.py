@@ -1,13 +1,14 @@
-"""Mock Anthropic API server for evaluation.
+"""Mock LLM API server for evaluation.
 
 Simulates realistic API behavior including:
 - Configurable rate limits (requests per window, tokens per window)
-- Rate limit headers (anthropic-ratelimit-*)
+- Rate limit headers (anthropic-ratelimit-* or x-ratelimit-*)
 - 429 responses when limits are exceeded
 - Random 502/ECONNRESET errors at configurable rates
 - Configurable latency (fixed + jitter)
 - Token usage in responses
 - Streaming support (SSE)
+- Both Anthropic and OpenAI response formats (api_format config)
 
 This lets us run the full evaluation without burning real API credits.
 """
@@ -58,6 +59,9 @@ class MockAPIConfig:
     # Concurrency tracking
     max_concurrent: int = 0  # 0 = unlimited; >0 = reject with 529 if exceeded
 
+    # API format: "anthropic" or "openai"
+    api_format: str = "anthropic"
+
 
 @dataclass
 class _RateLimitState:
@@ -81,7 +85,11 @@ class _RateLimitState:
 
 
 class MockAPIServer:
-    """A fake Anthropic API that behaves realistically for benchmarking."""
+    """A fake LLM API that behaves realistically for benchmarking.
+
+    Supports both Anthropic (/v1/messages) and OpenAI (/v1/chat/completions)
+    response formats via the api_format config parameter.
+    """
 
     def __init__(self, config: MockAPIConfig | None = None) -> None:
         self.config = config or MockAPIConfig()
@@ -97,6 +105,7 @@ class MockAPIServer:
         app = Starlette(
             routes=[
                 Route("/v1/messages", self._handle_messages, methods=["POST"]),
+                Route("/v1/chat/completions", self._handle_messages, methods=["POST"]),
                 Route("/_stats", self._handle_stats, methods=["GET"]),
                 Route("/_config", self._handle_config, methods=["POST"]),
                 Route("/_reset", self._handle_reset, methods=["POST"]),
@@ -161,30 +170,24 @@ class MockAPIServer:
             if self._rate_state.request_count > self.config.requests_per_minute:
                 self._total_rate_limited += 1
                 reset_seconds = self._rate_state.window_remaining_seconds
-                return JSONResponse(
-                    {"type": "error", "error": {"type": "rate_limit_error", "message": "Rate limit exceeded"}},
-                    status_code=429,
-                    headers={
-                        "retry-after": str(round(reset_seconds, 1)),
-                        "anthropic-ratelimit-requests-limit": str(self.config.requests_per_minute),
-                        "anthropic-ratelimit-requests-remaining": "0",
-                        "anthropic-ratelimit-requests-reset": str(round(time.time() + reset_seconds, 1)),
-                    },
+                rl_429 = self._rate_limit_429_headers(reset_seconds, "requests")
+                error_body = (
+                    {"error": {"message": "Rate limit exceeded", "type": "rate_limit_error", "code": "rate_limit_exceeded"}}
+                    if self.config.api_format == "openai"
+                    else {"type": "error", "error": {"type": "rate_limit_error", "message": "Rate limit exceeded"}}
                 )
+                return JSONResponse(error_body, status_code=429, headers=rl_429)
 
             if self._rate_state.token_count > self.config.tokens_per_minute:
                 self._total_rate_limited += 1
                 reset_seconds = self._rate_state.window_remaining_seconds
-                return JSONResponse(
-                    {"type": "error", "error": {"type": "rate_limit_error", "message": "Token rate limit exceeded"}},
-                    status_code=429,
-                    headers={
-                        "retry-after": str(round(reset_seconds, 1)),
-                        "anthropic-ratelimit-tokens-limit": str(self.config.tokens_per_minute),
-                        "anthropic-ratelimit-tokens-remaining": "0",
-                        "anthropic-ratelimit-tokens-reset": str(round(time.time() + reset_seconds, 1)),
-                    },
+                rl_429 = self._rate_limit_429_headers(reset_seconds, "tokens")
+                error_body = (
+                    {"error": {"message": "Token rate limit exceeded", "type": "rate_limit_error", "code": "rate_limit_exceeded"}}
+                    if self.config.api_format == "openai"
+                    else {"type": "error", "error": {"type": "rate_limit_error", "message": "Token rate limit exceeded"}}
                 )
+                return JSONResponse(error_body, status_code=429, headers=rl_429)
 
             # Simulate latency
             latency = self.config.base_latency_ms + random.gauss(0, self.config.latency_jitter_ms)
@@ -197,68 +200,154 @@ class MockAPIServer:
             output_tokens = max(10, int(random.gauss(self.config.output_tokens_mean, self.config.output_tokens_std)))
             self._rate_state.token_count += output_tokens
 
-            # Build rate limit headers
+            # Build rate limit headers (format-specific)
             remaining_requests = max(0, self.config.requests_per_minute - self._rate_state.request_count)
             remaining_tokens = max(0, self.config.tokens_per_minute - self._rate_state.token_count)
             reset_time = self._rate_state.window_start + self._rate_state.window_seconds
 
             msg_id = f"msg_{random.randint(10000, 99999)}"
-            model = req_data.get("model", "claude-sonnet-4-20250514")
-            rl_headers = {
-                "anthropic-ratelimit-requests-limit": str(self.config.requests_per_minute),
-                "anthropic-ratelimit-requests-remaining": str(remaining_requests),
-                "anthropic-ratelimit-requests-reset": str(round(reset_time, 1)),
-                "anthropic-ratelimit-tokens-limit": str(self.config.tokens_per_minute),
-                "anthropic-ratelimit-tokens-remaining": str(remaining_tokens),
-                "anthropic-ratelimit-tokens-reset": str(round(reset_time, 1)),
-            }
+            is_openai = self.config.api_format == "openai"
+            model = req_data.get("model", "gpt-4o" if is_openai else "claude-sonnet-4-20250514")
+
+            if is_openai:
+                rl_headers = {
+                    "x-ratelimit-limit-requests": str(self.config.requests_per_minute),
+                    "x-ratelimit-remaining-requests": str(remaining_requests),
+                    "x-ratelimit-reset-requests": str(round(reset_time, 1)),
+                    "x-ratelimit-limit-tokens": str(self.config.tokens_per_minute),
+                    "x-ratelimit-remaining-tokens": str(remaining_tokens),
+                    "x-ratelimit-reset-tokens": str(round(reset_time, 1)),
+                }
+            else:
+                rl_headers = {
+                    "anthropic-ratelimit-requests-limit": str(self.config.requests_per_minute),
+                    "anthropic-ratelimit-requests-remaining": str(remaining_requests),
+                    "anthropic-ratelimit-requests-reset": str(round(reset_time, 1)),
+                    "anthropic-ratelimit-tokens-limit": str(self.config.tokens_per_minute),
+                    "anthropic-ratelimit-tokens-remaining": str(remaining_tokens),
+                    "anthropic-ratelimit-tokens-reset": str(round(reset_time, 1)),
+                }
 
             # Streaming response
             if req_data.get("stream", False):
-                async def sse_generator():
-                    # message_start with input usage
-                    yield f"event: message_start\ndata: {json.dumps({'type': 'message_start', 'message': {'id': msg_id, 'type': 'message', 'role': 'assistant', 'model': model, 'usage': {'input_tokens': input_tokens}}})}\n\n"
-                    # content_block_start
-                    yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
-                    # content deltas — split output into chunks
-                    text = "x " * output_tokens
-                    chunk_size = max(1, len(text) // 5)
-                    for i in range(0, len(text), chunk_size):
-                        chunk_text = text[i:i + chunk_size]
-                        yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': chunk_text}})}\n\n"
-                        await asyncio.sleep(0.01)
-                    # content_block_stop
-                    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
-                    # message_delta with output usage
-                    yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'end_turn'}, 'usage': {'output_tokens': output_tokens}})}\n\n"
-                    # message_stop
-                    yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
+                if is_openai:
+                    return StreamingResponse(
+                        self._openai_sse_generator(msg_id, model, input_tokens, output_tokens),
+                        media_type="text/event-stream",
+                        headers={**rl_headers, "cache-control": "no-cache"},
+                    )
 
                 return StreamingResponse(
-                    sse_generator(),
+                    self._anthropic_sse_generator(msg_id, model, input_tokens, output_tokens),
                     media_type="text/event-stream",
                     headers={**rl_headers, "cache-control": "no-cache"},
                 )
 
             # Non-streaming response
-            response_data = {
-                "id": msg_id,
-                "type": "message",
-                "role": "assistant",
-                "content": [{"type": "text", "text": "x " * output_tokens}],
-                "model": model,
-                "stop_reason": "end_turn",
-                "usage": {
-                    "input_tokens": input_tokens,
-                    "output_tokens": output_tokens,
-                },
-            }
+            if is_openai:
+                response_data = {
+                    "id": f"chatcmpl-{msg_id}",
+                    "object": "chat.completion",
+                    "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "x " * output_tokens},
+                        "finish_reason": "stop",
+                    }],
+                    "usage": {
+                        "prompt_tokens": input_tokens,
+                        "completion_tokens": output_tokens,
+                        "total_tokens": input_tokens + output_tokens,
+                    },
+                }
+            else:
+                response_data = {
+                    "id": msg_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "x " * output_tokens}],
+                    "model": model,
+                    "stop_reason": "end_turn",
+                    "usage": {
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                    },
+                }
 
             return JSONResponse(response_data, headers=rl_headers)
 
         finally:
             async with self._lock:
                 self._active_connections -= 1
+
+    def _rate_limit_429_headers(self, reset_seconds: float, kind: str) -> dict[str, str]:
+        """Build 429 rate limit headers in the correct format."""
+        base = {"retry-after": str(round(reset_seconds, 1))}
+        reset_time = str(round(time.time() + reset_seconds, 1))
+        if self.config.api_format == "openai":
+            base[f"x-ratelimit-limit-{kind}"] = str(
+                self.config.requests_per_minute if kind == "requests" else self.config.tokens_per_minute
+            )
+            base[f"x-ratelimit-remaining-{kind}"] = "0"
+            base[f"x-ratelimit-reset-{kind}"] = reset_time
+        else:
+            base[f"anthropic-ratelimit-{kind}-limit"] = str(
+                self.config.requests_per_minute if kind == "requests" else self.config.tokens_per_minute
+            )
+            base[f"anthropic-ratelimit-{kind}-remaining"] = "0"
+            base[f"anthropic-ratelimit-{kind}-reset"] = reset_time
+        return base
+
+    async def _anthropic_sse_generator(self, msg_id: str, model: str, input_tokens: int, output_tokens: int):
+        """Generate Anthropic-format SSE stream."""
+        # message_start with input usage
+        yield f"event: message_start\ndata: {json.dumps({'type': 'message_start', 'message': {'id': msg_id, 'type': 'message', 'role': 'assistant', 'model': model, 'usage': {'input_tokens': input_tokens}}})}\n\n"
+        # content_block_start
+        yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+        # content deltas
+        text = "x " * output_tokens
+        chunk_size = max(1, len(text) // 5)
+        for i in range(0, len(text), chunk_size):
+            chunk_text = text[i:i + chunk_size]
+            yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': chunk_text}})}\n\n"
+            await asyncio.sleep(0.01)
+        # content_block_stop
+        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
+        # message_delta with output usage
+        yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'end_turn'}, 'usage': {'output_tokens': output_tokens}})}\n\n"
+        # message_stop
+        yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
+
+    async def _openai_sse_generator(self, msg_id: str, model: str, input_tokens: int, output_tokens: int):
+        """Generate OpenAI-format SSE stream."""
+        chat_id = f"chatcmpl-{msg_id}"
+        # Content deltas
+        text = "x " * output_tokens
+        chunk_size = max(1, len(text) // 5)
+        for i in range(0, len(text), chunk_size):
+            chunk_text = text[i:i + chunk_size]
+            chunk_data = {
+                "id": chat_id,
+                "object": "chat.completion.chunk",
+                "model": model,
+                "choices": [{"index": 0, "delta": {"content": chunk_text}, "finish_reason": None}],
+            }
+            yield f"data: {json.dumps(chunk_data)}\n\n"
+            await asyncio.sleep(0.01)
+        # Final chunk with finish_reason and usage
+        final_data = {
+            "id": chat_id,
+            "object": "chat.completion.chunk",
+            "model": model,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            "usage": {
+                "prompt_tokens": input_tokens,
+                "completion_tokens": output_tokens,
+                "total_tokens": input_tokens + output_tokens,
+            },
+        }
+        yield f"data: {json.dumps(final_data)}\n\n"
+        yield "data: [DONE]\n\n"
 
     def _estimate_input_tokens(self, data: dict) -> int:
         """Rough input token estimate from request data."""

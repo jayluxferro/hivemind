@@ -14,11 +14,13 @@ When you spawn 10 agents, they shouldn't all stampede the API at once. HiveMind 
 # Install
 pip install hivemind-scheduler
 
-# Start the proxy
-hivemind proxy
+# Start the proxy (auto-detects provider from URL)
+hivemind proxy                                          # Anthropic (default)
+hivemind proxy --upstream https://api.openai.com        # OpenAI
 
-# In another terminal, run your agents through it
-ANTHROPIC_BASE_URL=http://127.0.0.1:8765 claude code
+# In another terminal, point your agents at it
+ANTHROPIC_BASE_URL=http://127.0.0.1:8765 claude code   # Claude Code
+OPENAI_BASE_URL=http://127.0.0.1:8765/v1 cursor        # Cursor / Copilot / Codex
 ```
 
 That's it. Your agents now go through HiveMind. Zero code changes.
@@ -32,14 +34,14 @@ That's it. Your agents now go through HiveMind. Zero code changes.
 ## How It Works
 
 ```
-Agent → http://localhost:8765/v1/messages → HiveMind Proxy → https://api.anthropic.com
-                                                ↑
-                                    Admission control (condition variable)
-                                    Rate limit tracking (provider-aware)
-                                    AIMD backpressure + circuit breaker
-                                    Token counting (budget enforcement)
-                                    Transparent retry (429/502/ECONNRESET)
-                                    SSE streaming pass-through
+Agent → http://localhost:8765/v1/... → HiveMind Proxy → Anthropic / OpenAI / Ollama / Azure
+                                            ↑
+                                Admission control (condition variable)
+                                Rate limit tracking (provider-aware)
+                                AIMD backpressure + circuit breaker
+                                Token counting (budget enforcement)
+                                Provider-specific retry (429/502/529)
+                                SSE streaming pass-through
 ```
 
 Agents don't know HiveMind exists. They make normal API calls. HiveMind sits in the middle.
@@ -166,7 +168,7 @@ pip install -e ".[dev]"
 python -m pytest tests/ -v
 ```
 
-174 tests covering all scheduler primitives (admission control, backpressure with circuit breaker, rate limiting with provider profiles), proxy, streaming, providers, tokenizer, distributed backend, and MCP tools.
+182 tests covering all scheduler primitives (admission control, backpressure with circuit breaker, rate limiting with provider profiles), proxy, streaming, multi-provider integration (Anthropic + OpenAI), tokenizer, distributed backend, and MCP tools.
 
 ## License
 

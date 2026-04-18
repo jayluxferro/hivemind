@@ -1,8 +1,9 @@
 """Local HTTP reverse proxy — the core of HiveMind.
 
-Agents make API calls to http://localhost:8765/v1/messages and this proxy
-transparently forwards them to the upstream API while applying all
-scheduling primitives (admission, rate limits, backpressure, token budgets).
+Agents make API calls to http://localhost:8765 and this proxy transparently
+forwards them to the upstream API (Anthropic, OpenAI, Ollama, Azure, etc.)
+while applying all scheduling primitives (admission, rate limits, backpressure,
+token budgets). The provider is auto-detected from the upstream URL.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ from ..scheduler.admission import AdmissionController
 from ..scheduler.backpressure import BackpressureController
 from ..scheduler.budget import BudgetManager
 from ..scheduler.rate_limiter import RateLimiter
+from ..scheduler.providers import detect_provider
 from ..storage.db import Database
 from ..storage.models import HiveMindConfig
 from .interceptor import Interceptor
@@ -56,6 +58,7 @@ class ProxyServer:
             base_delay=config.retry_base_delay,
             max_delay=config.retry_max_delay,
         )
+        provider = detect_provider(config.upstream_url)
         self.interceptor = Interceptor(
             upstream_url=config.upstream_url,
             admission=admission,
@@ -64,6 +67,7 @@ class ProxyServer:
             budget_manager=budget_manager,
             latency_tracker=self.latency_tracker,
             retry_policy=self.retry_policy,
+            provider=provider,
         )
         self._app: Starlette | None = None
         self._server_task: asyncio.Task | None = None
