@@ -700,11 +700,13 @@ against local model APIs.
 \subsection{Methodology}
 
 We evaluate using a mock API server that simulates realistic
-Anthropic API behaviour with configurable rate limits
+LLM API behaviour in both Anthropic and OpenAI response formats.
+The mock supports configurable rate limits
 (requests per minute), error injection (random HTTP~502 and
-connection resets at specified rates), rate-limit headers
-(\texttt{anthropic-ratelimit-*}), latency (base plus jitter
-plus configurable spikes), and concurrency limits.
+connection resets at specified rates), provider-specific rate-limit
+headers (\texttt{anthropic-ratelimit-*} and \texttt{x-ratelimit-*}),
+latency (base plus jitter plus configurable spikes), concurrency
+limits, and SSE streaming in both formats.
 
 Mock agents make $N$~sequential API calls simulating multi-turn
 coding sessions.  Each agent either completes all turns or
@@ -1043,10 +1045,11 @@ circuit closes.
     long tokens (e.g., CJK) and overestimates for code with
     short identifiers.
   \item \textbf{Mock evaluation.}  Our primary evaluation uses
-    a mock API server.  While it simulates realistic behaviour
-    (rate limits, errors, latency), the stampede failure mode
-    requires a cloud API with hard rate limits to trigger
-    reliably---local models queue gracefully.
+    a mock API server supporting both Anthropic and OpenAI
+    response formats.  While it simulates realistic behaviour
+    (rate limits, errors, latency, streaming), the stampede
+    failure mode requires a cloud API with hard rate limits to
+    trigger reliably---local models queue gracefully.
   \item \textbf{Dynamic priority.}  Priority is set at submission
     time.  Automatic priority adjustment based on observed
     progress (e.g., promoting agents near completion) is future

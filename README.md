@@ -79,7 +79,7 @@ pip install -e ".[dev]"
 ```bash
 # Start the proxy — auto-detects provider from URL
 hivemind proxy --upstream https://api.anthropic.com
-hivemind proxy --upstream https://api.openai.com/v1
+hivemind proxy --upstream https://api.openai.com
 hivemind proxy --upstream http://localhost:11434  # Ollama
 
 # Point agents at it
@@ -105,6 +105,39 @@ hivemind setup codex
 hivemind setup copilot
 hivemind setup all         # Show all configs
 ```
+
+### CLI Reference
+
+#### `hivemind proxy`
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--host` | `127.0.0.1` | Bind address |
+| `--port` | `8765` | Bind port |
+| `--upstream` | `https://api.anthropic.com` | Upstream API URL (provider auto-detected) |
+| `--max-concurrency` | `5` | Max concurrent in-flight requests |
+| `--min-concurrency` | `1` | Floor for AIMD backpressure |
+| `--db` | `hivemind.db` | SQLite database path |
+| `--max-retries` | `3` | Max transparent retries on 429/502 |
+| `--retry-base-delay` | `1.0` | Base retry delay (seconds) |
+| `--retry-max-delay` | `30.0` | Max retry delay (seconds) |
+| `--latency-target` | auto | Latency target in ms for AIMD (auto-detected from provider) |
+| `--aimd-increase` | auto | AIMD additive increase (auto-detected from provider) |
+| `--aimd-decrease` | auto | AIMD multiplicative decrease (auto-detected from provider) |
+| `--total-budget` | unlimited | Global token budget |
+| `--agent-budget` | unlimited | Default per-agent token budget |
+
+#### `hivemind serve`
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--upstream` | `https://api.anthropic.com` | Upstream API URL |
+| `--max-concurrency` | `5` | Max concurrent requests |
+| `--db` | `hivemind.db` | Database path |
+| `--total-budget` | unlimited | Global token budget |
+| `--agent-budget` | unlimited | Default per-agent token budget |
+| `--max-retries` | `3` | Max transparent retries |
+| `--min-concurrency` | `1` | Floor for AIMD backpressure |
 
 ### MCP Tools
 

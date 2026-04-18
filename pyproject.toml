@@ -1,6 +1,6 @@
 [project]
 name = "hivemind-scheduler"
-version = "0.1.0"
+version = "0.2.0"
 description = "OS-inspired scheduler for concurrent LLM coding agents. Transparent API proxy with admission control, rate limit awareness, AIMD backpressure, token budgets, and priority scheduling."
 readme = "README.md"
 license = {text = "MIT"}

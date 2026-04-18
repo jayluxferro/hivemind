@@ -289,16 +289,61 @@ class ProxyServer:
                 pass
 
 
+def _build_proxy(config: HiveMindConfig) -> ProxyServer:
+    """Build a ProxyServer from config, wiring all scheduler components."""
+    from ..scheduler.budget import BudgetManager as BM
+
+    config.apply_provider_defaults()
+    logger.info(
+        "Provider: %s | upstream: %s | concurrency: %d",
+        config.provider, config.upstream_url, config.max_concurrency,
+    )
+
+    admission = AdmissionController(config.max_concurrency)
+    rate_limiter = RateLimiter()
+    if config.provider:
+        from ..scheduler.providers import get_profile
+        rate_limiter.configure_from_profile(get_profile(config.provider))
+    backpressure = BackpressureController(
+        max_concurrency=config.max_concurrency,
+        additive_increase=config.aimd_additive_increase,
+        multiplicative_decrease=config.aimd_multiplicative_decrease,
+        latency_target_ms=config.latency_target_ms,
+        min_concurrency=config.min_concurrency,
+    )
+    budget_manager = BM(
+        total_budget=config.total_token_budget,
+        default_agent_budget=config.default_agent_budget,
+    )
+
+    return ProxyServer(
+        config=config,
+        admission=admission,
+        rate_limiter=rate_limiter,
+        backpressure=backpressure,
+        budget_manager=budget_manager,
+    )
+
+
+def run_proxy(config: HiveMindConfig) -> None:
+    """Run the proxy with a fully-built config (called from __main__)."""
+    proxy = _build_proxy(config)
+    try:
+        asyncio.run(proxy.serve())
+    except KeyboardInterrupt:
+        pass
+
+
 def main() -> None:
-    """CLI entry point for standalone proxy."""
+    """CLI entry point for standalone proxy (hivemind-proxy script)."""
     import argparse
 
     parser = argparse.ArgumentParser(description="HiveMind API Proxy")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8765)
-    parser.add_argument("--upstream", default="https://api.anthropic.com")
-    parser.add_argument("--max-concurrency", type=int, default=5)
-    parser.add_argument("--db", default="hivemind.db")
+    parser.add_argument("--host", default="127.0.0.1", help="Bind address")
+    parser.add_argument("--port", type=int, default=8765, help="Bind port")
+    parser.add_argument("--upstream", default="https://api.anthropic.com", help="Upstream API URL (auto-detects provider)")
+    parser.add_argument("--max-concurrency", type=int, default=5, help="Max concurrent requests")
+    parser.add_argument("--db", default="hivemind.db", help="Database path")
     args = parser.parse_args()
 
     config = HiveMindConfig(
@@ -308,30 +353,7 @@ def main() -> None:
         max_concurrency=args.max_concurrency,
         db_path=args.db,
     )
-
-    config.apply_provider_defaults()
-    logger.info("Detected provider: %s", config.provider)
-
-    admission = AdmissionController(config.max_concurrency)
-    rate_limiter = RateLimiter()
-    if config.provider:
-        from ..scheduler.providers import get_profile
-        rate_limiter.configure_from_profile(get_profile(config.provider))
-    backpressure = BackpressureController(config.max_concurrency)
-    budget_manager = BudgetManager()
-
-    proxy = ProxyServer(
-        config=config,
-        admission=admission,
-        rate_limiter=rate_limiter,
-        backpressure=backpressure,
-        budget_manager=budget_manager,
-    )
-
-    try:
-        asyncio.run(proxy.serve())
-    except KeyboardInterrupt:
-        pass
+    run_proxy(config)
 
 
 if __name__ == "__main__":
