@@ -7,7 +7,7 @@ import httpx
 
 from evaluation.mock_api import MockAPIConfig, MockAPIServer
 from evaluation.mock_agent import AgentConfig, AgentResult, run_mock_agent
-from evaluation.reporter import BenchmarkReport, ComparisonResult
+from evaluation.reporter import BenchmarkReport
 from evaluation.harness import ScenarioResult
 
 

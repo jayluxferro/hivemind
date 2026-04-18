@@ -213,7 +213,7 @@ class RateLimiter:
             pass
         # Try ISO8601
         try:
-            from datetime import datetime, timezone
+            from datetime import datetime
 
             dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
             return dt.timestamp()

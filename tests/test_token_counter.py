@@ -1,7 +1,6 @@
 """Tests for token counting from API payloads."""
 
 import json
-import pytest
 
 from hivemind.proxy.token_counter import (
     count_request_tokens,

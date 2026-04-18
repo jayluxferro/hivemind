@@ -1,7 +1,6 @@
 """Tests for streaming SSE pass-through."""
 
 import json
-import pytest
 
 from hivemind.proxy.streaming import is_streaming_request, parse_sse_chunk
 

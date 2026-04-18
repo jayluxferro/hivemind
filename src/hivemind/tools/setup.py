@@ -12,7 +12,6 @@ Produces ready-to-paste config snippets for:
 from __future__ import annotations
 
 import json
-import os
 import sys
 
 SUPPORTED_TOOLS = [
@@ -90,7 +89,7 @@ def _claude_code_config(proxy_url: str, python: str, upstream: str, concurrency:
         "env": env_config,
         "instructions": [
             "Option A: MCP Server (rich tools — submit, status, metrics, etc.)",
-            f"  Add to ~/.claude/settings.json:",
+            "  Add to ~/.claude/settings.json:",
             f"  {json.dumps(config, indent=2)}",
             "",
             "Option B: Transparent proxy (zero config, just set env var)",
@@ -118,7 +117,7 @@ def _cursor_config(proxy_url: str, python: str, upstream: str, concurrency: int)
             json.dumps(config, indent=2),
             "",
             "Or use transparent proxy mode:",
-            f"  1. Start: hivemind proxy",
+            "  1. Start: hivemind proxy",
             f"  2. In Cursor settings, set API base URL to {proxy_url}",
         ],
     }

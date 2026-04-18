@@ -2,7 +2,6 @@
 
 from hivemind.scheduler.providers import (
     ANTHROPIC,
-    GENERIC,
     OLLAMA,
     OPENAI,
     ProviderType,

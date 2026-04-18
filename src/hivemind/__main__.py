@@ -65,7 +65,6 @@ def main() -> None:
     )
 
     if args.command == "setup":
-        import json
         from .tools.setup import generate_config, SUPPORTED_TOOLS
 
         tools_to_show = SUPPORTED_TOOLS if args.tool == "all" else [args.tool]

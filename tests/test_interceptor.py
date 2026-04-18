@@ -2,9 +2,9 @@
 
 import json
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
-from hivemind.proxy.interceptor import Interceptor, InterceptResult
+from hivemind.proxy.interceptor import Interceptor
 from hivemind.proxy.latency_tracker import LatencyTracker
 from hivemind.proxy.retry import RetryPolicy
 from hivemind.scheduler.admission import AdmissionController

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from ..scheduler.queue import PriorityQueue
-from ..storage.models import TaskState
 
 
 async def get_status(

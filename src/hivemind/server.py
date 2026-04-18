@@ -427,7 +427,6 @@ class HiveMindServer:
 
     async def _wait_task_completion(self, task, agent) -> None:
         """Wait for an agent to finish and update task state."""
-        from .storage.models import TaskState
         import time
 
         while True:

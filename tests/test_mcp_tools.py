@@ -4,7 +4,7 @@ import pytest
 
 from hivemind.scheduler.budget import BudgetManager
 from hivemind.scheduler.queue import PriorityQueue
-from hivemind.storage.models import TaskPriority, TaskState
+from hivemind.storage.models import TaskPriority
 from hivemind.tools.batch import batch_submit
 from hivemind.tools.budget import manage_budget
 from hivemind.tools.priority import set_priority

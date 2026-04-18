@@ -1,7 +1,5 @@
 """Tests for the rate limit tracker."""
 
-import asyncio
-import time
 import pytest
 
 from hivemind.scheduler.rate_limiter import RateLimiter

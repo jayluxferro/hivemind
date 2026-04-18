@@ -1,7 +1,5 @@
 """Tests for the AIMD backpressure controller."""
 
-import time
-
 import pytest
 
 from hivemind.scheduler.admission import AdmissionController

@@ -5,7 +5,6 @@ verifies chunks arrive progressively and tokens are counted.
 """
 
 import asyncio
-import json
 import socket
 
 import httpx
@@ -95,23 +94,10 @@ async def test_streaming_through_proxy():
                 assert "text/event-stream" in resp.headers.get("content-type", "")
 
                 chunks = []
-                saw_message_start = False
-                saw_content_delta = False
-                saw_message_stop = False
-                saw_usage = False
 
                 async for chunk in resp.aiter_bytes():
                     text = chunk.decode("utf-8", errors="replace")
                     chunks.append(text)
-
-                    if "message_start" in text:
-                        saw_message_start = True
-                    if "content_block_delta" in text:
-                        saw_content_delta = True
-                    if "message_stop" in text:
-                        saw_message_stop = True
-                    if "output_tokens" in text:
-                        saw_usage = True
 
                 all_text = "".join(chunks)
                 assert "message_start" in all_text, "Should see message_start event"
