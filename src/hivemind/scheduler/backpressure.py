@@ -69,6 +69,10 @@ class BackpressureController:
         """Set the admission controller reference (for deferred wiring)."""
         self._admission = admission
 
+    def set_latency_target(self, target_ms: float) -> None:
+        """Update the latency target used for AIMD decisions."""
+        self._latency_target = target_ms
+
     @property
     def recommended_concurrency(self) -> int:
         return max(self._min, int(self._current_concurrency))

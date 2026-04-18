@@ -378,7 +378,7 @@ class HiveMindServer:
 
         if "latency_target_ms" in arguments:
             self.config.latency_target_ms = arguments["latency_target_ms"]
-            self.backpressure._latency_target = arguments["latency_target_ms"]
+            self.backpressure.set_latency_target(arguments["latency_target_ms"])
             updates["latency_target_ms"] = arguments["latency_target_ms"]
 
         if "max_retries" in arguments:
@@ -418,10 +418,7 @@ class HiveMindServer:
                     await self.queue.complete(task.id, error=str(exc))
 
             except asyncio.TimeoutError:
-                # No tasks — update backpressure concurrency
-                recommended = self.backpressure.recommended_concurrency
-                if recommended != self.admission.max_concurrency:
-                    await self.admission.set_max_concurrency(recommended)
+                pass  # Backpressure→admission sync is handled automatically via set_admission()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

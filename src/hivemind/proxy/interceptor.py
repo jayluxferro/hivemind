@@ -156,8 +156,6 @@ class Interceptor:
         a completed StreamingResult with token counts. The admission slot is
         held for the duration of the stream.
         """
-        import asyncio
-
         # 0. Circuit breaker — fast-fail if the upstream is overwhelmed
         if self.backpressure.circuit_open:
             error_body = b'{"error": "HiveMind: circuit breaker open - upstream overwhelmed, retry later"}'
