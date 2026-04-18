@@ -35,6 +35,10 @@ paper/*.out
 paper/*.bbl
 paper/*.blg
 paper/*.synctex.gz
+paper/*-arxiv.zip
+
+# Resilient-write internal state
+.resilient_write/
 
 # Testing
 .pytest_cache/
@@ -43,3 +47,4 @@ htmlcov/
 
 # OS
 Thumbs.db
+texput.log

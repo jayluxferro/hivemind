@@ -1,6 +1,6 @@
 # HiveMind
 
-[![CI](https://github.com/sperixlabs/hivemind/actions/workflows/ci.yml/badge.svg)](https://github.com/sperixlabs/hivemind/actions/workflows/ci.yml)
+[![CI](https://github.com/jayluxferro/hivemind/actions/workflows/ci.yml/badge.svg)](https://github.com/jayluxferro/hivemind/actions/workflows/ci.yml)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
@@ -34,9 +34,9 @@ That's it. Your agents now go through HiveMind. Zero code changes.
 ```
 Agent → http://localhost:8765/v1/messages → HiveMind Proxy → https://api.anthropic.com
                                                 ↑
-                                    Admission control (semaphore)
-                                    Rate limit tracking (header parsing)
-                                    AIMD backpressure (latency-based)
+                                    Admission control (condition variable)
+                                    Rate limit tracking (provider-aware)
+                                    AIMD backpressure + circuit breaker
                                     Token counting (budget enforcement)
                                     Transparent retry (429/502/ECONNRESET)
                                     SSE streaming pass-through
@@ -65,7 +65,7 @@ pip install hivemind-scheduler[all]     # + tiktoken + redis
 Or from source:
 
 ```bash
-git clone https://github.com/sperixlabs/hivemind.git
+git clone https://github.com/jayluxferro/hivemind.git
 cd hivemind
 pip install -e ".[dev]"
 ```
@@ -123,7 +123,7 @@ hivemind setup all         # Show all configs
 
 | # | Primitive | What it does | OS Analogy |
 |---|-----------|-------------|------------|
-| 1 | **Admission Control** | Concurrency semaphore — max N requests in-flight | Process scheduler |
+| 1 | **Admission Control** | Concurrency gate — max N requests in-flight | Process scheduler |
 | 2 | **Rate Limit Tracking** | Parse `x-ratelimit-*` headers, pause proactively | I/O scheduling |
 | 3 | **AIMD Backpressure** | Latency-based concurrency: low → increase, high → cut | TCP congestion control |
 | 4 | **Token Budgets** | Per-agent + global ceilings, warn at 85%, checkpoint at 100% | OOM killer |
@@ -166,7 +166,7 @@ pip install -e ".[dev]"
 python -m pytest tests/ -v
 ```
 
-158 tests covering all scheduler primitives, proxy, streaming, providers, tokenizer, distributed backend, and MCP tools.
+174 tests covering all scheduler primitives (admission control, backpressure with circuit breaker, rate limiting with provider profiles), proxy, streaming, providers, tokenizer, distributed backend, and MCP tools.
 
 ## License
 
