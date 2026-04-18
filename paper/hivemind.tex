@@ -18,6 +18,7 @@
 \usepackage{tikz}
 \usepackage{authblk}
 \usepackage{float}
+\usepackage[ruled,vlined,linesnumbered]{algorithm2e}
 \usetikzlibrary{arrows.meta, positioning, calc, shapes.geometric}
 
 \hypersetup{
@@ -473,6 +474,64 @@ and normal operation resumes; if it fails, the circuit re-opens.
 \end{cases}
 \end{equation}
 
+\begin{algorithm}[t]
+\footnotesize
+\SetAlgoLined
+\KwIn{latency sample $\ell$ or error event}
+\KwResult{Updated concurrency $c_t$, circuit state}
+\BlankLine
+\uIf{error event}{
+  $c_t \gets \max(C_{\min},\; c_t \cdot \beta)$\;
+  $e \gets e + 1$;\quad $n \gets n + 1$\;
+  push $c_t$ to admission controller\;
+  \If{$n \geq N$ \textbf{and} $e/n \geq \tau$}{
+    circuit $\gets$ \textit{open}\;
+    $t_{\text{open}} \gets$ now\;
+  }
+}
+\uElseIf{latency sample $\ell$}{
+  append $\ell$ to window\;
+  $n \gets n + 1$\;
+  \If{update interval elapsed}{
+    $\bar{\ell} \gets$ mean(window)\;
+    \uIf{$\bar{\ell} \leq L_{\text{target}}$}{
+      $c_t \gets \min(C_{\max},\; c_t + \alpha)$\;
+    }\Else{
+      $c_t \gets \max(C_{\min},\; c_t \cdot \beta)$\;
+    }
+    push $c_t$ to admission controller\;
+  }
+}
+\uElseIf{success \textbf{and} circuit = \textit{half-open}}{
+  circuit $\gets$ \textit{closed}\;
+}
+\caption{AIMD with circuit breaker.}
+\label{alg:aimd}
+\end{algorithm}
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  state/.style={draw, rounded corners, minimum width=1.6cm,
+                minimum height=0.7cm, font=\footnotesize},
+  arr/.style={-{Stealth[length=2mm]}, thick},
+  lbl/.style={font=\scriptsize, fill=white, inner sep=1pt},
+]
+  \node[state, fill=green!15] (closed) {Closed};
+  \node[state, fill=red!15, right=2.2cm of closed] (open) {Open};
+  \node[state, fill=yellow!20, below=1.2cm of $(closed)!0.5!(open)$] (half) {Half-Open};
+
+  \draw[arr] (closed) -- node[lbl, above] {$e/n \geq \tau$} (open);
+  \draw[arr] (open) -- node[lbl, right, align=left] {$t > t_{\text{open}}$\\$+ T_{\text{cool}}$} (half);
+  \draw[arr] (half) -- node[lbl, left, align=right] {probe\\succeeds} (closed);
+  \draw[arr] (half.east) -- ++(0.5,0) |- node[lbl, right, pos=0.25] {probe fails} (open.south);
+\end{tikzpicture}
+\caption{Circuit breaker state machine.  The circuit opens on
+sustained errors, transitions to half-open after a cooldown,
+and closes on a successful probe request.}
+\label{fig:circuit}
+\end{figure}
+
 \subsection{Token Budget Management}
 \label{sec:budget}
 
@@ -698,6 +757,29 @@ agents stampede and die.  Direct mode ``finishes fast'' only
 because most agents fail immediately.  When measured against
 \emph{completed work}, \hm{}'s throughput is strictly higher.
 
+Figure~\ref{fig:failure} visualises the failure rate reduction
+across all scenarios.  Figure~\ref{fig:throughput} shows the
+scaling behaviour: direct mode completes zero agents beyond
+5~concurrent, while \hm{} scales linearly.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{fig_failure_rates.pdf}
+\caption{Failure rates by scenario.  Direct mode
+(red) fails catastrophically at 10+ agents; \hm{} (green)
+reduces failures to 0--18\%.}
+\label{fig:failure}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{fig_throughput.pdf}
+\caption{Scaling behaviour.  Left: agents that complete
+successfully.  Right: effective throughput (tasks/min).
+Direct mode throughput drops to zero beyond 5~agents.}
+\label{fig:throughput}
+\end{figure}
+
 \subsection{Ablation Study}
 
 To measure the individual contribution of each scheduling
@@ -736,6 +818,15 @@ in combination: retry handles transient errors, admission
 prevents connection exhaustion, rate limiting prevents errors
 from occurring in the first place, and backpressure provides
 fine-grained stability.
+
+\paragraph{Why not per-agent retry?}
+Per-agent retry (e.g., via \texttt{tenacity}) is the natural
+first response, but it lacks centralised coordination.  When
+10~agents each independently retry after a 429 error, the
+retries arrive simultaneously---the ``thundering
+herd''~\cite{dean2013tail}---re-triggering the rate limit.
+\hm{}'s centralised retry serialises retries through the
+admission gate, preventing amplification.
 
 \subsection{Real-World Validation}
 
@@ -778,6 +869,55 @@ An earlier test run produced one MLX failure (10\%) caused by a
 this pattern to the retryable-error list
 (Section~\ref{sec:retry}) resolved the issue; subsequent runs
 achieve 10/10 across both servers.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{fig_ablation.pdf}
+\caption{Ablation study results.  Removing retry causes the
+largest degradation (63.6\% failure); admission-only is
+insufficient (81.8\%).  Other primitives are compensated by
+the remaining ones.}
+\label{fig:ablation}
+\end{figure}
+
+\subsection{Cost of Wasted Compute}
+
+Token waste translates directly to monetary cost.
+Table~\ref{tab:cost} shows the cost of wasted tokens (tokens
+consumed by agents that ultimately failed) across our evaluation
+suite, extrapolated to a daily workload of 10~runs.
+
+\begin{table}[!htb]
+\centering
+\footnotesize
+\caption{Daily cost of wasted tokens at current Anthropic
+pricing (per million input tokens), assuming 10~evaluation runs
+per day.}
+\label{tab:cost}
+\begin{tabular}{@{}l rr r@{}}
+\toprule
+Model & Direct & \hm{} & Savings \\
+\midrule
+Haiku (\$0.80/M)  & \$0.35 & \$0.01 & 97\% \\
+Sonnet (\$3/M)    & \$1.31 & \$0.05 & 96\% \\
+Opus (\$15/M)     & \$6.55 & \$0.24 & 96\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent At Opus-tier pricing, uncoordinated agents waste
+\$6.55/day from our seven-scenario suite alone.  In production
+workloads with 20--50 agents running continuously, waste scales
+to hundreds of dollars per day.  \hm{} reduces this by 96--97\%.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.85\columnwidth]{fig_token_waste.pdf}
+\caption{Wasted tokens by scenario (thousands).  Direct mode
+(red) wastes 1--12K tokens per scenario; \hm{} (green)
+reduces waste to near-zero.}
+\label{fig:waste}
+\end{figure}
 
 % ============================================================
 \section{Related Work}
