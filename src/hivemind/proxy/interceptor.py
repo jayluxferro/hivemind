@@ -1,14 +1,15 @@
 """Request/response interceptor — the core proxy logic.
 
 Sits between agents and the upstream API. For each request:
-1. Acquire admission slot (semaphore)
-2. Wait if rate-limited
-3. Forward request to upstream
-4. Parse rate limit headers from response
-5. Record latency for backpressure
-6. Count tokens for budget management
-7. Retry transparently on 429/502/ECONNRESET
-8. Release admission slot
+1. Check circuit breaker (fast-fail if open)
+2. Acquire admission slot
+3. Wait if rate-limited
+4. Forward request to upstream
+5. Parse rate limit headers from response
+6. Record latency for backpressure
+7. Count tokens for budget management
+8. Retry transparently on 429/502/ECONNRESET
+9. Release admission slot
 """
 
 from __future__ import annotations
@@ -109,6 +110,14 @@ class Interceptor:
     ) -> InterceptResult:
         """Process a proxied API request through all scheduling layers."""
 
+        # 0. Circuit breaker — fast-fail if the upstream is overwhelmed
+        if self.backpressure.circuit_open:
+            return InterceptResult(
+                status_code=503,
+                headers={"content-type": "application/json", "retry-after": "10"},
+                body=b'{"error": "HiveMind: circuit breaker open - upstream overwhelmed, retry later"}',
+            )
+
         # Estimate request tokens for budget check
         est_request_tokens = count_request_tokens(body)
 
@@ -148,6 +157,12 @@ class Interceptor:
         held for the duration of the stream.
         """
         import asyncio
+
+        # 0. Circuit breaker — fast-fail if the upstream is overwhelmed
+        if self.backpressure.circuit_open:
+            error_body = b'{"error": "HiveMind: circuit breaker open - upstream overwhelmed, retry later"}'
+            yield error_body, StreamingResult(status_code=503, error="circuit breaker open")
+            return
 
         est_request_tokens = count_request_tokens(body)
 

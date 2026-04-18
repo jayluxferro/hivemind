@@ -47,6 +47,8 @@ class ProxyServer:
         self.rate_limiter = rate_limiter
         self.backpressure = backpressure
         self.budget_manager = budget_manager
+        # Wire backpressure directly to admission controller
+        self.backpressure.set_admission(self.admission)
         self.db = db
         self.latency_tracker = LatencyTracker()
         self.retry_policy = RetryPolicy(
