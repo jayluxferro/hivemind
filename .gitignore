@@ -48,3 +48,6 @@ htmlcov/
 # OS
 Thumbs.db
 texput.log
+
+# Misc
+git-push
