@@ -1,0 +1,32 @@
+{
+  "direct": {
+    "provider": "ollama",
+    "model": "qwen3.5:4b",
+    "mode": "hivemind",
+    "num_agents": 10,
+    "agents_alive": 10,
+    "agents_dead": 0,
+    "failure_rate_pct": 0.0,
+    "total_tokens": 2580,
+    "wasted_tokens": 0,
+    "total_429s": 0,
+    "total_5xx": 0,
+    "wall_time_s": 30.46,
+    "turns_per_agent": 3
+  },
+  "hivemind": {
+    "provider": "ollama",
+    "model": "qwen3.5:4b",
+    "mode": "hivemind",
+    "num_agents": 10,
+    "agents_alive": 10,
+    "agents_dead": 0,
+    "failure_rate_pct": 0.0,
+    "total_tokens": 2580,
+    "wasted_tokens": 0,
+    "total_429s": 0,
+    "total_5xx": 0,
+    "wall_time_s": 28.47,
+    "turns_per_agent": 3
+  }
+}

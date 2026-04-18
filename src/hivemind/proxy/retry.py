@@ -31,6 +31,8 @@ def is_retryable_error(error: Exception) -> bool:
         "timeout",
         "connect timeout",
         "read timeout",
+        "server disconnected",
+        "remoteprotocolerror",
     ]
     return any(p in error_str for p in retryable_patterns)
 

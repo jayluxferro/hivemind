@@ -16,7 +16,9 @@ Measures the same metrics as mock evaluation:
 Usage:
     python -m evaluation.real_world --provider openai --agents 10
     python -m evaluation.real_world --provider anthropic --agents 10
-    python -m evaluation.real_world --provider anthropic --agents 10 --with-hivemind
+    python -m evaluation.real_world --provider ollama --agents 10 --compare
+    python -m evaluation.real_world --provider ollama --agents 10 --with-hivemind
+    python -m evaluation.real_world --provider generic --base-url http://127.0.0.1:11435/v1 --model my-model --agents 10
 """
 
 from __future__ import annotations
@@ -39,7 +41,7 @@ class RealWorldConfig:
     """Configuration for a real-world validation run."""
 
     # Provider
-    provider: str = "openai"  # openai, anthropic
+    provider: str = "openai"  # openai, anthropic, ollama, generic
     api_key: str = ""
     base_url: str = ""
     model: str = ""
@@ -64,10 +66,21 @@ class RealWorldConfig:
             self.api_key = self.api_key or os.environ.get("ANTHROPIC_API_KEY", "")
             self.base_url = self.base_url or "https://api.anthropic.com"
             self.model = self.model or "claude-haiku-4-5-20251001"
+        elif self.provider == "ollama":
+            self.api_key = self.api_key or "ollama"  # Ollama doesn't need a real key
+            self.base_url = self.base_url or "http://localhost:11434/v1"
+            self.model = self.model or "qwen3.5:4b"
+        elif self.provider == "generic":
+            # Generic OpenAI-compatible endpoint (e.g. MLX, vLLM, llama.cpp)
+            self.api_key = self.api_key or "none"
+            if not self.base_url:
+                raise ValueError("--base-url is required for generic provider")
+            if not self.model:
+                raise ValueError("--model is required for generic provider")
         else:
             raise ValueError(f"Unknown provider: {self.provider}")
 
-        if not self.api_key:
+        if self.provider in ("openai", "anthropic") and not self.api_key:
             raise ValueError(f"No API key found for {self.provider}. Set {self.provider.upper()}_API_KEY")
 
 
@@ -343,11 +356,11 @@ async def run_validation(config: RealWorldConfig) -> ValidationResult:
         # here would produce /v1/v1/chat/completions.
         logger.info("HiveMind proxy at %s → %s", agent_base_url, config.base_url)
 
-    # Select agent runner
-    if config.provider == "openai":
-        runner = _run_agent_openai
-    else:
+    # Select agent runner — ollama and generic use OpenAI-compatible format
+    if config.provider == "anthropic":
         runner = _run_agent_anthropic
+    else:
+        runner = _run_agent_openai
     url = agent_base_url
 
     result = ValidationResult(config=config, started_at=time.time())
@@ -397,16 +410,20 @@ async def run_validation(config: RealWorldConfig) -> ValidationResult:
 
 async def run_comparison(config: RealWorldConfig) -> tuple[ValidationResult, ValidationResult]:
     """Run both direct and HiveMind modes and return both results."""
-    # Direct
-    config.use_hivemind = False
-    direct = await run_validation(config)
+    import copy
+
+    # Direct — use a copy so the original config isn't mutated
+    direct_config = copy.copy(config)
+    direct_config.use_hivemind = False
+    direct = await run_validation(direct_config)
 
     # Brief pause
     await asyncio.sleep(2.0)
 
     # HiveMind
-    config.use_hivemind = True
-    hivemind = await run_validation(config)
+    hm_config = copy.copy(config)
+    hm_config.use_hivemind = True
+    hivemind = await run_validation(hm_config)
 
     return direct, hivemind
 
@@ -415,8 +432,9 @@ def main() -> None:
     import argparse
 
     parser = argparse.ArgumentParser(description="HiveMind Real-World Validation")
-    parser.add_argument("--provider", default="openai", choices=["openai", "anthropic"])
+    parser.add_argument("--provider", default="openai", choices=["openai", "anthropic", "ollama", "generic"])
     parser.add_argument("--model", default="", help="Model to use (default: cheapest for provider)")
+    parser.add_argument("--base-url", default="", help="Base URL for the API (required for generic)")
     parser.add_argument("--agents", type=int, default=10, help="Number of concurrent agents")
     parser.add_argument("--turns", type=int, default=4, help="Turns per agent")
     parser.add_argument("--max-concurrency", type=int, default=5, help="HiveMind max concurrency")
@@ -434,6 +452,7 @@ def main() -> None:
     config = RealWorldConfig(
         provider=args.provider,
         model=args.model,
+        base_url=args.base_url,
         num_agents=args.agents,
         turns_per_agent=args.turns,
         use_hivemind=args.with_hivemind,

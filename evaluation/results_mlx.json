@@ -1,0 +1,32 @@
+{
+  "direct": {
+    "provider": "generic",
+    "model": "mlx-community/Qwen3.5-4B-4bit",
+    "mode": "hivemind",
+    "num_agents": 10,
+    "agents_alive": 10,
+    "agents_dead": 0,
+    "failure_rate_pct": 0.0,
+    "total_tokens": 0,
+    "wasted_tokens": 0,
+    "total_429s": 0,
+    "total_5xx": 0,
+    "wall_time_s": 4.42,
+    "turns_per_agent": 3
+  },
+  "hivemind": {
+    "provider": "generic",
+    "model": "mlx-community/Qwen3.5-4B-4bit",
+    "mode": "hivemind",
+    "num_agents": 10,
+    "agents_alive": 9,
+    "agents_dead": 1,
+    "failure_rate_pct": 10.0,
+    "total_tokens": 0,
+    "wasted_tokens": 0,
+    "total_429s": 0,
+    "total_5xx": 1,
+    "wall_time_s": 4.26,
+    "turns_per_agent": 3
+  }
+}
