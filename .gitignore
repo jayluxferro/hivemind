@@ -49,5 +49,16 @@ htmlcov/
 Thumbs.db
 texput.log
 
+# Secrets and local env (never commit)
+.env
+.env.*
+!.env.example
+*.pem
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+*.key
+
 # Misc
 git-push

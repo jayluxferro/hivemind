@@ -6,6 +6,11 @@ import pytest
 from hivemind.scheduler.admission import AdmissionController
 
 
+def test_max_concurrency_zero_clamps_to_one():
+    ac = AdmissionController(max_concurrency=0)
+    assert ac.max_concurrency == 1
+
+
 @pytest.mark.asyncio
 async def test_basic_acquire_release():
     ac = AdmissionController(max_concurrency=3)

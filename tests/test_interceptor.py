@@ -10,7 +10,7 @@ from hivemind.proxy.retry import RetryPolicy
 from hivemind.scheduler.admission import AdmissionController
 from hivemind.scheduler.backpressure import BackpressureController
 from hivemind.scheduler.budget import BudgetManager
-from hivemind.scheduler.providers import ANTHROPIC, OPENAI
+from hivemind.scheduler.providers import ANTHROPIC, OPENAI, ProviderType
 from hivemind.scheduler.rate_limiter import RateLimiter
 
 
@@ -349,3 +349,27 @@ async def test_anthropic_provider_retries_529(components):
 
     assert result.status_code == 200
     assert result.retries == 1
+
+
+def test_rebind_upstream(components):
+    inc = Interceptor(upstream_url="https://api.anthropic.com", **components)
+    assert "anthropic.com" in inc.upstream_url
+    inc.rebind_upstream("https://api.openai.com/v1")
+    assert "openai.com" in inc.upstream_url
+    assert inc.provider is not None
+    assert inc.provider.provider_type == ProviderType.OPENAI
+
+
+@pytest.mark.asyncio
+async def test_set_tls_verify_recreates_client(components):
+    inc = Interceptor(
+        upstream_url="https://api.anthropic.com",
+        tls_verify=True,
+        **components,
+    )
+    await inc.start()
+    first_client = inc._client
+    await inc.set_tls_verify(False)
+    assert inc._client is not None
+    assert inc._client is not first_client
+    await inc.stop()

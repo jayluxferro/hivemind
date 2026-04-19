@@ -1,0 +1,9 @@
+# Install: pip install pre-commit && pre-commit install
+# See CONTRIBUTING.md (Gitleaks runs in CI and on publish; optional locally: `gitleaks protect --staged`.)
+
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.9.6
+    hooks:
+      - id: ruff
+        exclude: ^(evaluation|paper)/

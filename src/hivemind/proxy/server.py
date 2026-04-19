@@ -68,6 +68,7 @@ class ProxyServer:
             latency_tracker=self.latency_tracker,
             retry_policy=self.retry_policy,
             provider=provider,
+            tls_verify=config.http_tls_verify,
         )
         self._app: Starlette | None = None
         self._server_task: asyncio.Task | None = None
@@ -196,42 +197,52 @@ class ProxyServer:
         self, method: str, path: str, headers: dict[str, str], body: bytes, agent_id: str | None
     ) -> Response:
         """Handle a streaming (SSE) request — forward chunks as they arrive."""
-        streaming_result = None
+        stream_iter = self.interceptor.handle_streaming_request(
+            method=method, path=path, headers=headers, body=body, agent_id=agent_id,
+        )
 
-        async def chunk_generator():
+        # Pull the first yield to detect early errors (401, 429, 503, etc.)
+        # before committing to a StreamingResponse.
+        first_chunk = None
+        first_result = None
+        async for chunk, result in stream_iter:
+            first_chunk = chunk
+            first_result = result
+            break
+
+        # If the first yield already carries a completed result with an error
+        # status, return a plain Response so the upstream status code is preserved.
+        if first_result is not None and first_result.status_code >= 400:
+            await self._log_result(agent_id, method, path, first_result)
+            resp_headers = self._build_response_headers(first_result)
+            body_bytes = (
+                first_chunk
+                if isinstance(first_chunk, bytes)
+                else (first_chunk.encode() if first_chunk else b"")
+            )
+            return Response(
+                content=body_bytes,
+                status_code=first_result.status_code,
+                headers=resp_headers,
+            )
+
+        # Normal streaming path — forward remaining chunks.
+        streaming_result = first_result
+
+        async def generate_and_log():
             nonlocal streaming_result
-            async for chunk, result in self.interceptor.handle_streaming_request(
-                method=method, path=path, headers=headers, body=body, agent_id=agent_id,
-            ):
+            # Yield the first chunk we already pulled.
+            if first_chunk is not None:
+                yield first_chunk
+
+            async for chunk, result in stream_iter:
                 if chunk is not None:
                     yield chunk
                 if result is not None:
                     streaming_result = result
-                    # If error status, yield the error body
-                    if result.error and result.status_code >= 400:
-                        yield result.error.encode() if isinstance(result.error, str) else result.error
 
-        async def generate_and_log():
-            async for chunk in chunk_generator():
-                yield chunk
-
-            # Log after stream completes
-            if self.db and streaming_result:
-                try:
-                    await self.db.log_request(
-                        agent_id=agent_id,
-                        method=method,
-                        path=path,
-                        status_code=streaming_result.status_code,
-                        tokens_in=streaming_result.tokens_in,
-                        tokens_out=streaming_result.tokens_out,
-                        latency_ms=streaming_result.latency_total_ms,
-                        retried=streaming_result.retries > 0,
-                        error=streaming_result.error,
-                        recorded_at=time.time(),
-                    )
-                except Exception as exc:
-                    logger.warning("Failed to log streaming request: %s", exc)
+            if streaming_result:
+                await self._log_result(agent_id, method, path, streaming_result)
 
         return StreamingResponse(
             generate_and_log(),
@@ -241,6 +252,41 @@ class ProxyServer:
                 "connection": "keep-alive",
             },
         )
+
+    def _build_response_headers(self, result) -> dict[str, str]:
+        """Build response headers from an intercept result, forwarding upstream headers."""
+        response_headers: dict[str, str] = {}
+        if hasattr(result, "headers") and result.headers:
+            for k, v in result.headers.items():
+                if k.lower() not in ("transfer-encoding", "connection", "content-encoding", "content-length"):
+                    response_headers[k] = v
+        response_headers["x-hivemind-tokens-in"] = str(getattr(result, "tokens_in", 0))
+        response_headers["x-hivemind-tokens-out"] = str(getattr(result, "tokens_out", 0))
+        latency = getattr(result, "latency_ms", None) or getattr(result, "latency_total_ms", 0)
+        response_headers["x-hivemind-latency-ms"] = str(round(latency, 1))
+        response_headers["x-hivemind-retries"] = str(getattr(result, "retries", 0))
+        return response_headers
+
+    async def _log_result(self, agent_id, method, path, result) -> None:
+        """Log a completed request to the database."""
+        if not self.db or not result:
+            return
+        try:
+            latency = getattr(result, "latency_ms", None) or getattr(result, "latency_total_ms", 0)
+            await self.db.log_request(
+                agent_id=agent_id,
+                method=method,
+                path=path,
+                status_code=result.status_code,
+                tokens_in=getattr(result, "tokens_in", 0),
+                tokens_out=getattr(result, "tokens_out", 0),
+                latency_ms=latency,
+                retried=getattr(result, "retries", 0) > 0,
+                error=getattr(result, "error", None),
+                recorded_at=time.time(),
+            )
+        except Exception as exc:
+            logger.warning("Failed to log request: %s", exc)
 
     def get_stats(self) -> dict:
         return {
@@ -337,22 +383,22 @@ def run_proxy(config: HiveMindConfig) -> None:
 def main() -> None:
     """CLI entry point for standalone proxy (hivemind-proxy script)."""
     import argparse
+    import logging
 
-    parser = argparse.ArgumentParser(description="HiveMind API Proxy")
-    parser.add_argument("--host", default="127.0.0.1", help="Bind address")
-    parser.add_argument("--port", type=int, default=8765, help="Bind port")
-    parser.add_argument("--upstream", default="https://api.anthropic.com", help="Upstream API URL (auto-detects provider)")
-    parser.add_argument("--max-concurrency", type=int, default=5, help="Max concurrent requests")
-    parser.add_argument("--db", default="hivemind.db", help="Database path")
+    from ..cli_args import hivemind_config_from_proxy_cli_args, register_proxy_cli_arguments
+
+    parser = argparse.ArgumentParser(
+        prog="hivemind-proxy",
+        description="HiveMind API proxy (same flags as `hivemind proxy`)",
+    )
+    register_proxy_cli_arguments(parser, include_log_level=True)
     args = parser.parse_args()
 
-    config = HiveMindConfig(
-        proxy_host=args.host,
-        proxy_port=args.port,
-        upstream_url=args.upstream,
-        max_concurrency=args.max_concurrency,
-        db_path=args.db,
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     )
+    config = hivemind_config_from_proxy_cli_args(args)
     run_proxy(config)
 
 

@@ -1,0 +1,3 @@
+# Benchmark / evaluation fixtures and test doubles often look like secrets.
+evaluation/
+tests/

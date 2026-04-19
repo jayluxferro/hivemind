@@ -175,6 +175,12 @@ class HiveMindConfig:
     mcp_host: str = "127.0.0.1"
     mcp_port: int = 8766
 
+    # Upstream HTTP client (httpx verify=…)
+    http_tls_verify: bool = True
+
+    def __post_init__(self) -> None:
+        self.normalize_runtime_limits()
+
     def apply_provider_defaults(self) -> None:
         """Auto-detect provider from upstream URL and apply its defaults.
 
@@ -196,6 +202,16 @@ class HiveMindConfig:
         if self.aimd_multiplicative_decrease == 0.5:
             self.aimd_multiplicative_decrease = profile.aimd_multiplicative_decrease
 
+        self.normalize_runtime_limits()
+
+    def normalize_runtime_limits(self) -> None:
+        """Clamp concurrency limits so config matches admission/backpressure behavior.
+
+        Admission rejects max_concurrency < 1; min_concurrency must not exceed max.
+        """
+        self.max_concurrency = max(1, self.max_concurrency)
+        self.min_concurrency = max(0, min(self.min_concurrency, self.max_concurrency))
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "provider": self.provider,
@@ -213,4 +229,5 @@ class HiveMindConfig:
             "retry_base_delay": self.retry_base_delay,
             "retry_max_delay": self.retry_max_delay,
             "db_path": self.db_path,
+            "http_tls_verify": self.http_tls_verify,
         }

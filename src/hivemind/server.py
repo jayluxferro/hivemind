@@ -16,6 +16,7 @@ from .proxy.server import ProxyServer
 from .scheduler.admission import AdmissionController
 from .scheduler.backpressure import BackpressureController
 from .scheduler.budget import BudgetManager
+from .scheduler.providers import detect_provider, get_profile
 from .scheduler.queue import PriorityQueue
 from .scheduler.rate_limiter import RateLimiter
 from .tools.setup import setup_tool, SUPPORTED_TOOLS
@@ -43,7 +44,6 @@ class HiveMindServer:
         self.admission = AdmissionController(self.config.max_concurrency)
         self.rate_limiter = RateLimiter()
         if self.config.provider:
-            from .scheduler.providers import get_profile
             self.rate_limiter.configure_from_profile(get_profile(self.config.provider))
         self.backpressure = BackpressureController(
             max_concurrency=self.config.max_concurrency,
@@ -221,6 +221,10 @@ class HiveMindServer:
                                 "type": "integer",
                                 "description": "Max concurrent API requests",
                             },
+                            "min_concurrency": {
+                                "type": "integer",
+                                "description": "Floor for AIMD backpressure (clamped to max_concurrency)",
+                            },
                             "upstream_url": {
                                 "type": "string",
                                 "description": "Upstream API URL",
@@ -240,6 +244,10 @@ class HiveMindServer:
                             "max_retries": {
                                 "type": "integer",
                                 "description": "Max retries per request",
+                            },
+                            "http_tls_verify": {
+                                "type": "boolean",
+                                "description": "Verify upstream TLS certificates (set false only for local/dev)",
                             },
                         },
                     },
@@ -350,21 +358,59 @@ class HiveMindServer:
         else:
             return {"error": f"Unknown tool: {name}"}
 
+    async def _sync_concurrency_and_backpressure_from_config(self) -> None:
+        """Push concurrency and AIMD fields from self.config to admission + backpressure."""
+        self.config.normalize_runtime_limits()
+        await self.admission.set_max_concurrency(self.config.max_concurrency)
+        await self.backpressure.set_concurrency_limits(
+            self.config.max_concurrency,
+            self.config.min_concurrency,
+        )
+        await self.backpressure.set_aimd_params(
+            self.config.aimd_additive_increase,
+            self.config.aimd_multiplicative_decrease,
+        )
+        self.backpressure.set_latency_target(self.config.latency_target_ms)
+
     async def _handle_config(self, arguments: dict) -> dict:
         """View or update configuration."""
         if not arguments:
             return {"config": self.config.to_dict()}
 
-        updates = {}
-        if "max_concurrency" in arguments:
-            new_val = arguments["max_concurrency"]
-            self.config.max_concurrency = new_val
-            await self.admission.set_max_concurrency(new_val)
-            updates["max_concurrency"] = new_val
+        updates: dict = {}
 
+        # Upstream first: re-detect provider, refresh rate limiter, AIMD defaults, proxy target.
         if "upstream_url" in arguments:
-            self.config.upstream_url = arguments["upstream_url"]
-            updates["upstream_url"] = arguments["upstream_url"]
+            url = str(arguments["upstream_url"]).strip()
+            if not url:
+                return {"error": "upstream_url must be a non-empty string"}
+            self.config.upstream_url = url
+            self.config.apply_provider_defaults()
+            if self.config.provider:
+                self.rate_limiter.configure_from_profile(get_profile(self.config.provider))
+
+            profile = detect_provider(self.config.upstream_url)
+            self.proxy.interceptor.rebind_upstream(self.config.upstream_url, profile)
+            await self._sync_concurrency_and_backpressure_from_config()
+            updates["upstream_url"] = self.config.upstream_url
+            updates["provider"] = self.config.provider
+
+        if "max_concurrency" in arguments:
+            self.config.max_concurrency = arguments["max_concurrency"]
+        if "min_concurrency" in arguments:
+            self.config.min_concurrency = arguments["min_concurrency"]
+
+        if "max_concurrency" in arguments or "min_concurrency" in arguments:
+            self.config.normalize_runtime_limits()
+            await self.admission.set_max_concurrency(self.config.max_concurrency)
+            await self.backpressure.set_concurrency_limits(
+                self.config.max_concurrency,
+                self.config.min_concurrency,
+            )
+            if "max_concurrency" in arguments:
+                updates["max_concurrency"] = self.config.max_concurrency
+            if "min_concurrency" in arguments:
+                updates["min_concurrency"] = self.config.min_concurrency
 
         if "total_token_budget" in arguments:
             val = arguments["total_token_budget"]
@@ -385,6 +431,14 @@ class HiveMindServer:
             self.config.max_retries = arguments["max_retries"]
             self.proxy.retry_policy.max_retries = arguments["max_retries"]
             updates["max_retries"] = arguments["max_retries"]
+
+        if "http_tls_verify" in arguments:
+            v = arguments["http_tls_verify"]
+            if not isinstance(v, bool):
+                return {"error": "http_tls_verify must be a boolean"}
+            self.config.http_tls_verify = v
+            await self.proxy.interceptor.set_tls_verify(v)
+            updates["http_tls_verify"] = v
 
         return {
             "updated": updates,

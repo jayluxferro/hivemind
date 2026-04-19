@@ -22,7 +22,7 @@ import httpx
 from ..scheduler.admission import AdmissionController
 from ..scheduler.backpressure import BackpressureController
 from ..scheduler.budget import BudgetExhausted, BudgetManager
-from ..scheduler.providers import ProviderProfile
+from ..scheduler.providers import ProviderProfile, detect_provider
 from ..scheduler.rate_limiter import RateLimiter
 from .latency_tracker import LatencyTracker
 from .retry import RetryPolicy, is_retryable_error, is_retryable_status
@@ -69,6 +69,8 @@ class Interceptor:
         latency_tracker: LatencyTracker,
         retry_policy: RetryPolicy,
         provider: ProviderProfile | None = None,
+        *,
+        tls_verify: bool = True,
     ) -> None:
         self.upstream_url = upstream_url.rstrip("/")
         self.admission = admission
@@ -78,14 +80,28 @@ class Interceptor:
         self.latency_tracker = latency_tracker
         self.retry_policy = retry_policy
         self.provider = provider
+        self._tls_verify = tls_verify
         self._client: httpx.AsyncClient | None = None
+
+    def rebind_upstream(self, upstream_url: str, provider: ProviderProfile | None = None) -> None:
+        """Point the interceptor at a new upstream (URL and provider profile)."""
+        self.upstream_url = upstream_url.rstrip("/")
+        self.provider = provider if provider is not None else detect_provider(self.upstream_url)
+
+    async def set_tls_verify(self, verify: bool) -> None:
+        """Toggle TLS certificate verification; recreates the httpx client if running."""
+        self._tls_verify = verify
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
+            await self.start()
 
     async def start(self) -> None:
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(connect=10.0, read=300.0, write=30.0, pool=30.0),
             limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
             follow_redirects=True,
-            verify=False,
+            verify=self._tls_verify,
         )
 
     async def stop(self) -> None:
@@ -180,7 +196,7 @@ class Interceptor:
             forward_headers = {
                 k: v
                 for k, v in headers.items()
-                if k.lower() not in ("host", "transfer-encoding", "connection")
+                if k.lower() not in ("host", "transfer-encoding", "connection", "content-length")
             }
 
             start = time.monotonic()
@@ -299,7 +315,7 @@ class Interceptor:
                 forward_headers = {
                     k: v
                     for k, v in headers.items()
-                    if k.lower() not in ("host", "transfer-encoding", "connection")
+                    if k.lower() not in ("host", "transfer-encoding", "connection", "content-length")
                 }
 
                 response = await self.client.request(

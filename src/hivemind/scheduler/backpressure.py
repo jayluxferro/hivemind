@@ -40,8 +40,10 @@ class BackpressureController:
         update_interval: float = 5.0,
         admission: object | None = None,  # AdmissionController, avoids circular import
     ) -> None:
-        self._max_concurrency = max_concurrency
-        self._current_concurrency = float(max_concurrency)
+        # Match admission: max must be at least 1 or AIMD state stays degenerate.
+        safe_max = max(1, max_concurrency)
+        self._max_concurrency = safe_max
+        self._current_concurrency = float(safe_max)
         self._ai = additive_increase
         self._md = multiplicative_decrease
         self._latency_target = latency_target_ms
@@ -72,6 +74,23 @@ class BackpressureController:
     def set_latency_target(self, target_ms: float) -> None:
         """Update the latency target used for AIMD decisions."""
         self._latency_target = target_ms
+
+    async def set_concurrency_limits(self, max_concurrency: int, min_concurrency: int) -> None:
+        """Align AIMD ceiling/floor with config (e.g. after hm.config updates)."""
+        async with self._lock:
+            safe_max = max(1, max_concurrency)
+            self._min = max(0, min(min_concurrency, safe_max))
+            self._max_concurrency = safe_max
+            self._current_concurrency = min(
+                float(safe_max),
+                max(float(self._min), self._current_concurrency),
+            )
+
+    async def set_aimd_params(self, additive_increase: float, multiplicative_decrease: float) -> None:
+        """Update AIMD step sizes from config (e.g. after provider defaults change)."""
+        async with self._lock:
+            self._ai = additive_increase
+            self._md = multiplicative_decrease
 
     @property
     def recommended_concurrency(self) -> int:

@@ -16,7 +16,8 @@ logger = logging.getLogger(__name__)
 
 class AdmissionController:
     def __init__(self, max_concurrency: int = 5) -> None:
-        self._max = max_concurrency
+        # Zero or negative would make acquire() wait forever (active >= max with max==0).
+        self._max = max(1, max_concurrency)
         self._active = 0
         self._total_admitted = 0
         self._total_queued_time = 0.0

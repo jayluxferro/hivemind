@@ -7,6 +7,24 @@ from hivemind.scheduler.backpressure import BackpressureController
 
 
 @pytest.mark.asyncio
+async def test_set_concurrency_limits():
+    bp = BackpressureController(max_concurrency=10, min_concurrency=1)
+    bp._current_concurrency = 8.0
+    await bp.set_concurrency_limits(3, 1)
+    assert bp._max_concurrency == 3
+    assert bp._min == 1
+    assert bp._current_concurrency == 3.0
+
+
+@pytest.mark.asyncio
+async def test_set_aimd_params():
+    bp = BackpressureController(max_concurrency=5, additive_increase=0.5, multiplicative_decrease=0.5)
+    await bp.set_aimd_params(2.0, 0.25)
+    assert bp._ai == 2.0
+    assert bp._md == 0.25
+
+
+@pytest.mark.asyncio
 async def test_initial_state():
     bp = BackpressureController(max_concurrency=5)
     assert bp.recommended_concurrency == 5

@@ -17,6 +17,8 @@ pip install hivemind-scheduler
 # Start the proxy (auto-detects provider from URL)
 hivemind proxy                                          # Anthropic (default)
 hivemind proxy --upstream https://api.openai.com        # OpenAI
+# Equivalent console entry point (same flags as `hivemind proxy`):
+hivemind-proxy --upstream https://api.openai.com
 
 # In another terminal, point your agents at it
 ANTHROPIC_BASE_URL=http://127.0.0.1:8765 claude code   # Claude Code
@@ -82,6 +84,12 @@ hivemind proxy --upstream https://api.anthropic.com
 hivemind proxy --upstream https://api.openai.com
 hivemind proxy --upstream http://localhost:11434  # Ollama
 
+# Same behavior via the `hivemind-proxy` script (useful in minimal containers)
+hivemind-proxy --upstream http://localhost:11434
+
+# Local HTTPS / self-signed upstream (development only)
+hivemind proxy --insecure --upstream https://127.0.0.1:8443
+
 # Point agents at it
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8765
 export OPENAI_BASE_URL=http://127.0.0.1:8765/v1
@@ -91,6 +99,8 @@ export OPENAI_BASE_URL=http://127.0.0.1:8765/v1
 
 ```bash
 hivemind serve
+# Optional: same tuning flags as the proxy, plus TLS toggle
+hivemind serve --upstream https://api.openai.com --insecure
 ```
 
 ### IDE Integration
@@ -108,7 +118,9 @@ hivemind setup all         # Show all configs
 
 ### CLI Reference
 
-#### `hivemind proxy`
+`hivemind proxy` and **`hivemind-proxy`** share the same flags (implemented in `hivemind.cli_args`). The parent `hivemind` command also accepts `--log-level` before the subcommand (for example `hivemind --log-level DEBUG proxy`). **`hivemind-proxy`** includes `--log-level` on its own parser.
+
+#### `hivemind proxy` / `hivemind-proxy`
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -126,6 +138,8 @@ hivemind setup all         # Show all configs
 | `--aimd-decrease` | auto | AIMD multiplicative decrease (auto-detected from provider) |
 | `--total-budget` | unlimited | Global token budget |
 | `--agent-budget` | unlimited | Default per-agent token budget |
+| `--insecure` | off | Disable upstream TLS certificate verification (dev only) |
+| `--log-level` | `INFO` | **`hivemind-proxy` only** — logging verbosity |
 
 #### `hivemind serve`
 
@@ -138,6 +152,7 @@ hivemind setup all         # Show all configs
 | `--agent-budget` | unlimited | Default per-agent token budget |
 | `--max-retries` | `3` | Max transparent retries |
 | `--min-concurrency` | `1` | Floor for AIMD backpressure |
+| `--insecure` | off | Disable upstream TLS certificate verification (dev only) |
 
 ### MCP Tools
 
@@ -149,8 +164,21 @@ hivemind setup all         # Show all configs
 | `hm.priority` | Adjust task priority (low/normal/high/critical) |
 | `hm.budget` | Set/check token budgets (per-agent and global) |
 | `hm.metrics` | Scheduler performance stats |
-| `hm.config` | Tune scheduler parameters at runtime |
+| `hm.config` | Tune scheduler, upstream URL, TLS, and concurrency at runtime (see below) |
 | `hm.setup` | Generate IDE/tool integration configs |
+
+#### `hm.config` (runtime updates)
+
+Updates apply to the running MCP server (including the in-process proxy). Notable keys:
+
+| Key | Effect |
+|-----|--------|
+| `upstream_url` | Re-detects provider, re-seeds rate limits / AIMD defaults from the profile, rebinds the live proxy target, and syncs admission + backpressure. |
+| `max_concurrency` / `min_concurrency` | Clamped and pushed to admission + backpressure. |
+| `latency_target_ms` | Backpressure latency target. |
+| `http_tls_verify` | Recreates the upstream httpx client with verification on or off (boolean). |
+| `max_retries` | Proxy retry policy. |
+| Budget fields | Token budget manager + config mirror. |
 
 ## Architecture
 
@@ -201,7 +229,13 @@ pip install -e ".[dev]"
 python -m pytest tests/ -v
 ```
 
-182 tests covering all scheduler primitives (admission control, backpressure with circuit breaker, rate limiting with provider profiles), proxy, streaming, multi-provider integration (Anthropic + OpenAI), tokenizer, distributed backend, and MCP tools.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for **pre-commit** (Ruff) and optional local **Gitleaks** usage.
+
+Automated tests cover scheduler primitives (admission control, backpressure with circuit breaker, rate limiting with provider profiles), proxy, streaming, multi-provider integration (Anthropic + OpenAI), tokenizer, distributed backend, and MCP tools. Run `python -m pytest tests/ -q` for the current count.
+
+## Security
+
+See [SECURITY.md](SECURITY.md) for TLS defaults, secret handling, and **Gitleaks** in CI and publish workflows.
 
 ## License
 

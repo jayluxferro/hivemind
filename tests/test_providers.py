@@ -2,6 +2,7 @@
 
 from hivemind.scheduler.providers import (
     ANTHROPIC,
+    GENERIC,
     OLLAMA,
     OPENAI,
     ProviderType,
@@ -52,6 +53,38 @@ def test_get_profile_by_string():
 def test_get_profile_by_enum():
     p = get_profile(ProviderType.OPENAI)
     assert p.name == "OpenAI"
+
+
+def test_get_profile_invalid_string_falls_back_to_generic():
+    p = get_profile("not-a-real-provider")
+    assert p is GENERIC
+
+
+def test_get_profile_case_and_whitespace_insensitive():
+    assert get_profile("ANTHROPIC").provider_type == ProviderType.ANTHROPIC
+    assert get_profile("  openai  ").provider_type == ProviderType.OPENAI
+
+
+def test_hivemind_config_normalize_runtime_limits():
+    from hivemind.storage.models import HiveMindConfig
+
+    c = HiveMindConfig(max_concurrency=-3, min_concurrency=50)
+    c.normalize_runtime_limits()
+    assert c.max_concurrency == 1
+    assert c.min_concurrency == 1
+
+
+def test_apply_provider_defaults_normalizes_extreme_concurrency():
+    from hivemind.storage.models import HiveMindConfig
+
+    c = HiveMindConfig(
+        max_concurrency=0,
+        min_concurrency=99,
+        upstream_url="https://api.anthropic.com",
+    )
+    c.apply_provider_defaults()
+    assert c.max_concurrency == 1
+    assert c.min_concurrency == 1
 
 
 def test_anthropic_profile_defaults():

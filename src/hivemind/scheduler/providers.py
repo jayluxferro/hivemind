@@ -11,9 +11,12 @@ Auto-detects provider from upstream URL or explicit configuration.
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
 from enum import Enum
+
+logger = logging.getLogger(__name__)
 
 
 class ProviderType(str, Enum):
@@ -201,7 +204,20 @@ def detect_provider(upstream_url: str) -> ProviderProfile:
 def get_profile(provider_type: ProviderType | str) -> ProviderProfile:
     """Get a provider profile by type."""
     if isinstance(provider_type, str):
-        provider_type = ProviderType(provider_type)
+        raw = provider_type
+        candidates: list[str] = []
+        for c in (raw, raw.strip(), raw.strip().lower()):
+            if c and c not in candidates:
+                candidates.append(c)
+        for cand in candidates:
+            try:
+                provider_type = ProviderType(cand)
+                break
+            except ValueError:
+                continue
+        else:
+            logger.warning("Unknown provider type %r, using GENERIC", raw)
+            return GENERIC
     return _PROFILES.get(provider_type, GENERIC)
 
 
