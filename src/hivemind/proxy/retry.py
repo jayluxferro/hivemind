@@ -64,6 +64,10 @@ def compute_delay(
 class RetryPolicy:
     """Configurable retry policy for API requests."""
 
+    # If the upstream says retry-after exceeds this threshold, don't retry —
+    # just pass the response through immediately (e.g. hard rate limit "resets at 8pm").
+    RETRY_AFTER_PASS_THROUGH_THRESHOLD = 120.0  # seconds
+
     def __init__(
         self,
         max_retries: int = 3,
@@ -82,8 +86,17 @@ class RetryPolicy:
         status_code: int | None = None,
         error: Exception | None = None,
         retryable_codes: set[int] | None = None,
+        retry_after: float | None = None,
     ) -> bool:
         if attempt >= self.max_retries:
+            return False
+        # If retry-after is too long, pass through immediately (hard rate limit)
+        if retry_after is not None and retry_after > self.RETRY_AFTER_PASS_THROUGH_THRESHOLD:
+            logger.info(
+                "Retry-after %.0fs exceeds threshold (%.0fs) — passing response through",
+                retry_after,
+                self.RETRY_AFTER_PASS_THROUGH_THRESHOLD,
+            )
             return False
         if status_code is not None and is_retryable_status(status_code, retryable_codes):
             return True

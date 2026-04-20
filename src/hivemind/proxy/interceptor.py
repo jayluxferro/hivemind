@@ -225,7 +225,23 @@ class Interceptor:
                     latency_ms = (time.monotonic() - start) * 1000
                     self.latency_tracker.record(latency_ms, response.status_code)
                     result.latency_total_ms = latency_ms
-                    result.error = b"".join(error_chunks).decode("utf-8", errors="replace")[:500]
+                    error_body = b"".join(error_chunks).decode("utf-8", errors="replace")[:500]
+                    result.error = error_body
+
+                    # Debug: log auth failures
+                    if response.status_code == 401:
+                        has_key = "x-api-key" in forward_headers
+                        key_prefix = forward_headers.get("x-api-key", "")[:8] if has_key else "<missing>"
+                        logger.warning(
+                            "401 from upstream (stream): url=%s has_x_api_key=%s "
+                            "key_prefix=%s anthropic_version=%s body=%s",
+                            upstream_url,
+                            has_key,
+                            key_prefix,
+                            forward_headers.get("anthropic-version", "<missing>"),
+                            error_body[:300],
+                        )
+
                     yield b"".join(error_chunks), result
                     return
 
@@ -327,6 +343,20 @@ class Interceptor:
 
                 latency_ms = (time.monotonic() - start) * 1000
 
+                # Debug: log auth failures with response body and header presence
+                if response.status_code == 401:
+                    has_key = "x-api-key" in forward_headers
+                    key_prefix = forward_headers.get("x-api-key", "")[:8] if has_key else "<missing>"
+                    logger.warning(
+                        "401 from upstream: url=%s has_x_api_key=%s key_prefix=%s "
+                        "anthropic_version=%s body=%s",
+                        upstream_url,
+                        has_key,
+                        key_prefix,
+                        forward_headers.get("anthropic-version", "<missing>"),
+                        response.content[:300],
+                    )
+
                 # 4. Record latency
                 self.latency_tracker.record(latency_ms, response.status_code)
                 await self.backpressure.record_latency(latency_ms)
@@ -336,15 +366,15 @@ class Interceptor:
                 await self.rate_limiter.update_from_headers(resp_headers)
 
                 # 6. Check if retryable (use provider-specific codes when available)
+                retry_after = None
+                if "retry-after" in resp_headers:
+                    try:
+                        retry_after = float(resp_headers["retry-after"])
+                    except ValueError:
+                        pass
                 provider_codes = self.provider.retryable_status_codes if self.provider else None
-                if is_retryable_status(response.status_code, provider_codes) and self.retry_policy.should_retry(attempt, response.status_code, retryable_codes=provider_codes):
+                if is_retryable_status(response.status_code, provider_codes) and self.retry_policy.should_retry(attempt, response.status_code, retryable_codes=provider_codes, retry_after=retry_after):
                     await self.backpressure.record_error()
-                    retry_after = None
-                    if "retry-after" in resp_headers:
-                        try:
-                            retry_after = float(resp_headers["retry-after"])
-                        except ValueError:
-                            pass
                     await self.retry_policy.wait(attempt, retry_after)
                     retries += 1
                     continue
