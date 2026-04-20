@@ -102,6 +102,9 @@ class Interceptor:
             limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
             follow_redirects=True,
             verify=self._tls_verify,
+            # Empty user-agent default so httpx doesn't inject python-httpx/X.Y.Z;
+            # the actual user-agent flows through via forward_headers from the agent.
+            headers={"user-agent": ""},
         )
 
     async def stop(self) -> None:
