@@ -350,6 +350,7 @@ def _build_proxy(config: HiveMindConfig) -> ProxyServer:
     if config.provider:
         from ..scheduler.providers import get_profile
         rate_limiter.configure_from_profile(get_profile(config.provider))
+    rate_limiter.apply_overrides(rpm=config.rpm_limit, tpm=config.tpm_limit)
     backpressure = BackpressureController(
         max_concurrency=config.max_concurrency,
         additive_increase=config.aimd_additive_increase,

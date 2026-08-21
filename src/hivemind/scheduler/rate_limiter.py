@@ -68,6 +68,21 @@ class RateLimiter:
             profile.name, self._rpm_limit, self._tpm_limit,
         )
 
+    def apply_overrides(self, *, rpm: int | None = None, tpm: int | None = None) -> None:
+        """Apply explicit CLI/config limits on top of the provider profile.
+
+        Only non-None values are overridden. Call after configure_from_profile.
+        """
+        if rpm is not None:
+            self._rpm_limit = rpm
+        if tpm is not None:
+            self._tpm_limit = tpm
+        if rpm is not None or tpm is not None:
+            logger.info(
+                "Rate limiter: overrides applied — %s RPM, %s TPM",
+                self._rpm_limit, self._tpm_limit,
+            )
+
     def record_request(self) -> None:
         """Record that a request was sent (for RPM counting)."""
         self._request_timestamps.append(time.monotonic())

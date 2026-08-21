@@ -35,6 +35,18 @@ def register_serve_cli_arguments(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Disable upstream HTTPS TLS certificate verification",
     )
+    parser.add_argument(
+        "--rpm-limit",
+        type=int,
+        default=None,
+        help="Override requests-per-minute limit (auto-detected from provider)",
+    )
+    parser.add_argument(
+        "--tpm-limit",
+        type=int,
+        default=None,
+        help="Override tokens-per-minute limit (auto-detected from provider)",
+    )
 
 
 def apply_serve_cli_args_to_config(config: HiveMindConfig, args: argparse.Namespace) -> None:
@@ -55,6 +67,10 @@ def apply_serve_cli_args_to_config(config: HiveMindConfig, args: argparse.Namesp
         config.min_concurrency = args.min_concurrency
     if hasattr(args, "insecure") and args.insecure:
         config.http_tls_verify = False
+    if getattr(args, "rpm_limit", None) is not None:
+        config.rpm_limit = args.rpm_limit
+    if getattr(args, "tpm_limit", None) is not None:
+        config.tpm_limit = args.tpm_limit
 
 
 def register_proxy_cli_arguments(
@@ -113,6 +129,18 @@ def register_proxy_cli_arguments(
         action="store_true",
         help="Disable upstream HTTPS TLS certificate verification",
     )
+    parser.add_argument(
+        "--rpm-limit",
+        type=int,
+        default=None,
+        help="Override requests-per-minute limit (auto-detected from provider)",
+    )
+    parser.add_argument(
+        "--tpm-limit",
+        type=int,
+        default=None,
+        help="Override tokens-per-minute limit (auto-detected from provider)",
+    )
 
 
 def hivemind_config_from_proxy_cli_args(args: argparse.Namespace) -> HiveMindConfig:
@@ -143,4 +171,8 @@ def hivemind_config_from_proxy_cli_args(args: argparse.Namespace) -> HiveMindCon
         config.aimd_additive_increase = args.aimd_increase
     if args.aimd_decrease is not None:
         config.aimd_multiplicative_decrease = args.aimd_decrease
+    if getattr(args, "rpm_limit", None) is not None:
+        config.rpm_limit = args.rpm_limit
+    if getattr(args, "tpm_limit", None) is not None:
+        config.tpm_limit = args.tpm_limit
     return config

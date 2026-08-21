@@ -185,7 +185,12 @@ _PROFILES: dict[ProviderType, ProviderProfile] = {
 # URL patterns for auto-detection
 _URL_PATTERNS: list[tuple[str, ProviderType]] = [
     (r"api\.anthropic\.com", ProviderType.ANTHROPIC),
+    (r"api\.deepseek\.com", ProviderType.ANTHROPIC),
+    (r"api\.myapi\.world", ProviderType.ANTHROPIC),
+    (r"api\.kimi\.com", ProviderType.ANTHROPIC),
+    (r"api\.z\.ai", ProviderType.ANTHROPIC),
     (r"api\.openai\.com", ProviderType.OPENAI),
+    (r"api\.doubleword\.ai", ProviderType.OPENAI),
     (r"openai\.azure\.com", ProviderType.AZURE_OPENAI),
     (r"generativelanguage\.googleapis\.com", ProviderType.GOOGLE),
     (r"localhost:11434", ProviderType.OLLAMA),

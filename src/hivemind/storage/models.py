@@ -165,6 +165,10 @@ class HiveMindConfig:
     retry_base_delay: float = 1.0
     retry_max_delay: float = 30.0
 
+    # Rate limits (None = use provider profile defaults)
+    rpm_limit: int | None = None
+    tpm_limit: int | None = None
+
     # Storage
     db_path: str = "hivemind.db"
 
