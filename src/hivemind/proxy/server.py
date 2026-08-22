@@ -27,6 +27,7 @@ from ..storage.db import Database
 from ..storage.models import HiveMindConfig
 from .interceptor import Interceptor
 from .latency_tracker import LatencyTracker
+from ..scheduler.cache_telemetry import CacheTelemetry
 from .retry import RetryPolicy
 
 logger = logging.getLogger(__name__)
@@ -59,6 +60,7 @@ class ProxyServer:
             max_delay=config.retry_max_delay,
         )
         provider = detect_provider(config.upstream_url)
+        self.cache_telemetry = CacheTelemetry()
         self.interceptor = Interceptor(
             upstream_url=config.upstream_url,
             admission=admission,
@@ -69,6 +71,7 @@ class ProxyServer:
             retry_policy=self.retry_policy,
             provider=provider,
             tls_verify=config.http_tls_verify,
+            cache_telemetry=self.cache_telemetry,
         )
         self._app: Starlette | None = None
         self._server_task: asyncio.Task | None = None
@@ -92,6 +95,76 @@ class ProxyServer:
                 media_type="application/json",
             )
 
+        async def cache_probe_handler(request: Request) -> Response:
+            """Active prompt-cache probe: send one cache_control-bearing body
+            twice; a provider that honors caching reports creation on the first
+            request and a cache read on the second."""
+            import json as _json
+
+            import httpx as _httpx
+
+            try:
+                params = await request.json()
+            except Exception:
+                params = {}
+            model = str(params.get("model") or "claude-sonnet-4-20250514")
+            # Anthropic-style caching needs a >=1024-token cacheable prefix;
+            # this filler crosses the threshold while staying cheap.
+            filler = "prompt cache capability probe payload. " * 220
+            probe_body = {
+                "model": model,
+                "max_tokens": 8,
+                "system": [
+                    {
+                        "type": "text",
+                        "text": filler,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+                "messages": [{"role": "user", "content": "Reply with: ok"}],
+            }
+            headers = {
+                "content-type": "application/json",
+                "anthropic-version": "2023-06-01",
+            }
+            for key in ("x-api-key", "authorization"):
+                value = request.headers.get(key)
+                if value:
+                    headers[key] = value
+            url = f"{self.config.upstream_url.rstrip('/')}/v1/messages"
+            usages = []
+            try:
+                async with _httpx.AsyncClient(
+                    verify=self.config.http_tls_verify, timeout=60.0
+                ) as client:
+                    for _ in range(2):
+                        resp = await client.post(url, json=probe_body, headers=headers)
+                        try:
+                            usages.append(resp.json().get("usage", {}))
+                        except Exception:
+                            usages.append(
+                                {"_status": resp.status_code, "_raw": resp.text[:200]}
+                            )
+            except Exception as exc:
+                return Response(
+                    content=_json.dumps({"error": str(exc)}),
+                    status_code=502,
+                    media_type="application/json",
+                )
+            verdict = self.cache_telemetry.record_probe(usages[-1] if usages else {})
+            return Response(
+                content=_json.dumps(
+                    {
+                        "model": model,
+                        "usages": usages,
+                        "cache_supported": verdict,
+                        "note": "verdict from the second request's usage fields",
+                    },
+                    indent=2,
+                ),
+                media_type="application/json",
+            )
+
         from contextlib import asynccontextmanager
 
         @asynccontextmanager
@@ -104,6 +177,7 @@ class ProxyServer:
             routes=[
                 Route("/_health", health_handler, methods=["GET"]),
                 Route("/_stats", stats_handler, methods=["GET"]),
+                Route("/_probe/cache", cache_probe_handler, methods=["POST"]),
                 # Catch-all proxy route
                 Route("/{path:path}", proxy_handler, methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"]),
             ],
@@ -295,6 +369,7 @@ class ProxyServer:
                 "host": self.config.proxy_host,
                 "port": self.config.proxy_port,
             },
+            "caching": self.cache_telemetry.snapshot(),
             "admission": self.admission.stats,
             "rate_limiter": self.rate_limiter.stats,
             "backpressure": self.backpressure.stats,

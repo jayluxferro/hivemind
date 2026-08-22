@@ -28,6 +28,7 @@ from .latency_tracker import LatencyTracker
 from .retry import RetryPolicy, is_retryable_error, is_retryable_status
 from .streaming import StreamingResult, is_streaming_request, parse_sse_chunk, stream_response
 from .token_counter import count_request_tokens, count_response_tokens
+from ..scheduler.cache_telemetry import CacheTelemetry
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +72,7 @@ class Interceptor:
         provider: ProviderProfile | None = None,
         *,
         tls_verify: bool = True,
+        cache_telemetry: CacheTelemetry | None = None,
     ) -> None:
         self.upstream_url = upstream_url.rstrip("/")
         self.admission = admission
@@ -81,6 +83,7 @@ class Interceptor:
         self.retry_policy = retry_policy
         self.provider = provider
         self._tls_verify = tls_verify
+        self.cache_telemetry = cache_telemetry
         self._client: httpx.AsyncClient | None = None
 
     def rebind_upstream(self, upstream_url: str, provider: ProviderProfile | None = None) -> None:
@@ -142,6 +145,8 @@ class Interceptor:
 
         # Estimate request tokens for budget check
         est_request_tokens = count_request_tokens(body)
+        if self.cache_telemetry:
+            self.cache_telemetry.observe_request(body)
 
         # 1. Acquire admission slot
         acquired = await self.admission.acquire(timeout=120.0)
@@ -185,6 +190,8 @@ class Interceptor:
             return
 
         est_request_tokens = count_request_tokens(body)
+        if self.cache_telemetry:
+            self.cache_telemetry.observe_request(body)
 
         acquired = await self.admission.acquire(timeout=120.0)
         if not acquired:
@@ -271,6 +278,8 @@ class Interceptor:
                     tokens_in, tokens_out, is_final = parse_sse_chunk(chunk)
                     total_tokens_in += tokens_in
                     total_tokens_out += tokens_out
+                    if self.cache_telemetry and b'"usage"' in chunk:
+                        self.cache_telemetry.observe_response(chunk)
 
                     # Yield chunk to client
                     yield chunk, None
@@ -384,6 +393,8 @@ class Interceptor:
 
                 # 7. Count tokens
                 tokens_in, tokens_out = count_response_tokens(response.content)
+                if self.cache_telemetry:
+                    self.cache_telemetry.observe_response(response.content)
                 if not tokens_in:
                     tokens_in = est_request_tokens
 
