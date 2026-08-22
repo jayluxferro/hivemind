@@ -381,7 +381,7 @@ requires-dist = [
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.24.0" },
     { name = "redis", marker = "extra == 'distributed'", specifier = ">=5.0.0" },
     { name = "rich", specifier = ">=13.0.0" },
-    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.8.0" },
+    { name = "ruff", marker = "extra == 'dev'", specifier = "==0.15.11" },
     { name = "starlette", specifier = ">=0.45.0" },
     { name = "tiktoken", marker = "extra == 'tokenizer'", specifier = ">=0.7.0" },
     { name = "tomli", specifier = ">=2.0.0" },

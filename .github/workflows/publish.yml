@@ -27,7 +27,7 @@ jobs:
           python-version: "3.12"
 
       - name: Lint
-        run: pip install ruff && ruff check src/ tests/
+        run: ruff check src/ tests/
 
       - name: Install build tools
         run: pip install build

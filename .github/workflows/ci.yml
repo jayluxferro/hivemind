@@ -43,6 +43,4 @@ jobs:
 
       - name: Lint
         if: matrix.python-version == '3.12'
-        run: |
-          pip install ruff
-          ruff check src/ tests/
+        run: ruff check src/ tests/
