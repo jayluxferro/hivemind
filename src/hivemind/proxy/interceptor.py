@@ -333,11 +333,22 @@ class Interceptor:
                                 raise chunk
 
                             # Gate 2: mid-stream failure — emit exactly one terminal frame.
+                            # An abrupt upstream close surfaces as httpx.ReadError wrapping
+                            # anyio.EndOfStream — str(exc) is EMPTY, so always prefix the
+                            # exception type; without it the warning and the client-visible
+                            # terminal frame carry no information.
                             latency_ms = (time.monotonic() - start) * 1000
                             result.latency_total_ms = latency_ms
                             self.latency_tracker.record(latency_ms, result.status_code)
                             await self.backpressure.record_error()
-                            result.error = str(chunk)
+                            detail = f"{type(chunk).__name__}: {chunk}".rstrip(": ")
+                            logger.warning(
+                                "HiveMind: mid-stream failure after %.1fs / %d chunks: %s",
+                                latency_ms / 1000,
+                                result.chunks_sent,
+                                detail,
+                            )
+                            result.error = detail
                             result.tokens_in = total_tokens_in or est_request_tokens
                             result.tokens_out = total_tokens_out
                             yield sse_terminal_error_frame(path, result.error), None
@@ -383,7 +394,8 @@ class Interceptor:
                 except Exception as exc:
                     latency_ms = (time.monotonic() - start) * 1000
                     result.latency_total_ms = latency_ms
-                    result.error = str(exc)
+                    detail = f"{type(exc).__name__}: {exc}".rstrip(": ")
+                    result.error = detail
 
                     if response is not None:
                         await response.aclose()
@@ -401,7 +413,7 @@ class Interceptor:
                     result.headers["content-type"] = "application/json"
                     self.latency_tracker.record(latency_ms, status)
                     await self.backpressure.record_error()
-                    error_json = f'{{"error": "HiveMind proxy error: {exc}"}}'.encode()
+                    error_json = f'{{"error": "HiveMind proxy error: {detail}"}}'.encode()
                     yield error_json, result
                     return
 

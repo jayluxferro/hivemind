@@ -7,6 +7,7 @@ network is required. They exercise the full ProxyServer -> Interceptor path.
 from __future__ import annotations
 
 import json
+import logging
 
 import httpx
 import pytest
@@ -90,6 +91,45 @@ class _PartialThenReset(httpx.AsyncByteStream):
         raise httpx.ConnectError("peer closed connection without sending complete message body")
 
 
+class _ReadErrorEmpty(httpx.AsyncByteStream):
+    """Emit one complete SSE event then raise httpx.ReadError with an empty str.
+
+    This is what an abrupt upstream close looks like: httpx wraps anyio's
+    EndOfStream in ReadError, and str(exc) is empty.
+    """
+
+    async def __aiter__(self):
+        yield b'event: message_start\ndata: {"type": "message_start"}\n\n'
+        raise httpx.ReadError("")
+
+
+def _parse_sse(data: bytes) -> list[dict]:
+    """Parse simple ``event/data`` SSE frames into a list of dicts."""
+    events: list[dict] = []
+    current: dict = {}
+    for line in data.decode("utf-8", errors="replace").splitlines():
+        if line.startswith("event: "):
+            current["event"] = line[len("event: ") :]
+        elif line.startswith("data: "):
+            current.setdefault("data", []).append(line[len("data: ") :])
+        elif line == "":
+            if current:
+                _finalize_event(current)
+                events.append(current)
+                current = {}
+    if current:
+        _finalize_event(current)
+        events.append(current)
+    return events
+
+
+def _finalize_event(event: dict) -> None:
+    try:
+        event["json"] = json.loads("".join(event.get("data", [])))
+    except json.JSONDecodeError:
+        event["json"] = None
+
+
 class _HappySSEStream(httpx.AsyncByteStream):
     """Emit a complete Anthropic-style SSE lifecycle."""
 
@@ -171,8 +211,54 @@ async def test_streaming_mid_stream_reset_emits_terminal_frame():
 
 
 @pytest.mark.asyncio
+async def test_streaming_mid_stream_empty_str_error_is_typed(caplog):
+    """B.2 abrupt upstream close (empty-str ReadError) -> terminal frame names the type.
+
+    Regression: an abrupt close surfaces as httpx.ReadError wrapping
+    anyio.EndOfStream, whose str() is EMPTY. The terminal SSE frame and the
+    warning log must still name the exception type — otherwise the failure is
+    invisible ("HiveMind: mid-stream failure: " with nothing after the colon,
+    and an empty client-facing message).
+    """
+
+    def handler(request):
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=_ReadErrorEmpty(),
+        )
+
+    proxy = await _proxy()
+    try:
+        _install_transport(proxy, handler)
+        with caplog.at_level(logging.WARNING, logger="hivemind.proxy.interceptor"):
+            response = await proxy._handle_streaming_request(
+                "POST",
+                "/v1/messages",
+                {"content-type": "application/json", "accept": "text/event-stream"},
+                _stream_body("/v1/messages"),
+                agent_id=None,
+            )
+
+        assert response.status_code == 200
+        assert "text/event-stream" in response.headers.get("content-type", "")
+        body = await _consume_response(response)
+        assert b"event: message_start" in body, "Should receive the one valid upstream frame"
+        assert b"event: error" in body, "Should receive a terminal error frame"
+
+        events = _parse_sse(body)
+        assert events, "zero-frame EOF is a bug"
+        assert events[-1]["event"] == "error"
+        assert events[-1]["json"]["error"]["message"].startswith("ReadError")
+        assert any("mid-stream failure" in r.getMessage() and "ReadError" in r.getMessage() for r in caplog.records)
+        assert proxy.interceptor.admission.active == 0
+    finally:
+        await proxy.interceptor.stop()
+
+
+@pytest.mark.asyncio
 async def test_streaming_reset_before_headers_returns_plain_502():
-    """B.2 upstream reset before headers -> plain 502/504 JSON, never empty 200 SSE."""
+    """B.3 upstream reset before headers -> plain 502/504 JSON, never empty 200 SSE."""
 
     def handler(request):
         raise httpx.ConnectError("connection reset by peer")
