@@ -373,3 +373,29 @@ async def test_set_tls_verify_recreates_client(components):
     assert inc._client is not None
     assert inc._client is not first_client
     await inc.stop()
+
+
+def test_forward_headers_strips_accept_encoding():
+    """Regression: a proxy consumes upstream bytes before re-serving them, so
+    it must not advertise encodings its own httpx cannot decode.  Forwarding
+    a client's `br` when brotli isn't installed made DeepSeek/CloudFront send
+    brotli bytes that reached the client raw with content-encoding stripped
+    (undecodable binary labelled application/json)."""
+    from hivemind.proxy.interceptor import _forward_headers
+
+    out = _forward_headers({
+        "host": "example.com",
+        "accept-encoding": "gzip, deflate, br, zstd",
+        "Accept-Encoding": "gzip, deflate, br",
+        "x-api-key": "k",
+        "content-type": "application/json",
+        "content-length": "123",
+        "connection": "keep-alive",
+    })
+    lowered = {k.lower() for k in out}
+    assert "accept-encoding" not in lowered
+    assert "host" not in lowered
+    assert "content-length" not in lowered
+    assert "connection" not in lowered
+    assert out["x-api-key"] == "k"
+    assert out["content-type"] == "application/json"

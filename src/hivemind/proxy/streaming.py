@@ -105,6 +105,44 @@ def parse_sse_chunk(raw: bytes) -> tuple[int, int, bool]:
     return 0, 0, False
 
 
+def _sse_path_flavor(path: str) -> str:
+    """Detect SSE event flavor from the request path."""
+    base = path.split("?", 1)[0]
+    if base == "/v1/messages":
+        return "anthropic"
+    if base == "/v1/chat/completions":
+        return "openai"
+    # Fallback: heuristic for any anthropic-style messages endpoint.
+    return "anthropic" if "/v1/messages" in base else "openai"
+
+
+def is_sse_content_type(headers: dict[str, str]) -> bool:
+    """Return True if the upstream headers advertise a text/event-stream body."""
+    return "text/event-stream" in headers.get("content-type", "")
+
+
+def sse_terminal_error_frame(path: str, message: str) -> bytes:
+    """Build a single terminal SSE frame for a mid-stream failure (Gate 2).
+
+    Anthropic /v1/messages uses ``event: error``. OpenAI /v1/chat/completions
+    uses a ``data: {"error": ...}`` frame followed by ``data: [DONE]``.
+
+    The leading ``\\n\\n`` self-frames the terminal event: if the upstream died
+    mid-frame, the partial line is terminated and its block dispatched first;
+    after a complete frame the extra blank lines are no-ops to SSE parsers.
+    """
+    flavor = _sse_path_flavor(path)
+    if flavor == "anthropic":
+        return (
+            f'\n\nevent: error\ndata: {json.dumps({"error": {"type": "error", "message": message}})}\n\n'
+        ).encode()
+    # OpenAI flavor
+    return (
+        f'\n\ndata: {json.dumps({"error": {"message": message, "type": "api_error"}})}\n\n'
+        f'data: [DONE]\n\n'
+    ).encode()
+
+
 async def stream_response(
     client: httpx.AsyncClient,
     method: str,

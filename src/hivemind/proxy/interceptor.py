@@ -14,6 +14,7 @@ Sits between agents and the upstream API. For each request:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 
@@ -26,11 +27,26 @@ from ..scheduler.providers import ProviderProfile, detect_provider
 from ..scheduler.rate_limiter import RateLimiter
 from .latency_tracker import LatencyTracker
 from .retry import RetryPolicy, is_retryable_error, is_retryable_status
-from .streaming import StreamingResult, is_streaming_request, parse_sse_chunk, stream_response
+from .streaming import StreamingResult, is_sse_content_type, is_streaming_request, parse_sse_chunk, sse_terminal_error_frame, stream_response
 from .token_counter import count_request_tokens, count_response_tokens
 from ..scheduler.cache_telemetry import CacheTelemetry
 
 logger = logging.getLogger(__name__)
+
+# Headers never forwarded upstream: hop-by-hop framing plus accept-encoding.
+# accept-encoding is capability-bound: this proxy consumes the upstream
+# response before re-serving it, so it must only advertise encodings its own
+# httpx can decode.  Forwarding a client's `br`/`zstd` when brotli/zstandard
+# aren't installed makes the upstream (or its CDN) send bytes that reach the
+# client raw with content-encoding stripped — undecodable garbage.
+_FORWARD_DROP = frozenset({
+    "host", "transfer-encoding", "connection", "content-length", "accept-encoding",
+})
+
+
+def _forward_headers(headers: dict[str, str]) -> dict[str, str]:
+    """Strip hop-by-hop + accept-encoding; httpx re-adds its own capability set."""
+    return {k: v for k, v in headers.items() if k.lower() not in _FORWARD_DROP}
 
 
 class InterceptResult:
@@ -179,9 +195,17 @@ class Interceptor:
     ):
         """Handle a streaming request — yields (chunk, streaming_result) tuples.
 
-        Yields chunks as they arrive from upstream. The final yield includes
-        a completed StreamingResult with token counts. The admission slot is
-        held for the duration of the stream.
+        Implements two gates from the SSE envelope spec:
+
+        * Gate 1 — never commit to ``text/event-stream`` until the upstream
+          proves it has one (2xx + ``text/event-stream`` content-type). Errors
+          and non-SSE 2xx bodies are returned as plain responses, with retries
+          allowed only before any byte has been committed to the client.
+        * Gate 2 — once committed, a mid-stream failure emits exactly one
+          terminal SSE error frame and then closes. Zero-frame EOF is a bug.
+
+        The admission slot is held for the duration of the request (including
+        any retries) and released exactly once.
         """
         # 0. Circuit breaker — fast-fail if the upstream is overwhelmed
         if self.backpressure.circuit_open:
@@ -200,118 +224,195 @@ class Interceptor:
             return
 
         try:
-            await self.rate_limiter.wait_if_throttled()
-
             upstream_url = f"{self.upstream_url}{path}"
-            forward_headers = {
-                k: v
-                for k, v in headers.items()
-                if k.lower() not in ("host", "transfer-encoding", "connection", "content-length")
-            }
+            forward_headers = _forward_headers(headers)
 
             start = time.monotonic()
             result = StreamingResult()
+            provider_codes = self.provider.retryable_status_codes if self.provider else None
 
-            try:
-                response, chunk_queue = await stream_response(
-                    self.client, method, upstream_url, forward_headers, body,
-                )
-                result.status_code = response.status_code
-                result.headers = dict(response.headers)
+            # Retry loop: only valid while no byte has been sent to the client.
+            for attempt in range(self.retry_policy.max_retries + 1):
+                response: httpx.Response | None = None
+                chunk_queue: asyncio.Queue | None = None
+                try:
+                    await self.rate_limiter.wait_if_throttled()
 
-                # Parse rate limit headers from initial response
-                await self.rate_limiter.update_from_headers(result.headers)
+                    response, chunk_queue = await stream_response(
+                        self.client, method, upstream_url, forward_headers, body,
+                    )
+                    result.status_code = response.status_code
+                    result.headers = dict(response.headers)
 
-                # If error status, collect body and don't stream
-                if response.status_code >= 400:
-                    error_chunks = []
+                    await self.rate_limiter.update_from_headers(result.headers)
+
+                    # Gate 1 branch: upstream already returned an error status.
+                    if response.status_code >= 400:
+                        retry_after = None
+                        if "retry-after" in result.headers:
+                            try:
+                                retry_after = float(result.headers["retry-after"])
+                            except ValueError:
+                                pass
+
+                        if is_retryable_status(response.status_code, provider_codes) and self.retry_policy.should_retry(
+                            attempt,
+                            status_code=response.status_code,
+                            retryable_codes=provider_codes,
+                            retry_after=retry_after,
+                        ):
+                            await self.backpressure.record_error()
+                            await self.retry_policy.wait(attempt, retry_after)
+                            result.retries += 1
+                            await response.aclose()
+                            continue
+
+                        error_chunks = []
+                        while True:
+                            chunk = await chunk_queue.get()
+                            if chunk is None:
+                                break
+                            if isinstance(chunk, Exception):
+                                break
+                            error_chunks.append(chunk)
+                        await response.aclose()
+                        latency_ms = (time.monotonic() - start) * 1000
+                        self.latency_tracker.record(latency_ms, response.status_code)
+                        result.latency_total_ms = latency_ms
+                        error_body = b"".join(error_chunks).decode("utf-8", errors="replace")[:500]
+                        result.error = error_body
+
+                        if response.status_code == 401:
+                            has_key = "x-api-key" in forward_headers
+                            key_prefix = forward_headers.get("x-api-key", "")[:8] if has_key else "<missing>"
+                            logger.warning(
+                                "401 from upstream (stream): url=%s has_x_api_key=%s "
+                                "key_prefix=%s anthropic_version=%s body=%s",
+                                upstream_url,
+                                has_key,
+                                key_prefix,
+                                forward_headers.get("anthropic-version", "<missing>"),
+                                error_body[:300],
+                            )
+
+                        yield b"".join(error_chunks), result
+                        return
+
+                    # Gate 1 branch: upstream returned 2xx but it isn't an SSE stream.
+                    if not is_sse_content_type(result.headers):
+                        body_chunks = []
+                        while True:
+                            chunk = await chunk_queue.get()
+                            if chunk is None:
+                                break
+                            if isinstance(chunk, Exception):
+                                # No byte has been sent yet, so this is still a
+                                # pre-commit failure we can retry.
+                                raise chunk
+                            body_chunks.append(chunk)
+                        await response.aclose()
+                        latency_ms = (time.monotonic() - start) * 1000
+                        self.latency_tracker.record(latency_ms, response.status_code)
+                        result.latency_total_ms = latency_ms
+                        yield b"".join(body_chunks), result
+                        return
+
+                    # Committed SSE path: from here on the status is frozen.
+                    first_chunk = True
+                    total_tokens_in = 0
+                    total_tokens_out = 0
+
                     while True:
                         chunk = await chunk_queue.get()
                         if chunk is None:
                             break
+
                         if isinstance(chunk, Exception):
-                            break
-                        error_chunks.append(chunk)
-                    latency_ms = (time.monotonic() - start) * 1000
-                    self.latency_tracker.record(latency_ms, response.status_code)
-                    result.latency_total_ms = latency_ms
-                    error_body = b"".join(error_chunks).decode("utf-8", errors="replace")[:500]
-                    result.error = error_body
+                            # If no byte has been committed yet we can still retry.
+                            if first_chunk:
+                                raise chunk
 
-                    # Debug: log auth failures
-                    if response.status_code == 401:
-                        has_key = "x-api-key" in forward_headers
-                        key_prefix = forward_headers.get("x-api-key", "")[:8] if has_key else "<missing>"
-                        logger.warning(
-                            "401 from upstream (stream): url=%s has_x_api_key=%s "
-                            "key_prefix=%s anthropic_version=%s body=%s",
-                            upstream_url,
-                            has_key,
-                            key_prefix,
-                            forward_headers.get("anthropic-version", "<missing>"),
-                            error_body[:300],
-                        )
+                            # Gate 2: mid-stream failure — emit exactly one terminal frame.
+                            latency_ms = (time.monotonic() - start) * 1000
+                            result.latency_total_ms = latency_ms
+                            self.latency_tracker.record(latency_ms, result.status_code)
+                            await self.backpressure.record_error()
+                            result.error = str(chunk)
+                            result.tokens_in = total_tokens_in or est_request_tokens
+                            result.tokens_out = total_tokens_out
+                            yield sse_terminal_error_frame(path, result.error), None
+                            yield None, result
+                            return
 
-                    yield b"".join(error_chunks), result
+                        # Track first chunk latency only on the first real byte.
+                        if first_chunk:
+                            result.latency_first_chunk_ms = (time.monotonic() - start) * 1000
+                            first_chunk = False
+
+                        result.chunks_sent += 1
+
+                        tokens_in, tokens_out, is_final = parse_sse_chunk(chunk)
+                        total_tokens_in += tokens_in
+                        total_tokens_out += tokens_out
+                        if self.cache_telemetry and b'"usage"' in chunk:
+                            self.cache_telemetry.observe_response(chunk)
+
+                        yield chunk, None
+
+                    # Normal completion.
+                    result.latency_total_ms = (time.monotonic() - start) * 1000
+                    result.tokens_in = total_tokens_in or est_request_tokens
+                    result.tokens_out = total_tokens_out
+
+                    self.latency_tracker.record(result.latency_total_ms, result.status_code)
+                    await self.backpressure.record_latency(result.latency_total_ms)
+                    await self.backpressure.record_success()
+                    self.rate_limiter.record_tokens(result.tokens_in + result.tokens_out)
+
+                    if agent_id and (result.tokens_in or result.tokens_out):
+                        try:
+                            await self.budget_manager.record_usage(
+                                agent_id, result.tokens_in, result.tokens_out
+                            )
+                        except BudgetExhausted:
+                            logger.warning("Budget exhausted for agent %s during stream", agent_id)
+
+                    yield None, result
                     return
 
-                first_chunk = True
-                total_tokens_in = 0
-                total_tokens_out = 0
+                except Exception as exc:
+                    latency_ms = (time.monotonic() - start) * 1000
+                    result.latency_total_ms = latency_ms
+                    result.error = str(exc)
 
-                while True:
-                    chunk = await chunk_queue.get()
-                    if chunk is None:
-                        break
-                    if isinstance(chunk, Exception):
-                        result.error = str(chunk)
-                        break
+                    if response is not None:
+                        await response.aclose()
 
-                    # Track first chunk latency
-                    if first_chunk:
-                        result.latency_first_chunk_ms = (time.monotonic() - start) * 1000
-                        first_chunk = False
+                    # Pre-commit failures may be retried before the client sees anything.
+                    if is_retryable_error(exc) and self.retry_policy.should_retry(attempt, error=exc):
+                        await self.backpressure.record_error()
+                        await self.retry_policy.wait(attempt)
+                        result.retries += 1
+                        continue
 
-                    result.chunks_sent += 1
+                    # Non-retryable or exhausted: map to a real HTTP status.
+                    status = 504 if isinstance(exc, httpx.TimeoutException) else 502
+                    result.status_code = status
+                    result.headers["content-type"] = "application/json"
+                    self.latency_tracker.record(latency_ms, status)
+                    await self.backpressure.record_error()
+                    error_json = f'{{"error": "HiveMind proxy error: {exc}"}}'.encode()
+                    yield error_json, result
+                    return
 
-                    # Parse for token counts
-                    tokens_in, tokens_out, is_final = parse_sse_chunk(chunk)
-                    total_tokens_in += tokens_in
-                    total_tokens_out += tokens_out
-                    if self.cache_telemetry and b'"usage"' in chunk:
-                        self.cache_telemetry.observe_response(chunk)
-
-                    # Yield chunk to client
-                    yield chunk, None
-
-                # Finalize
-                result.latency_total_ms = (time.monotonic() - start) * 1000
-                result.tokens_in = total_tokens_in or est_request_tokens
-                result.tokens_out = total_tokens_out
-
-                self.latency_tracker.record(result.latency_total_ms, result.status_code)
-                await self.backpressure.record_latency(result.latency_total_ms)
-                await self.backpressure.record_success()
-                self.rate_limiter.record_tokens(result.tokens_in + result.tokens_out)
-
-                # Record budget
-                if agent_id and (result.tokens_in or result.tokens_out):
-                    try:
-                        await self.budget_manager.record_usage(
-                            agent_id, result.tokens_in, result.tokens_out
-                        )
-                    except BudgetExhausted:
-                        logger.warning("Budget exhausted for agent %s during stream", agent_id)
-
-                # Yield final result
-                yield None, result
-
-            except Exception as exc:
-                latency_ms = (time.monotonic() - start) * 1000
-                self.latency_tracker.record(latency_ms, status_code=None)
-                result.latency_total_ms = latency_ms
-                result.error = str(exc)
-                yield None, result
+            # Retries exhausted — should have returned inside the loop, but guard anyway.
+            result.status_code = 502
+            result.headers["content-type"] = "application/json"
+            result.error = result.error or "max retries exceeded"
+            latency_ms = (time.monotonic() - start) * 1000
+            self.latency_tracker.record(latency_ms, 502)
+            await self.backpressure.record_error()
+            yield f'{{"error": "HiveMind: retries exhausted - {result.error}"}}'.encode(), result
 
         finally:
             await self.admission.release()
@@ -339,12 +440,8 @@ class Interceptor:
             try:
                 upstream_url = f"{self.upstream_url}{path}"
 
-                # Clean hop-by-hop headers
-                forward_headers = {
-                    k: v
-                    for k, v in headers.items()
-                    if k.lower() not in ("host", "transfer-encoding", "connection", "content-length")
-                }
+                # Clean hop-by-hop + capability-bound headers
+                forward_headers = _forward_headers(headers)
 
                 response = await self.client.request(
                     method=method,

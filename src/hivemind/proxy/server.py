@@ -287,6 +287,7 @@ class ProxyServer:
         # If the first yield already carries a completed result with an error
         # status, return a plain Response so the upstream status code is preserved.
         if first_result is not None and first_result.status_code >= 400:
+            await stream_iter.aclose()
             await self._log_result(agent_id, method, path, first_result)
             resp_headers = self._build_response_headers(first_result)
             body_bytes = (
@@ -299,6 +300,25 @@ class ProxyServer:
                 status_code=first_result.status_code,
                 headers=resp_headers,
             )
+
+        # Gate 1: upstream returned 2xx but not text/event-stream — forward as a
+        # plain response instead of mislabeling it as SSE.
+        if first_result is not None:
+            content_type = first_result.headers.get("content-type", "")
+            if "text/event-stream" not in content_type:
+                await stream_iter.aclose()
+                await self._log_result(agent_id, method, path, first_result)
+                resp_headers = self._build_response_headers(first_result)
+                body_bytes = (
+                    first_chunk
+                    if isinstance(first_chunk, bytes)
+                    else (first_chunk.encode() if first_chunk else b"")
+                )
+                return Response(
+                    content=body_bytes,
+                    status_code=first_result.status_code,
+                    headers=resp_headers,
+                )
 
         # Normal streaming path — forward remaining chunks.
         streaming_result = first_result
