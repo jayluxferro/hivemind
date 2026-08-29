@@ -3,6 +3,25 @@
 Reads x-ratelimit-* headers from API responses and pauses requests
 before hitting limits, not after. Can be pre-seeded from a provider
 profile so throttling works before the first response arrives.
+
+Two scopes for the local sliding-window counters (see ``scope``):
+
+* ``per_agent`` (default) — each agent_id gets its own RPM/TPM window, so
+  one busy session cannot consume another session's self-imposed budget.
+  Calls with no agent_id fall back to the shared global window.
+* ``global`` — every request shares the single global window (the original
+  behavior; select with ``--rate-limit-scope global``).
+
+Header-driven state is ALWAYS global regardless of scope: 429s, retry-after,
+and proactive throttling reflect the upstream provider's view of the shared
+API key, so they must pause everyone.
+
+Why no aggregate sliding-window ceiling in per_agent scope: a global counter
+held at the same RPM/TPM values would throttle every agent as soon as their
+combined traffic hit the limit — exactly the cross-agent stall this feature
+exists to remove. The genuine provider ceiling still arrives via response
+headers (above), which pause all agents when the shared key is truly
+saturated.
 """
 
 from __future__ import annotations
@@ -14,6 +33,13 @@ from collections import deque
 from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
+
+# Length of the sliding window for local RPM/TPM counters.
+_WINDOW_SECONDS = 60.0
+
+# Valid values for the rate-limiter scope. "per_agent" buckets the local
+# sliding windows by agent identity; "global" keeps one shared window.
+SCOPES = ("per_agent", "global")
 
 
 @dataclass
@@ -35,24 +61,47 @@ class RateLimiter:
     Two layers of protection:
     1. Header-based: parses x-ratelimit-* / anthropic-ratelimit-* headers
        from API responses and throttles proactively when near limits.
-    2. Request counter: a sliding-window RPM counter seeded from the
+       This layer is always global — it reflects the shared API key.
+    2. Request counter: a sliding-window RPM/TPM counter seeded from the
        provider profile. Acts as a safety net when the provider sends
        no rate-limit headers (e.g. Ollama) or before the first response.
+       This layer is scoped: per-agent by default, or global when
+       ``scope="global"``.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, scope: str = "per_agent") -> None:
+        if scope not in SCOPES:
+            raise ValueError(f"Invalid rate limiter scope {scope!r}; expected one of {SCOPES}")
+        self._scope = scope
         self._windows: dict[str, RateLimitWindow] = {}
         self._lock = asyncio.Lock()
         # Threshold: if remaining requests < this fraction of limit, start throttling
         self._throttle_threshold = 0.1
         self._pause_until: float = 0.0
 
-        # Sliding-window RPM counter (provider-seeded)
+        # Sliding-window RPM/TPM counters (provider-seeded)
         self._rpm_limit: int | None = None  # None = no RPM enforcement
         self._tpm_limit: int | None = None
+        # Global windows: used for scope="global", for calls with no agent_id,
+        # and directly by tests. Kept as plain attributes for back-compat.
         self._request_timestamps: deque[float] = deque()
         self._token_usage: deque[tuple[float, int]] = deque()  # (timestamp, tokens)
+        # Per-agent windows, keyed by agent_id (scope="per_agent" only).
+        self._agent_requests: dict[str, deque[float]] = {}
+        self._agent_tokens: dict[str, deque[tuple[float, int]]] = {}
         self._provider_name: str | None = None
+
+    @property
+    def scope(self) -> str:
+        return self._scope
+
+    def set_scope(self, scope: str) -> None:
+        """Switch between per-agent and global windowing at runtime."""
+        if scope not in SCOPES:
+            raise ValueError(f"Invalid rate limiter scope {scope!r}; expected one of {SCOPES}")
+        if scope != self._scope:
+            logger.info("Rate limiter: scope %s -> %s", self._scope, scope)
+            self._scope = scope
 
     def configure_from_profile(self, profile) -> None:
         """Pre-seed rate limits from a ProviderProfile.
@@ -65,7 +114,9 @@ class RateLimiter:
         self._provider_name = profile.name
         logger.info(
             "Rate limiter: configured for %s — %d RPM, %d TPM",
-            profile.name, self._rpm_limit, self._tpm_limit,
+            profile.name,
+            self._rpm_limit,
+            self._tpm_limit,
         )
 
     def apply_overrides(self, *, rpm: int | None = None, tpm: int | None = None) -> None:
@@ -80,56 +131,91 @@ class RateLimiter:
         if rpm is not None or tpm is not None:
             logger.info(
                 "Rate limiter: overrides applied — %s RPM, %s TPM",
-                self._rpm_limit, self._tpm_limit,
+                self._rpm_limit,
+                self._tpm_limit,
             )
 
-    def record_request(self) -> None:
-        """Record that a request was sent (for RPM counting)."""
-        self._request_timestamps.append(time.monotonic())
+    # -- scoped window selection -------------------------------------------
 
-    def record_tokens(self, count: int) -> None:
+    def _requests_window(self, agent_id: str | None) -> deque[float]:
+        """The request-timestamp deque an agent's traffic counts against."""
+        if self._scope == "per_agent" and agent_id is not None:
+            return self._agent_requests.setdefault(agent_id, deque())
+        return self._request_timestamps
+
+    def _tokens_window(self, agent_id: str | None) -> deque[tuple[float, int]]:
+        """The token-usage deque an agent's traffic counts against."""
+        if self._scope == "per_agent" and agent_id is not None:
+            return self._agent_tokens.setdefault(agent_id, deque())
+        return self._token_usage
+
+    # -- recording ----------------------------------------------------------
+
+    def record_request(self, agent_id: str | None = None) -> None:
+        """Record that a request was sent (for RPM counting)."""
+        self._requests_window(agent_id).append(time.monotonic())
+
+    def record_tokens(self, count: int, agent_id: str | None = None) -> None:
         """Record token usage (for TPM counting)."""
         if count > 0:
-            self._token_usage.append((time.monotonic(), count))
+            self._tokens_window(agent_id).append((time.monotonic(), count))
 
-    def _rpm_wait_seconds(self) -> float:
-        """How long to wait based on RPM counter. 0 = no wait needed."""
-        if self._rpm_limit is None:
+    # -- wait computation ----------------------------------------------------
+
+    @staticmethod
+    def _requests_wait(timestamps: deque[float], limit: int | None) -> float:
+        """Seconds until the request window has capacity. 0 = no wait."""
+        if limit is None:
             return 0.0
         now = time.monotonic()
-        window = 60.0
         # Evict old entries
-        while self._request_timestamps and now - self._request_timestamps[0] > window:
-            self._request_timestamps.popleft()
-        if len(self._request_timestamps) >= self._rpm_limit:
+        while timestamps and now - timestamps[0] > _WINDOW_SECONDS:
+            timestamps.popleft()
+        if len(timestamps) >= limit:
             # Wait until the oldest request in the window expires
-            oldest = self._request_timestamps[0]
-            return (oldest + window) - now
+            return (timestamps[0] + _WINDOW_SECONDS) - now
         return 0.0
 
-    def _tpm_wait_seconds(self) -> float:
-        """How long to wait based on TPM counter. 0 = no wait needed."""
-        if self._tpm_limit is None:
+    @staticmethod
+    def _tokens_wait(usage: deque[tuple[float, int]], limit: int | None) -> float:
+        """Seconds until the token window has capacity. 0 = no wait."""
+        if limit is None:
             return 0.0
         now = time.monotonic()
-        window = 60.0
         # Evict old entries
-        while self._token_usage and now - self._token_usage[0][0] > window:
-            self._token_usage.popleft()
-        total = sum(t for _, t in self._token_usage)
-        if total >= self._tpm_limit:
-            oldest_ts = self._token_usage[0][0]
-            return (oldest_ts + window) - now
+        while usage and now - usage[0][0] > _WINDOW_SECONDS:
+            usage.popleft()
+        total = sum(t for _, t in usage)
+        if total >= limit:
+            return (usage[0][0] + _WINDOW_SECONDS) - now
         return 0.0
+
+    def _rpm_wait_seconds(self, agent_id: str | None = None) -> float:
+        """How long to wait based on RPM counter. 0 = no wait needed."""
+        return self._requests_wait(self._requests_window(agent_id), self._rpm_limit)
+
+    def _tpm_wait_seconds(self, agent_id: str | None = None) -> float:
+        """How long to wait based on TPM counter. 0 = no wait needed."""
+        return self._tokens_wait(self._tokens_window(agent_id), self._tpm_limit)
+
+    def _wait_seconds(self, agent_id: str | None) -> float:
+        """Combined wait: global header pause + this agent's window wait."""
+        header_wait = max(0.0, self._pause_until - time.time())  # always global
+        return max(header_wait, self._rpm_wait_seconds(agent_id), self._tpm_wait_seconds(agent_id))
 
     @property
     def is_throttled(self) -> bool:
-        return time.time() < self._pause_until or self._rpm_wait_seconds() > 0 or self._tpm_wait_seconds() > 0
+        """Global view: header pause or the shared window saturated."""
+        return self._wait_seconds(None) > 0
+
+    def agent_is_throttled(self, agent_id: str | None) -> bool:
+        """Scoped view: would a request from this agent have to wait?"""
+        return self._wait_seconds(agent_id) > 0
 
     @property
     def throttle_remaining_seconds(self) -> float:
-        header_wait = max(0.0, self._pause_until - time.time())
-        return max(header_wait, self._rpm_wait_seconds(), self._tpm_wait_seconds())
+        """Global view: seconds until the shared window has capacity."""
+        return self._wait_seconds(None)
 
     def get_window(self, provider: str = "default") -> RateLimitWindow | None:
         return self._windows.get(provider)
@@ -143,6 +229,9 @@ class RateLimiter:
           x-ratelimit-remaining-requests
           x-ratelimit-remaining-tokens
           retry-after
+
+        Header state is global: it describes the shared upstream API key,
+        so it pauses every agent regardless of scope.
         """
         async with self._lock:
             window = self._windows.get(provider, RateLimitWindow())
@@ -204,20 +293,25 @@ class RateLimiter:
                     self._pause_until - time.time(),
                 )
 
-    async def wait_if_throttled(self) -> float:
+    async def wait_if_throttled(self, agent_id: str | None = None) -> float:
         """Block until we're allowed to make a request. Returns seconds waited.
 
-        Also records the request in the RPM sliding window.
+        Waits on the global header pause plus this agent's scoped window,
+        then records the request in that window.
         """
         total_waited = 0.0
         while True:
-            wait_time = self.throttle_remaining_seconds
+            wait_time = self._wait_seconds(agent_id)
             if wait_time <= 0:
                 break
-            logger.info("Rate limiter: waiting %.1fs before next request", wait_time)
+            logger.info(
+                "Rate limiter: waiting %.1fs before next request (agent=%s)",
+                wait_time,
+                agent_id or "global",
+            )
             await asyncio.sleep(wait_time)
             total_waited += wait_time
-        self.record_request()
+        self.record_request(agent_id)
         return total_waited
 
     def _parse_reset(self, value: str) -> float | None:
@@ -235,25 +329,49 @@ class RateLimiter:
         except (ValueError, ImportError):
             return None
 
+    def _prune_agent_windows(self, now: float) -> None:
+        """Drop agent windows with no traffic left in the sliding window."""
+        for agent_id in [a for a, dq in self._agent_requests.items() if not dq or now - dq[-1] > _WINDOW_SECONDS]:
+            del self._agent_requests[agent_id]
+        for agent_id in [a for a, dq in self._agent_tokens.items() if not dq or now - dq[-1][0] > _WINDOW_SECONDS]:
+            del self._agent_tokens[agent_id]
+
     @property
     def stats(self) -> dict:
         now = time.monotonic()
         # Count requests in the last 60s
-        while self._request_timestamps and now - self._request_timestamps[0] > 60:
+        while self._request_timestamps and now - self._request_timestamps[0] > _WINDOW_SECONDS:
             self._request_timestamps.popleft()
-        while self._token_usage and now - self._token_usage[0][0] > 60:
+        while self._token_usage and now - self._token_usage[0][0] > _WINDOW_SECONDS:
             self._token_usage.popleft()
+        self._prune_agent_windows(now)
 
         result: dict = {
             "is_throttled": self.is_throttled,
             "throttle_remaining_seconds": round(self.throttle_remaining_seconds, 2),
             "provider": self._provider_name,
+            "scope": self._scope,
             "rpm_limit": self._rpm_limit,
             "rpm_current": len(self._request_timestamps),
             "tpm_limit": self._tpm_limit,
             "tpm_current": sum(t for _, t in self._token_usage),
             "providers": {},
+            "agents": {},
         }
+        for agent_id, timestamps in self._agent_requests.items():
+            while timestamps and now - timestamps[0] > _WINDOW_SECONDS:
+                timestamps.popleft()
+            tokens = self._agent_tokens.get(agent_id)
+            token_total = 0
+            if tokens:
+                while tokens and now - tokens[0][0] > _WINDOW_SECONDS:
+                    tokens.popleft()
+                token_total = sum(t for _, t in tokens)
+            result["agents"][agent_id] = {
+                "rpm_current": len(timestamps),
+                "tpm_current": token_total,
+                "is_throttled": self.agent_is_throttled(agent_id),
+            }
         for provider, window in self._windows.items():
             result["providers"][provider] = {
                 "remaining_requests": window.remaining_requests,

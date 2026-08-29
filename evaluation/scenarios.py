@@ -122,6 +122,7 @@ def latency_spike_test() -> ScenarioConfig:
 
 # --- Ablation studies: disable one primitive at a time ---
 
+
 def ablation_no_admission() -> ScenarioConfig:
     """HiveMind without admission control."""
     s = real_workload_replay()

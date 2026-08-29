@@ -47,6 +47,7 @@ class RedisBackend:
         """Connect to Redis. Returns False if unavailable."""
         try:
             import redis.asyncio as aioredis
+
             self._redis = aioredis.from_url(self._redis_url, decode_responses=True)
             await self._redis.ping()
             self._connected = True
@@ -148,6 +149,7 @@ class RedisBackend:
         if not self._connected:
             return
         import json
+
         key = self._key(f"ratelimit:{provider}")
         await self._redis.set(key, json.dumps(state), ex=120)  # TTL 2 min
 
@@ -156,6 +158,7 @@ class RedisBackend:
         if not self._connected:
             return None
         import json
+
         key = self._key(f"ratelimit:{provider}")
         val = await self._redis.get(key)
         if val:

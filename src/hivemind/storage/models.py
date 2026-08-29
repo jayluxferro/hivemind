@@ -168,6 +168,10 @@ class HiveMindConfig:
     # Rate limits (None = use provider profile defaults)
     rpm_limit: int | None = None
     tpm_limit: int | None = None
+    # Sliding-window scope: "per_agent" buckets RPM/TPM by agent identity so
+    # one session can't stall another; "global" shares one window (original
+    # behavior). Header-driven throttling stays global either way.
+    rate_limit_scope: str = "per_agent"
 
     # Storage
     db_path: str = "hivemind.db"
@@ -215,6 +219,12 @@ class HiveMindConfig:
         """
         self.max_concurrency = max(1, self.max_concurrency)
         self.min_concurrency = max(0, min(self.min_concurrency, self.max_concurrency))
+        # Fail loudly on a bad scope rather than silently defaulting — a typo'd
+        # scope would otherwise flip the limiter semantics unnoticed.
+        from ..scheduler.rate_limiter import SCOPES
+
+        if self.rate_limit_scope not in SCOPES:
+            raise ValueError(f"Invalid rate_limit_scope {self.rate_limit_scope!r}; expected one of {SCOPES}")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -232,6 +242,9 @@ class HiveMindConfig:
             "max_retries": self.max_retries,
             "retry_base_delay": self.retry_base_delay,
             "retry_max_delay": self.retry_max_delay,
+            "rpm_limit": self.rpm_limit,
+            "tpm_limit": self.tpm_limit,
+            "rate_limit_scope": self.rate_limit_scope,
             "db_path": self.db_path,
             "http_tls_verify": self.http_tls_verify,
         }

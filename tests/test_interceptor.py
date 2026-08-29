@@ -37,10 +37,12 @@ def interceptor(components):
 def _make_response(status_code=200, body=None, headers=None):
     """Create a mock httpx.Response."""
     if body is None:
-        body = json.dumps({
-            "content": [{"type": "text", "text": "Hello"}],
-            "usage": {"input_tokens": 100, "output_tokens": 50},
-        }).encode()
+        body = json.dumps(
+            {
+                "content": [{"type": "text", "text": "Hello"}],
+                "usage": {"input_tokens": 100, "output_tokens": 50},
+            }
+        ).encode()
     resp = MagicMock()
     resp.status_code = status_code
     resp.content = body
@@ -138,9 +140,7 @@ async def test_connection_error_retry(interceptor):
     resp_200 = _make_response(status_code=200)
 
     mock_client = AsyncMock()
-    mock_client.request = AsyncMock(
-        side_effect=[ConnectionResetError("ECONNRESET"), resp_200]
-    )
+    mock_client.request = AsyncMock(side_effect=[ConnectionResetError("ECONNRESET"), resp_200])
     interceptor._client = mock_client
 
     result = await interceptor.handle_request(
@@ -222,13 +222,17 @@ async def test_rate_limit_headers_parsed(interceptor, components):
 def _make_openai_response(status_code=200, body=None, headers=None):
     """Create a mock httpx.Response in OpenAI format."""
     if body is None:
-        body = json.dumps({
-            "id": "chatcmpl-abc123",
-            "object": "chat.completion",
-            "model": "gpt-4o",
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hello!"}, "finish_reason": "stop"}],
-            "usage": {"prompt_tokens": 80, "completion_tokens": 30, "total_tokens": 110},
-        }).encode()
+        body = json.dumps(
+            {
+                "id": "chatcmpl-abc123",
+                "object": "chat.completion",
+                "model": "gpt-4o",
+                "choices": [
+                    {"index": 0, "message": {"role": "assistant", "content": "Hello!"}, "finish_reason": "stop"}
+                ],
+                "usage": {"prompt_tokens": 80, "completion_tokens": 30, "total_tokens": 110},
+            }
+        ).encode()
     resp = MagicMock()
     resp.status_code = status_code
     resp.content = body
@@ -383,15 +387,17 @@ def test_forward_headers_strips_accept_encoding():
     (undecodable binary labelled application/json)."""
     from hivemind.proxy.interceptor import _forward_headers
 
-    out = _forward_headers({
-        "host": "example.com",
-        "accept-encoding": "gzip, deflate, br, zstd",
-        "Accept-Encoding": "gzip, deflate, br",
-        "x-api-key": "k",
-        "content-type": "application/json",
-        "content-length": "123",
-        "connection": "keep-alive",
-    })
+    out = _forward_headers(
+        {
+            "host": "example.com",
+            "accept-encoding": "gzip, deflate, br, zstd",
+            "Accept-Encoding": "gzip, deflate, br",
+            "x-api-key": "k",
+            "content-type": "application/json",
+            "content-length": "123",
+            "connection": "keep-alive",
+        }
+    )
     lowered = {k.lower() for k in out}
     assert "accept-encoding" not in lowered
     assert "host" not in lowered

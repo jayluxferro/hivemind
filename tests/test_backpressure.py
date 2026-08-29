@@ -172,6 +172,7 @@ async def test_circuit_half_open_after_cooldown():
 
     # Wait past cooldown
     import asyncio
+
     await asyncio.sleep(0.02)
 
     # Should be half-open (circuit_open returns False)
@@ -195,6 +196,7 @@ async def test_circuit_closes_after_successful_probe():
 
     # Wait past cooldown → half-open
     import asyncio
+
     await asyncio.sleep(0.02)
     assert bp.circuit_open is False
 

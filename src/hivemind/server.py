@@ -42,7 +42,7 @@ class HiveMindServer:
         # Core components
         self.db = Database(self.config.db_path)
         self.admission = AdmissionController(self.config.max_concurrency)
-        self.rate_limiter = RateLimiter()
+        self.rate_limiter = RateLimiter(scope=self.config.rate_limit_scope)
         if self.config.provider:
             self.rate_limiter.configure_from_profile(get_profile(self.config.provider))
         self.backpressure = BackpressureController(
@@ -249,6 +249,11 @@ class HiveMindServer:
                                 "type": "boolean",
                                 "description": "Verify upstream TLS certificates (set false only for local/dev)",
                             },
+                            "rate_limit_scope": {
+                                "type": "string",
+                                "enum": ["per_agent", "global"],
+                                "description": "Rate-limit window scope: per-agent buckets (sessions don't stall each other) or one shared global window",
+                            },
                         },
                     },
                 ),
@@ -439,6 +444,15 @@ class HiveMindServer:
             self.config.http_tls_verify = v
             await self.proxy.interceptor.set_tls_verify(v)
             updates["http_tls_verify"] = v
+
+        if "rate_limit_scope" in arguments:
+            scope = arguments["rate_limit_scope"]
+            try:
+                self.rate_limiter.set_scope(scope)
+            except ValueError as exc:
+                return {"error": str(exc)}
+            self.config.rate_limit_scope = scope
+            updates["rate_limit_scope"] = scope
 
         return {
             "updated": updates,

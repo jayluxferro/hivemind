@@ -38,11 +38,7 @@ class AdmissionController:
 
     @property
     def stats(self) -> dict:
-        avg_queue = (
-            self._total_queued_time / self._total_admitted
-            if self._total_admitted > 0
-            else 0.0
-        )
+        avg_queue = self._total_queued_time / self._total_admitted if self._total_admitted > 0 else 0.0
         return {
             "max_concurrency": self._max,
             "active": self._active,
@@ -91,7 +87,9 @@ class AdmissionController:
         if elapsed > 0.1:
             logger.debug(
                 "Admission: acquired slot after %.1fs wait (active=%d/%d)",
-                elapsed, self._active, self._max,
+                elapsed,
+                self._active,
+                self._max,
             )
         return True
 

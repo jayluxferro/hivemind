@@ -27,6 +27,7 @@ def _init_anthropic():
     global _anthropic_tokenizer, _anthropic_available
     try:
         from anthropic import Anthropic
+
         _anthropic_tokenizer = Anthropic()
         _anthropic_available = True
         logger.debug("Tokenizer: anthropic library available")
@@ -38,6 +39,7 @@ def _init_tiktoken():
     global _tiktoken_available
     try:
         import tiktoken  # noqa: F401
+
         _tiktoken_available = True
         logger.debug("Tokenizer: tiktoken available")
     except ImportError:
@@ -53,6 +55,7 @@ _init_tiktoken()
 def _get_tiktoken_encoding(model: str):
     """Get tiktoken encoding for a model (cached)."""
     import tiktoken
+
     try:
         return tiktoken.encoding_for_model(model)
     except KeyError:
@@ -126,9 +129,5 @@ def get_tokenizer_info() -> dict:
     return {
         "anthropic_available": _anthropic_available,
         "tiktoken_available": _tiktoken_available,
-        "method": (
-            "anthropic" if _anthropic_available
-            else "tiktoken" if _tiktoken_available
-            else "heuristic"
-        ),
+        "method": ("anthropic" if _anthropic_available else "tiktoken" if _tiktoken_available else "heuristic"),
     }

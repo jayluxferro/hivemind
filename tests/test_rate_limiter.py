@@ -176,3 +176,122 @@ async def test_stats_include_provider_fields():
     assert stats["rpm_limit"] == 1000
     assert stats["rpm_current"] == 1
     assert stats["tpm_current"] == 500
+
+
+# --- Per-agent scope tests ---
+
+
+@pytest.mark.asyncio
+async def test_per_agent_windows_are_isolated():
+    """One agent saturating its window must not throttle another agent."""
+    rl = RateLimiter()  # default scope="per_agent"
+    rl.configure_from_profile(ANTHROPIC)  # 50 RPM
+
+    for _ in range(50):
+        rl.record_request(agent_id="agent-a")
+
+    assert rl._rpm_wait_seconds(agent_id="agent-a") > 0
+    assert rl._rpm_wait_seconds(agent_id="agent-b") == 0.0
+    assert rl.agent_is_throttled("agent-a")
+    assert not rl.agent_is_throttled("agent-b")
+    # Global view stays clean: nothing was recorded without an identity
+    assert not rl.is_throttled
+
+
+@pytest.mark.asyncio
+async def test_per_agent_tpm_isolated():
+    rl = RateLimiter()
+    rl.configure_from_profile(ANTHROPIC)  # 80K TPM
+
+    rl.record_tokens(80_000, agent_id="agent-a")
+
+    assert rl._tpm_wait_seconds(agent_id="agent-a") > 0
+    assert rl._tpm_wait_seconds(agent_id="agent-b") == 0.0
+
+
+@pytest.mark.asyncio
+async def test_global_scope_shares_window():
+    """scope="global" keeps the original one-shared-window behavior."""
+    rl = RateLimiter(scope="global")
+    rl.configure_from_profile(ANTHROPIC)
+
+    for _ in range(50):
+        rl.record_request(agent_id="agent-a")
+
+    assert rl._rpm_wait_seconds(agent_id="agent-b") > 0
+    assert rl.is_throttled
+
+
+@pytest.mark.asyncio
+async def test_unidentified_calls_use_global_window():
+    """Calls without an agent_id keep the pre-feature behavior..."""
+    rl = RateLimiter()
+    rl.configure_from_profile(ANTHROPIC)
+
+    for _ in range(50):
+        rl.record_request()
+
+    assert rl._rpm_wait_seconds() > 0
+    # ...but an identified agent is not dragged down by the shared window
+    assert rl._rpm_wait_seconds(agent_id="agent-a") == 0.0
+
+
+@pytest.mark.asyncio
+async def test_header_pause_is_global_across_agents():
+    """retry-after reflects the shared API key — it pauses every agent."""
+    rl = RateLimiter()
+    await rl.update_from_headers({"retry-after": "3.0"})
+
+    assert rl.agent_is_throttled("agent-a")
+    assert rl.agent_is_throttled("agent-b")
+
+
+@pytest.mark.asyncio
+async def test_wait_if_throttled_records_in_agent_window():
+    rl = RateLimiter()
+    rl.configure_from_profile(OPENAI)
+
+    await rl.wait_if_throttled(agent_id="agent-a")
+
+    stats = rl.stats
+    assert stats["agents"]["agent-a"]["rpm_current"] == 1
+    # Global window untouched by identified traffic in per-agent scope
+    assert stats["rpm_current"] == 0
+
+
+@pytest.mark.asyncio
+async def test_set_scope_switches_windowing():
+    rl = RateLimiter()
+    rl.configure_from_profile(ANTHROPIC)
+
+    for _ in range(50):
+        rl.record_request(agent_id="agent-a")
+
+    rl.set_scope("global")
+    # Global window is fresh — agent-a's per-agent traffic never touched it
+    assert rl._rpm_wait_seconds(agent_id="agent-b") == 0.0
+
+    rl.set_scope("per_agent")
+    assert rl._rpm_wait_seconds(agent_id="agent-a") > 0
+
+
+@pytest.mark.asyncio
+async def test_invalid_scope_rejected():
+    with pytest.raises(ValueError):
+        RateLimiter(scope="bogus")
+    rl = RateLimiter()
+    with pytest.raises(ValueError):
+        rl.set_scope("bogus")
+
+
+@pytest.mark.asyncio
+async def test_stats_expose_scope_and_agents():
+    rl = RateLimiter()
+    rl.configure_from_profile(ANTHROPIC)
+    rl.record_request(agent_id="agent-a")
+    rl.record_tokens(1234, agent_id="agent-a")
+
+    stats = rl.stats
+    assert stats["scope"] == "per_agent"
+    assert stats["agents"]["agent-a"]["rpm_current"] == 1
+    assert stats["agents"]["agent-a"]["tpm_current"] == 1234

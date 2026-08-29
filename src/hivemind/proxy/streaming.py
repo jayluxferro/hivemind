@@ -133,13 +133,10 @@ def sse_terminal_error_frame(path: str, message: str) -> bytes:
     """
     flavor = _sse_path_flavor(path)
     if flavor == "anthropic":
-        return (
-            f'\n\nevent: error\ndata: {json.dumps({"error": {"type": "error", "message": message}})}\n\n'
-        ).encode()
+        return (f"\n\nevent: error\ndata: {json.dumps({'error': {'type': 'error', 'message': message}})}\n\n").encode()
     # OpenAI flavor
     return (
-        f'\n\ndata: {json.dumps({"error": {"message": message, "type": "api_error"}})}\n\n'
-        f'data: [DONE]\n\n'
+        f"\n\ndata: {json.dumps({'error': {'message': message, 'type': 'api_error'}})}\n\ndata: [DONE]\n\n"
     ).encode()
 
 

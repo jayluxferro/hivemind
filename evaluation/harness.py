@@ -230,13 +230,15 @@ class BenchmarkHarness:
         for ar in agent_results:
             if isinstance(ar, Exception):
                 logger.error("Agent exception: %s", ar)
-                result.agent_results.append(AgentResult(
-                    agent_id="error",
-                    alive=False,
-                    started_at=result.started_at,
-                    completed_at=time.time(),
-                    errors=[str(ar)],
-                ))
+                result.agent_results.append(
+                    AgentResult(
+                        agent_id="error",
+                        alive=False,
+                        started_at=result.started_at,
+                        completed_at=time.time(),
+                        errors=[str(ar)],
+                    )
+                )
             else:
                 result.agent_results.append(ar)
 

@@ -49,7 +49,7 @@ def compute_delay(
     If retry_after header was provided, use that as minimum.
     """
     # Exponential backoff: base * 2^attempt
-    delay = base_delay * (2 ** attempt)
+    delay = base_delay * (2**attempt)
     # Add jitter (±25%)
     jitter = delay * 0.25 * (2 * random.random() - 1)
     delay = delay + jitter

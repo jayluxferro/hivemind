@@ -51,12 +51,14 @@ async def batch_submit(
                 metadata=task_spec.get("metadata", {}),
             )
             await queue.submit(task)
-            submitted.append({
-                "task_id": task.id,
-                "command": command[:80],
-                "priority": task.priority.name,
-                "state": task.state.value,
-            })
+            submitted.append(
+                {
+                    "task_id": task.id,
+                    "command": command[:80],
+                    "priority": task.priority.name,
+                    "state": task.state.value,
+                }
+            )
         except Exception as exc:
             errors.append({"index": i, "error": str(exc)})
 

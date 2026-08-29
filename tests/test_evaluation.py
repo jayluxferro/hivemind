@@ -146,10 +146,27 @@ def test_scenario_result_properties():
         completed_at=110.0,
     )
     r.agent_results = [
-        AgentResult(agent_id="a1", alive=True, requests_made=10, requests_succeeded=10,
-                    total_tokens_in=500, total_tokens_out=200, started_at=100, completed_at=105),
-        AgentResult(agent_id="a2", alive=False, requests_made=5, requests_succeeded=3, requests_failed=2,
-                    total_tokens_in=300, total_tokens_out=100, started_at=100, completed_at=103),
+        AgentResult(
+            agent_id="a1",
+            alive=True,
+            requests_made=10,
+            requests_succeeded=10,
+            total_tokens_in=500,
+            total_tokens_out=200,
+            started_at=100,
+            completed_at=105,
+        ),
+        AgentResult(
+            agent_id="a2",
+            alive=False,
+            requests_made=5,
+            requests_succeeded=3,
+            requests_failed=2,
+            total_tokens_in=300,
+            total_tokens_out=100,
+            started_at=100,
+            completed_at=103,
+        ),
     ]
     assert r.agents_alive == 1
     assert r.agents_dead == 1
@@ -163,17 +180,21 @@ def test_reporter_format():
     report = BenchmarkReport()
     direct = ScenarioResult(scenario_name="test", mode="direct", started_at=0, completed_at=5)
     direct.agent_results = [
-        AgentResult(agent_id="a1", alive=True, started_at=0, completed_at=5,
-                    total_tokens_in=100, total_tokens_out=50),
-        AgentResult(agent_id="a2", alive=False, started_at=0, completed_at=3,
-                    total_tokens_in=80, total_tokens_out=40, errors=["502"]),
+        AgentResult(agent_id="a1", alive=True, started_at=0, completed_at=5, total_tokens_in=100, total_tokens_out=50),
+        AgentResult(
+            agent_id="a2",
+            alive=False,
+            started_at=0,
+            completed_at=3,
+            total_tokens_in=80,
+            total_tokens_out=40,
+            errors=["502"],
+        ),
     ]
     hm = ScenarioResult(scenario_name="test", mode="hivemind", started_at=0, completed_at=6)
     hm.agent_results = [
-        AgentResult(agent_id="a1", alive=True, started_at=0, completed_at=6,
-                    total_tokens_in=100, total_tokens_out=50),
-        AgentResult(agent_id="a2", alive=True, started_at=0, completed_at=6,
-                    total_tokens_in=100, total_tokens_out=50),
+        AgentResult(agent_id="a1", alive=True, started_at=0, completed_at=6, total_tokens_in=100, total_tokens_out=50),
+        AgentResult(agent_id="a2", alive=True, started_at=0, completed_at=6, total_tokens_in=100, total_tokens_out=50),
     ]
 
     report.add_comparison(direct, hm)

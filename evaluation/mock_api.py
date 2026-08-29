@@ -159,7 +159,10 @@ class MockAPIServer:
             try:
                 req_data = json.loads(body)
             except json.JSONDecodeError:
-                return JSONResponse({"type": "error", "error": {"type": "invalid_request_error", "message": "Invalid JSON"}}, status_code=400)
+                return JSONResponse(
+                    {"type": "error", "error": {"type": "invalid_request_error", "message": "Invalid JSON"}},
+                    status_code=400,
+                )
 
             # Estimate input tokens
             input_tokens = self._estimate_input_tokens(req_data)
@@ -172,7 +175,13 @@ class MockAPIServer:
                 reset_seconds = self._rate_state.window_remaining_seconds
                 rl_429 = self._rate_limit_429_headers(reset_seconds, "requests")
                 error_body = (
-                    {"error": {"message": "Rate limit exceeded", "type": "rate_limit_error", "code": "rate_limit_exceeded"}}
+                    {
+                        "error": {
+                            "message": "Rate limit exceeded",
+                            "type": "rate_limit_error",
+                            "code": "rate_limit_exceeded",
+                        }
+                    }
                     if self.config.api_format == "openai"
                     else {"type": "error", "error": {"type": "rate_limit_error", "message": "Rate limit exceeded"}}
                 )
@@ -183,9 +192,18 @@ class MockAPIServer:
                 reset_seconds = self._rate_state.window_remaining_seconds
                 rl_429 = self._rate_limit_429_headers(reset_seconds, "tokens")
                 error_body = (
-                    {"error": {"message": "Token rate limit exceeded", "type": "rate_limit_error", "code": "rate_limit_exceeded"}}
+                    {
+                        "error": {
+                            "message": "Token rate limit exceeded",
+                            "type": "rate_limit_error",
+                            "code": "rate_limit_exceeded",
+                        }
+                    }
                     if self.config.api_format == "openai"
-                    else {"type": "error", "error": {"type": "rate_limit_error", "message": "Token rate limit exceeded"}}
+                    else {
+                        "type": "error",
+                        "error": {"type": "rate_limit_error", "message": "Token rate limit exceeded"},
+                    }
                 )
                 return JSONResponse(error_body, status_code=429, headers=rl_429)
 
@@ -249,11 +267,13 @@ class MockAPIServer:
                     "id": f"chatcmpl-{msg_id}",
                     "object": "chat.completion",
                     "model": model,
-                    "choices": [{
-                        "index": 0,
-                        "message": {"role": "assistant", "content": "x " * output_tokens},
-                        "finish_reason": "stop",
-                    }],
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "x " * output_tokens},
+                            "finish_reason": "stop",
+                        }
+                    ],
                     "usage": {
                         "prompt_tokens": input_tokens,
                         "completion_tokens": output_tokens,
@@ -308,7 +328,7 @@ class MockAPIServer:
         text = "x " * output_tokens
         chunk_size = max(1, len(text) // 5)
         for i in range(0, len(text), chunk_size):
-            chunk_text = text[i:i + chunk_size]
+            chunk_text = text[i : i + chunk_size]
             yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': chunk_text}})}\n\n"
             await asyncio.sleep(0.01)
         # content_block_stop
@@ -325,7 +345,7 @@ class MockAPIServer:
         text = "x " * output_tokens
         chunk_size = max(1, len(text) // 5)
         for i in range(0, len(text), chunk_size):
-            chunk_text = text[i:i + chunk_size]
+            chunk_text = text[i : i + chunk_size]
             chunk_data = {
                 "id": chat_id,
                 "object": "chat.completion.chunk",
@@ -365,17 +385,19 @@ class MockAPIServer:
         return max(10, total)
 
     async def _handle_stats(self, request: Request) -> JSONResponse:
-        return JSONResponse({
-            "total_requests": self._total_requests,
-            "total_errors": self._total_errors,
-            "total_rate_limited": self._total_rate_limited,
-            "active_connections": self._active_connections,
-            "rate_state": {
-                "request_count": self._rate_state.request_count,
-                "token_count": self._rate_state.token_count,
-                "window_remaining_seconds": round(self._rate_state.window_remaining_seconds, 1),
-            },
-        })
+        return JSONResponse(
+            {
+                "total_requests": self._total_requests,
+                "total_errors": self._total_errors,
+                "total_rate_limited": self._total_rate_limited,
+                "active_connections": self._active_connections,
+                "rate_state": {
+                    "request_count": self._rate_state.request_count,
+                    "token_count": self._rate_state.token_count,
+                    "window_remaining_seconds": round(self._rate_state.window_remaining_seconds, 1),
+                },
+            }
+        )
 
     async def _handle_config(self, request: Request) -> JSONResponse:
         """Update config on the fly."""
@@ -427,7 +449,12 @@ def main() -> None:
     )
 
     logging.basicConfig(level=logging.INFO)
-    logger.info("Starting mock API on :%d (rate=%d req/min, errors=%.0f%%)", config.port, config.requests_per_minute, config.error_rate * 100)
+    logger.info(
+        "Starting mock API on :%d (rate=%d req/min, errors=%.0f%%)",
+        config.port,
+        config.requests_per_minute,
+        config.error_rate * 100,
+    )
     asyncio.run(MockAPIServer(config).serve())
 
 

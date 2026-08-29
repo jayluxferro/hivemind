@@ -149,7 +149,7 @@ async def run_mock_agent(
                         break
                     elif response.status_code in (502, 529):
                         if retries < config.max_retries:
-                            await asyncio.sleep(1.0 * (2 ** retries))
+                            await asyncio.sleep(1.0 * (2**retries))
                             retries += 1
                             continue
                         result.errors.append(f"turn {turn}: {response.status_code}")
@@ -160,7 +160,7 @@ async def run_mock_agent(
 
                 except (httpx.ConnectError, httpx.ReadError, httpx.WriteError, httpx.PoolTimeout) as exc:
                     if retries < config.max_retries:
-                        await asyncio.sleep(1.0 * (2 ** retries))
+                        await asyncio.sleep(1.0 * (2**retries))
                         retries += 1
                         continue
                     result.errors.append(f"turn {turn}: {type(exc).__name__}: {exc}")

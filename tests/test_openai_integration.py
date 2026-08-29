@@ -45,13 +45,15 @@ async def _setup_openai_stack():
     api_port = _free_port()
     proxy_port = _free_port()
 
-    api = MockAPIServer(MockAPIConfig(
-        port=api_port,
-        requests_per_minute=100,
-        base_latency_ms=10.0,
-        latency_jitter_ms=5.0,
-        api_format="openai",
-    ))
+    api = MockAPIServer(
+        MockAPIConfig(
+            port=api_port,
+            requests_per_minute=100,
+            base_latency_ms=10.0,
+            latency_jitter_ms=5.0,
+            api_format="openai",
+        )
+    )
     api_task = asyncio.create_task(api.serve())
     await _wait_for(f"http://127.0.0.1:{api_port}/_health")
 

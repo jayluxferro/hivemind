@@ -55,11 +55,13 @@ async def test_load_nonexistent(store):
 @pytest.mark.asyncio
 async def test_list_checkpoints(store):
     for i in range(3):
-        await store.save(Checkpoint(
-            agent_id=f"agent-{i}",
-            task_id="task-1",
-            state={"i": i},
-        ))
+        await store.save(
+            Checkpoint(
+                agent_id=f"agent-{i}",
+                task_id="task-1",
+                state={"i": i},
+            )
+        )
 
     all_cps = await store.list_checkpoints()
     assert len(all_cps) == 3
@@ -73,11 +75,13 @@ async def test_list_checkpoints(store):
 
 @pytest.mark.asyncio
 async def test_delete(store):
-    await store.save(Checkpoint(
-        agent_id="del-agent",
-        task_id="task-1",
-        state={},
-    ))
+    await store.save(
+        Checkpoint(
+            agent_id="del-agent",
+            task_id="task-1",
+            state={},
+        )
+    )
 
     assert await store.load("del-agent") is not None
     deleted = await store.delete("del-agent")

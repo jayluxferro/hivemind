@@ -154,16 +154,12 @@ class Database:
                 (state.value,),
             )
         else:
-            cursor = await self.db.execute(
-                "SELECT * FROM tasks ORDER BY priority DESC, created_at ASC"
-            )
+            cursor = await self.db.execute("SELECT * FROM tasks ORDER BY priority DESC, created_at ASC")
         rows = await cursor.fetchall()
         return [self._row_to_task(row) for row in rows]
 
     async def count_tasks_by_state(self) -> dict[str, int]:
-        cursor = await self.db.execute(
-            "SELECT state, COUNT(*) as cnt FROM tasks GROUP BY state"
-        )
+        cursor = await self.db.execute("SELECT state, COUNT(*) as cnt FROM tasks GROUP BY state")
         rows = await cursor.fetchall()
         return {row["state"]: row["cnt"] for row in rows}
 
@@ -287,7 +283,5 @@ class Database:
 
     async def reset(self) -> None:
         """Clear all data — for testing."""
-        await self.db.executescript(
-            "DELETE FROM tasks; DELETE FROM agent_metrics; DELETE FROM request_log;"
-        )
+        await self.db.executescript("DELETE FROM tasks; DELETE FROM agent_metrics; DELETE FROM request_log;")
         await self.db.commit()

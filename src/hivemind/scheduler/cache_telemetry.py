@@ -93,9 +93,7 @@ class CacheTelemetry:
     def _record(self, fields: dict[str, int]) -> None:
         self.responses_with_cache_usage += 1
         self.cache_creation_tokens += fields.get("cache_creation_input_tokens", 0)
-        self.cache_read_tokens += (
-            fields.get("cache_read_input_tokens", 0) + fields.get("cached_tokens", 0)
-        )
+        self.cache_read_tokens += fields.get("cache_read_input_tokens", 0) + fields.get("cached_tokens", 0)
 
     @property
     def cache_supported(self) -> bool:

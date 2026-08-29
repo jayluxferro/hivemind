@@ -27,7 +27,14 @@ from ..scheduler.providers import ProviderProfile, detect_provider
 from ..scheduler.rate_limiter import RateLimiter
 from .latency_tracker import LatencyTracker
 from .retry import RetryPolicy, is_retryable_error, is_retryable_status
-from .streaming import StreamingResult, is_sse_content_type, is_streaming_request, parse_sse_chunk, sse_terminal_error_frame, stream_response
+from .streaming import (
+    StreamingResult,
+    is_sse_content_type,
+    is_streaming_request,
+    parse_sse_chunk,
+    sse_terminal_error_frame,
+    stream_response,
+)
 from .token_counter import count_request_tokens, count_response_tokens
 from ..scheduler.cache_telemetry import CacheTelemetry
 
@@ -39,9 +46,15 @@ logger = logging.getLogger(__name__)
 # httpx can decode.  Forwarding a client's `br`/`zstd` when brotli/zstandard
 # aren't installed makes the upstream (or its CDN) send bytes that reach the
 # client raw with content-encoding stripped — undecodable garbage.
-_FORWARD_DROP = frozenset({
-    "host", "transfer-encoding", "connection", "content-length", "accept-encoding",
-})
+_FORWARD_DROP = frozenset(
+    {
+        "host",
+        "transfer-encoding",
+        "connection",
+        "content-length",
+        "accept-encoding",
+    }
+)
 
 
 def _forward_headers(headers: dict[str, str]) -> dict[str, str]:
@@ -148,8 +161,13 @@ class Interceptor:
         headers: dict[str, str],
         body: bytes,
         agent_id: str | None = None,
+        rate_key: str | None = None,
     ) -> InterceptResult:
-        """Process a proxied API request through all scheduling layers."""
+        """Process a proxied API request through all scheduling layers.
+
+        agent_id is the explicit identity (budgets/logging); rate_key is the
+        rate-limiter bucket — defaults to agent_id when not provided.
+        """
 
         # 0. Circuit breaker — fast-fail if the upstream is overwhelmed
         if self.backpressure.circuit_open:
@@ -180,6 +198,7 @@ class Interceptor:
                 headers=headers,
                 body=body,
                 agent_id=agent_id,
+                rate_key=rate_key,
                 est_request_tokens=est_request_tokens,
             )
         finally:
@@ -192,6 +211,7 @@ class Interceptor:
         headers: dict[str, str],
         body: bytes,
         agent_id: str | None = None,
+        rate_key: str | None = None,
     ):
         """Handle a streaming request — yields (chunk, streaming_result) tuples.
 
@@ -226,6 +246,9 @@ class Interceptor:
         try:
             upstream_url = f"{self.upstream_url}{path}"
             forward_headers = _forward_headers(headers)
+            # Rate-limit bucket: explicit rate_key, else fall back to agent_id
+            # so direct callers still get per-agent windows when identified.
+            bucket = rate_key if rate_key is not None else agent_id
 
             start = time.monotonic()
             result = StreamingResult()
@@ -236,10 +259,14 @@ class Interceptor:
                 response: httpx.Response | None = None
                 chunk_queue: asyncio.Queue | None = None
                 try:
-                    await self.rate_limiter.wait_if_throttled()
+                    await self.rate_limiter.wait_if_throttled(agent_id=bucket)
 
                     response, chunk_queue = await stream_response(
-                        self.client, method, upstream_url, forward_headers, body,
+                        self.client,
+                        method,
+                        upstream_url,
+                        forward_headers,
+                        body,
                     )
                     result.status_code = response.status_code
                     result.headers = dict(response.headers)
@@ -378,13 +405,11 @@ class Interceptor:
                     self.latency_tracker.record(result.latency_total_ms, result.status_code)
                     await self.backpressure.record_latency(result.latency_total_ms)
                     await self.backpressure.record_success()
-                    self.rate_limiter.record_tokens(result.tokens_in + result.tokens_out)
+                    self.rate_limiter.record_tokens(result.tokens_in + result.tokens_out, agent_id=bucket)
 
                     if agent_id and (result.tokens_in or result.tokens_out):
                         try:
-                            await self.budget_manager.record_usage(
-                                agent_id, result.tokens_in, result.tokens_out
-                            )
+                            await self.budget_manager.record_usage(agent_id, result.tokens_in, result.tokens_out)
                         except BudgetExhausted:
                             logger.warning("Budget exhausted for agent %s during stream", agent_id)
 
@@ -437,15 +462,18 @@ class Interceptor:
         body: bytes,
         agent_id: str | None,
         est_request_tokens: int,
+        rate_key: str | None = None,
     ) -> InterceptResult:
         """Forward request with transparent retry on failure."""
 
         last_error: Exception | None = None
         retries = 0
+        # Rate-limit bucket: explicit rate_key, else agent_id (see streaming path).
+        bucket = rate_key if rate_key is not None else agent_id
 
         for attempt in range(self.retry_policy.max_retries + 1):
             # 2. Wait if rate-limited
-            await self.rate_limiter.wait_if_throttled()
+            await self.rate_limiter.wait_if_throttled(agent_id=bucket)
 
             # 3. Forward request
             start = time.monotonic()
@@ -469,8 +497,7 @@ class Interceptor:
                     has_key = "x-api-key" in forward_headers
                     key_prefix = forward_headers.get("x-api-key", "")[:8] if has_key else "<missing>"
                     logger.warning(
-                        "401 from upstream: url=%s has_x_api_key=%s key_prefix=%s "
-                        "anthropic_version=%s body=%s",
+                        "401 from upstream: url=%s has_x_api_key=%s key_prefix=%s anthropic_version=%s body=%s",
                         upstream_url,
                         has_key,
                         key_prefix,
@@ -494,7 +521,9 @@ class Interceptor:
                     except ValueError:
                         pass
                 provider_codes = self.provider.retryable_status_codes if self.provider else None
-                if is_retryable_status(response.status_code, provider_codes) and self.retry_policy.should_retry(attempt, response.status_code, retryable_codes=provider_codes, retry_after=retry_after):
+                if is_retryable_status(response.status_code, provider_codes) and self.retry_policy.should_retry(
+                    attempt, response.status_code, retryable_codes=provider_codes, retry_after=retry_after
+                ):
                     await self.backpressure.record_error()
                     await self.retry_policy.wait(attempt, retry_after)
                     retries += 1
@@ -516,7 +545,7 @@ class Interceptor:
                         # Still return the response — budget enforcement is advisory at proxy level
 
                 await self.backpressure.record_success()
-                self.rate_limiter.record_tokens(tokens_in + tokens_out)
+                self.rate_limiter.record_tokens(tokens_in + tokens_out, agent_id=bucket)
 
                 return InterceptResult(
                     status_code=response.status_code,

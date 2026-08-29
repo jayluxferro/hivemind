@@ -46,12 +46,14 @@ async def test_streaming_through_proxy():
     proxy_port = _free_port()
 
     # Start mock API
-    api = MockAPIServer(MockAPIConfig(
-        port=api_port,
-        requests_per_minute=100,
-        base_latency_ms=10.0,
-        latency_jitter_ms=5.0,
-    ))
+    api = MockAPIServer(
+        MockAPIConfig(
+            port=api_port,
+            requests_per_minute=100,
+            base_latency_ms=10.0,
+            latency_jitter_ms=5.0,
+        )
+    )
     api_task = asyncio.create_task(api.serve())
     await _wait_for(f"http://127.0.0.1:{api_port}/_health")
 
@@ -121,20 +123,29 @@ async def test_non_streaming_still_works():
     api_port = _free_port()
     proxy_port = _free_port()
 
-    api = MockAPIServer(MockAPIConfig(
-        port=api_port, requests_per_minute=100, base_latency_ms=10.0, latency_jitter_ms=5.0,
-    ))
+    api = MockAPIServer(
+        MockAPIConfig(
+            port=api_port,
+            requests_per_minute=100,
+            base_latency_ms=10.0,
+            latency_jitter_ms=5.0,
+        )
+    )
     api_task = asyncio.create_task(api.serve())
     await _wait_for(f"http://127.0.0.1:{api_port}/_health")
 
     config = HiveMindConfig(
-        proxy_host="127.0.0.1", proxy_port=proxy_port,
-        upstream_url=f"http://127.0.0.1:{api_port}", max_concurrency=5,
+        proxy_host="127.0.0.1",
+        proxy_port=proxy_port,
+        upstream_url=f"http://127.0.0.1:{api_port}",
+        max_concurrency=5,
     )
     proxy = ProxyServer(
         config=config,
-        admission=AdmissionController(5), rate_limiter=RateLimiter(),
-        backpressure=BackpressureController(5), budget_manager=BudgetManager(),
+        admission=AdmissionController(5),
+        rate_limiter=RateLimiter(),
+        backpressure=BackpressureController(5),
+        budget_manager=BudgetManager(),
     )
     proxy_task = asyncio.create_task(proxy.serve())
     await _wait_for(f"http://127.0.0.1:{proxy_port}/_health")

@@ -151,7 +151,9 @@ async def test_streaming_upstream_401_returns_plain_json():
         return httpx.Response(
             401,
             headers={"content-type": "application/json"},
-            content=json.dumps({"type": "error", "error": {"type": "authentication_error", "message": "invalid key"}}).encode(),
+            content=json.dumps(
+                {"type": "error", "error": {"type": "authentication_error", "message": "invalid key"}}
+            ).encode(),
         )
 
     proxy = await _proxy()
@@ -329,7 +331,9 @@ async def test_streaming_upstream_200_json_not_sse():
         return httpx.Response(
             200,
             headers={"content-type": "application/json"},
-            content=json.dumps({"object": "chat.completion", "choices": [], "usage": {"prompt_tokens": 5, "completion_tokens": 0}}).encode(),
+            content=json.dumps(
+                {"object": "chat.completion", "choices": [], "usage": {"prompt_tokens": 5, "completion_tokens": 0}}
+            ).encode(),
         )
 
     proxy = await _proxy()

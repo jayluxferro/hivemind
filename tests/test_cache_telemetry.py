@@ -68,13 +68,7 @@ def test_extract_cache_usage_nested_streaming_shape() -> None:
 
 
 def test_request_marker_detection() -> None:
-    body = json.dumps(
-        {
-            "system": [
-                {"type": "text", "text": "x", "cache_control": {"type": "ephemeral"}}
-            ]
-        }
-    ).encode()
+    body = json.dumps({"system": [{"type": "text", "text": "x", "cache_control": {"type": "ephemeral"}}]}).encode()
     assert request_uses_cache_control(body)
     assert not request_uses_cache_control(json.dumps({"messages": []}).encode())
 
@@ -84,9 +78,7 @@ def test_telemetry_accumulates_and_flips_supported() -> None:
     assert not t.cache_supported
 
     t.observe_request(b'{"messages": [{"content": "hi"}]}')
-    t.observe_request(
-        b'{"system": [{"cache_control": {"type": "ephemeral"}}]}'
-    )
+    t.observe_request(b'{"system": [{"cache_control": {"type": "ephemeral"}}]}')
     t.observe_response(_anthropic_response(creation_tokens=1100))
     t.observe_response(_anthropic_response(read_tokens=1100))
     t.observe_response(b'{"usage": {"input_tokens": 5}}')  # no cache fields

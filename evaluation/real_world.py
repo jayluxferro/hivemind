@@ -200,8 +200,12 @@ class ValidationResult:
 
 
 async def _run_agent_openai(
-    agent_id: str, base_url: str, api_key: str, model: str,
-    turns: int, message: str,
+    agent_id: str,
+    base_url: str,
+    api_key: str,
+    model: str,
+    turns: int,
+    message: str,
 ) -> AgentOutcome:
     """Run a single agent against OpenAI-compatible API."""
     outcome = AgentOutcome(agent_id=agent_id, started_at=time.time())
@@ -249,8 +253,12 @@ async def _run_agent_openai(
 
 
 async def _run_agent_anthropic(
-    agent_id: str, base_url: str, api_key: str, model: str,
-    turns: int, message: str,
+    agent_id: str,
+    base_url: str,
+    api_key: str,
+    model: str,
+    turns: int,
+    message: str,
 ) -> AgentOutcome:
     """Run a single agent against Anthropic API."""
     outcome = AgentOutcome(agent_id=agent_id, started_at=time.time())
@@ -333,8 +341,9 @@ async def run_validation(config: RealWorldConfig) -> ValidationResult:
             config=hm_config,
             admission=AdmissionController(hm_config.max_concurrency),
             rate_limiter=RateLimiter(),
-            backpressure=BackpressureController(hm_config.max_concurrency,
-                latency_target_ms=hm_config.latency_target_ms),
+            backpressure=BackpressureController(
+                hm_config.max_concurrency, latency_target_ms=hm_config.latency_target_ms
+            ),
             budget_manager=BudgetManager(),
         )
         proxy_task = asyncio.create_task(proxy.serve())
@@ -367,7 +376,10 @@ async def run_validation(config: RealWorldConfig) -> ValidationResult:
 
     logger.info(
         "Starting real-world validation: %s %s, %d agents x %d turns, mode=%s",
-        config.provider, config.model, config.num_agents, config.turns_per_agent,
+        config.provider,
+        config.model,
+        config.num_agents,
+        config.turns_per_agent,
         "hivemind" if config.use_hivemind else "direct",
     )
 
@@ -388,10 +400,15 @@ async def run_validation(config: RealWorldConfig) -> ValidationResult:
 
     for o in outcomes:
         if isinstance(o, Exception):
-            result.outcomes.append(AgentOutcome(
-                agent_id="error", alive=False, errors=[str(o)],
-                started_at=result.started_at, completed_at=time.time(),
-            ))
+            result.outcomes.append(
+                AgentOutcome(
+                    agent_id="error",
+                    alive=False,
+                    errors=[str(o)],
+                    started_at=result.started_at,
+                    completed_at=time.time(),
+                )
+            )
         else:
             result.outcomes.append(o)
 
@@ -483,9 +500,11 @@ def main() -> None:
         print()
         for o in result.outcomes:
             status = "ALIVE" if o.alive else "DEAD"
-            print(f"  {o.agent_id}: {status} turns={o.turns_completed}/{o.turns_attempted} "
-                  f"tokens={o.total_tokens} latency={o.avg_latency_ms:.0f}ms "
-                  f"{' '.join(o.errors[-2:])}")
+            print(
+                f"  {o.agent_id}: {status} turns={o.turns_completed}/{o.turns_attempted} "
+                f"tokens={o.total_tokens} latency={o.avg_latency_ms:.0f}ms "
+                f"{' '.join(o.errors[-2:])}"
+            )
 
         if args.output:
             data = result.summary()

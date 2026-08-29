@@ -33,12 +33,14 @@ async def get_status(
         state_name = task.state.value
         if state_name not in by_state:
             by_state[state_name] = []
-        by_state[state_name].append({
-            "id": task.id,
-            "command": task.command[:80],
-            "priority": task.priority.name,
-            "tokens_used": task.tokens_used,
-        })
+        by_state[state_name].append(
+            {
+                "id": task.id,
+                "command": task.command[:80],
+                "priority": task.priority.name,
+                "tokens_used": task.tokens_used,
+            }
+        )
 
     return {
         "queue": queue.stats,

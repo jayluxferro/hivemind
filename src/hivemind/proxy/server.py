@@ -25,6 +25,7 @@ from ..scheduler.rate_limiter import RateLimiter
 from ..scheduler.providers import detect_provider
 from ..storage.db import Database
 from ..storage.models import HiveMindConfig
+from .identity import resolve_agent_id, resolve_rate_key
 from .interceptor import Interceptor
 from .latency_tracker import LatencyTracker
 from ..scheduler.cache_telemetry import CacheTelemetry
@@ -134,17 +135,13 @@ class ProxyServer:
             url = f"{self.config.upstream_url.rstrip('/')}/v1/messages"
             usages = []
             try:
-                async with _httpx.AsyncClient(
-                    verify=self.config.http_tls_verify, timeout=60.0
-                ) as client:
+                async with _httpx.AsyncClient(verify=self.config.http_tls_verify, timeout=60.0) as client:
                     for _ in range(2):
                         resp = await client.post(url, json=probe_body, headers=headers)
                         try:
                             usages.append(resp.json().get("usage", {}))
                         except Exception:
-                            usages.append(
-                                {"_status": resp.status_code, "_raw": resp.text[:200]}
-                            )
+                            usages.append({"_status": resp.status_code, "_raw": resp.text[:200]})
             except Exception as exc:
                 return Response(
                     content=_json.dumps({"error": str(exc)}),
@@ -201,10 +198,10 @@ class ProxyServer:
 
     async def _handle_request(self, request: Request) -> Response:
         """Handle a proxied request through the interceptor."""
-        # Extract agent ID from custom header or query param
-        agent_id = request.headers.get("x-hivemind-agent-id")
-        if not agent_id:
-            agent_id = request.query_params.get("agent_id")
+        # Explicit identity (budgets/DB logging) and rate-limit bucket key
+        # (falls back to a credential+UA fingerprint, never None).
+        agent_id = resolve_agent_id(request.headers, request.query_params)
+        rate_key = resolve_rate_key(request.headers, request.query_params)
 
         # Read request body
         body = await request.body()
@@ -219,9 +216,7 @@ class ProxyServer:
 
         # Check if this is a streaming request
         if self.interceptor.is_streaming(req_headers, body):
-            return await self._handle_streaming_request(
-                request.method, path, req_headers, body, agent_id
-            )
+            return await self._handle_streaming_request(request.method, path, req_headers, body, agent_id, rate_key)
 
         # Non-streaming: buffer full response
         result = await self.interceptor.handle_request(
@@ -230,6 +225,7 @@ class ProxyServer:
             headers=req_headers,
             body=body,
             agent_id=agent_id,
+            rate_key=rate_key,
         )
 
         # Log to database
@@ -268,11 +264,22 @@ class ProxyServer:
         )
 
     async def _handle_streaming_request(
-        self, method: str, path: str, headers: dict[str, str], body: bytes, agent_id: str | None
+        self,
+        method: str,
+        path: str,
+        headers: dict[str, str],
+        body: bytes,
+        agent_id: str | None,
+        rate_key: str | None = None,
     ) -> Response:
         """Handle a streaming (SSE) request — forward chunks as they arrive."""
         stream_iter = self.interceptor.handle_streaming_request(
-            method=method, path=path, headers=headers, body=body, agent_id=agent_id,
+            method=method,
+            path=path,
+            headers=headers,
+            body=body,
+            agent_id=agent_id,
+            rate_key=rate_key,
         )
 
         # Pull the first yield to detect early errors (401, 429, 503, etc.)
@@ -291,9 +298,7 @@ class ProxyServer:
             await self._log_result(agent_id, method, path, first_result)
             resp_headers = self._build_response_headers(first_result)
             body_bytes = (
-                first_chunk
-                if isinstance(first_chunk, bytes)
-                else (first_chunk.encode() if first_chunk else b"")
+                first_chunk if isinstance(first_chunk, bytes) else (first_chunk.encode() if first_chunk else b"")
             )
             return Response(
                 content=body_bytes,
@@ -310,9 +315,7 @@ class ProxyServer:
                 await self._log_result(agent_id, method, path, first_result)
                 resp_headers = self._build_response_headers(first_result)
                 body_bytes = (
-                    first_chunk
-                    if isinstance(first_chunk, bytes)
-                    else (first_chunk.encode() if first_chunk else b"")
+                    first_chunk if isinstance(first_chunk, bytes) else (first_chunk.encode() if first_chunk else b"")
                 )
                 return Response(
                     content=body_bytes,
@@ -437,13 +440,16 @@ def _build_proxy(config: HiveMindConfig) -> ProxyServer:
     config.apply_provider_defaults()
     logger.info(
         "Provider: %s | upstream: %s | concurrency: %d",
-        config.provider, config.upstream_url, config.max_concurrency,
+        config.provider,
+        config.upstream_url,
+        config.max_concurrency,
     )
 
     admission = AdmissionController(config.max_concurrency)
-    rate_limiter = RateLimiter()
+    rate_limiter = RateLimiter(scope=config.rate_limit_scope)
     if config.provider:
         from ..scheduler.providers import get_profile
+
         rate_limiter.configure_from_profile(get_profile(config.provider))
     rate_limiter.apply_overrides(rpm=config.rpm_limit, tpm=config.tpm_limit)
     backpressure = BackpressureController(

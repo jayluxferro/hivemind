@@ -62,11 +62,7 @@ class LatencyTracker:
     def error_rate(self) -> float:
         if not self._samples:
             return 0.0
-        errors = sum(
-            1
-            for s in self._samples
-            if s.status_code is not None and s.status_code >= 400
-        )
+        errors = sum(1 for s in self._samples if s.status_code is not None and s.status_code >= 400)
         return errors / len(self._samples)
 
     def _percentile(self, p: float) -> float:

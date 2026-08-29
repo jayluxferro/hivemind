@@ -135,18 +135,19 @@ class BackpressureController:
             self._recent_errors += 1
             self._recent_requests += 1
             old = self._current_concurrency
-            self._current_concurrency = max(
-                self._min, self._current_concurrency * self._md
+            self._current_concurrency = max(self._min, self._current_concurrency * self._md)
+            self._adjustments.append(
+                {
+                    "time": time.time(),
+                    "trigger": "error",
+                    "old": old,
+                    "new": self._current_concurrency,
+                }
             )
-            self._adjustments.append({
-                "time": time.time(),
-                "trigger": "error",
-                "old": old,
-                "new": self._current_concurrency,
-            })
             logger.warning(
                 "Backpressure: error detected, concurrency %.1f → %.1f",
-                old, self._current_concurrency,
+                old,
+                self._current_concurrency,
             )
 
             # Circuit breaker check
@@ -156,10 +157,11 @@ class BackpressureController:
                     self._circuit_open = True
                     self._circuit_open_until = time.monotonic() + self._circuit_cooldown
                     logger.error(
-                        "Backpressure: CIRCUIT OPEN — %.0f%% error rate (%d/%d), "
-                        "cooling down %.0fs",
-                        error_rate * 100, self._recent_errors,
-                        self._recent_requests, self._circuit_cooldown,
+                        "Backpressure: CIRCUIT OPEN — %.0f%% error rate (%d/%d), cooling down %.0fs",
+                        error_rate * 100,
+                        self._recent_errors,
+                        self._recent_requests,
+                        self._circuit_cooldown,
                     )
                 self._recent_errors = 0
                 self._recent_requests = 0
@@ -199,17 +201,21 @@ class BackpressureController:
 
         if int(old) != int(self._current_concurrency):
             logger.info(
-                "Backpressure: AIMD adjust — avg_latency=%.0fms target=%.0fms, "
-                "concurrency %.1f → %.1f",
-                avg_latency, self._latency_target, old, self._current_concurrency,
+                "Backpressure: AIMD adjust — avg_latency=%.0fms target=%.0fms, concurrency %.1f → %.1f",
+                avg_latency,
+                self._latency_target,
+                old,
+                self._current_concurrency,
             )
-            self._adjustments.append({
-                "time": time.time(),
-                "trigger": "aimd",
-                "avg_latency_ms": avg_latency,
-                "old": old,
-                "new": self._current_concurrency,
-            })
+            self._adjustments.append(
+                {
+                    "time": time.time(),
+                    "trigger": "aimd",
+                    "avg_latency_ms": avg_latency,
+                    "old": old,
+                    "new": self._current_concurrency,
+                }
+            )
 
             # Apply to admission controller
             await self._apply_to_admission()

@@ -47,6 +47,12 @@ def register_serve_cli_arguments(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="Override tokens-per-minute limit (auto-detected from provider)",
     )
+    parser.add_argument(
+        "--rate-limit-scope",
+        choices=["per_agent", "global"],
+        default=None,
+        help="Bucket rate limits per agent session (default) or share one global window",
+    )
 
 
 def apply_serve_cli_args_to_config(config: HiveMindConfig, args: argparse.Namespace) -> None:
@@ -71,6 +77,8 @@ def apply_serve_cli_args_to_config(config: HiveMindConfig, args: argparse.Namesp
         config.rpm_limit = args.rpm_limit
     if getattr(args, "tpm_limit", None) is not None:
         config.tpm_limit = args.tpm_limit
+    if getattr(args, "rate_limit_scope", None) is not None:
+        config.rate_limit_scope = args.rate_limit_scope
 
 
 def register_proxy_cli_arguments(
@@ -141,6 +149,12 @@ def register_proxy_cli_arguments(
         default=None,
         help="Override tokens-per-minute limit (auto-detected from provider)",
     )
+    parser.add_argument(
+        "--rate-limit-scope",
+        choices=["per_agent", "global"],
+        default=None,
+        help="Bucket rate limits per agent session (default) or share one global window",
+    )
 
 
 def hivemind_config_from_proxy_cli_args(args: argparse.Namespace) -> HiveMindConfig:
@@ -175,4 +189,6 @@ def hivemind_config_from_proxy_cli_args(args: argparse.Namespace) -> HiveMindCon
         config.rpm_limit = args.rpm_limit
     if getattr(args, "tpm_limit", None) is not None:
         config.tpm_limit = args.tpm_limit
+    if getattr(args, "rate_limit_scope", None) is not None:
+        config.rate_limit_scope = args.rate_limit_scope
     return config
