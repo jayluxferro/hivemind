@@ -4,7 +4,36 @@ from __future__ import annotations
 
 import argparse
 
+from .scheduler.rate_limiter import AGENT_LIMIT_KINDS
 from .storage.models import HiveMindConfig
+
+
+def parse_agent_limit_specs(specs: list[str] | None) -> dict[str, dict[str, int]]:
+    """Parse repeatable ``--agent-limit AGENT:rpm=N,tpm=M`` specs into a registry.
+
+    Syntax validation lives here at the CLI boundary; the semantic shape is
+    re-checked by ``rate_limiter.validate_agent_limits`` when the config is
+    normalized, so a bad flag fails loudly either way.
+    """
+    overrides: dict[str, dict[str, int]] = {}
+    for spec in specs or []:
+        agent, sep, assignments = spec.partition(":")
+        if not sep or not agent.strip() or not assignments.strip():
+            raise ValueError(f"Invalid --agent-limit {spec!r}; expected AGENT:rpm=N,tpm=M")
+        entry = overrides.setdefault(agent.strip(), {})
+        for pair in assignments.split(","):
+            kind, eq, raw = pair.partition("=")
+            kind = kind.strip()
+            if not eq or kind not in AGENT_LIMIT_KINDS:
+                raise ValueError(f"Invalid --agent-limit {spec!r}; kinds must be one of {AGENT_LIMIT_KINDS}")
+            try:
+                value = int(raw)
+            except ValueError:
+                raise ValueError(f"Invalid --agent-limit {spec!r}; {kind} must be an integer") from None
+            if value <= 0:
+                raise ValueError(f"Invalid --agent-limit {spec!r}; {kind} must be positive")
+            entry[kind] = value
+    return overrides
 
 
 def register_serve_cli_arguments(parser: argparse.ArgumentParser) -> None:
@@ -53,6 +82,13 @@ def register_serve_cli_arguments(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="Bucket rate limits per agent session (default) or share one global window",
     )
+    parser.add_argument(
+        "--agent-limit",
+        action="append",
+        default=None,
+        metavar="AGENT:rpm=N,tpm=M",
+        help="Per-agent rate-limit override (repeatable), e.g. --agent-limit batch-bot:rpm=20",
+    )
 
 
 def apply_serve_cli_args_to_config(config: HiveMindConfig, args: argparse.Namespace) -> None:
@@ -79,6 +115,9 @@ def apply_serve_cli_args_to_config(config: HiveMindConfig, args: argparse.Namesp
         config.tpm_limit = args.tpm_limit
     if getattr(args, "rate_limit_scope", None) is not None:
         config.rate_limit_scope = args.rate_limit_scope
+    if getattr(args, "agent_limit", None):
+        config.agent_limit_overrides.update(parse_agent_limit_specs(args.agent_limit))
+        config.normalize_runtime_limits()  # re-validate the merged registry loudly
 
 
 def register_proxy_cli_arguments(
@@ -155,6 +194,13 @@ def register_proxy_cli_arguments(
         default=None,
         help="Bucket rate limits per agent session (default) or share one global window",
     )
+    parser.add_argument(
+        "--agent-limit",
+        action="append",
+        default=None,
+        metavar="AGENT:rpm=N,tpm=M",
+        help="Per-agent rate-limit override (repeatable), e.g. --agent-limit batch-bot:rpm=20",
+    )
 
 
 def hivemind_config_from_proxy_cli_args(args: argparse.Namespace) -> HiveMindConfig:
@@ -191,4 +237,7 @@ def hivemind_config_from_proxy_cli_args(args: argparse.Namespace) -> HiveMindCon
         config.tpm_limit = args.tpm_limit
     if getattr(args, "rate_limit_scope", None) is not None:
         config.rate_limit_scope = args.rate_limit_scope
+    if getattr(args, "agent_limit", None):
+        config.agent_limit_overrides.update(parse_agent_limit_specs(args.agent_limit))
+        config.normalize_runtime_limits()  # re-validate the merged registry loudly
     return config

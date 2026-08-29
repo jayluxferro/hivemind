@@ -40,6 +40,7 @@ Agent → http://localhost:8765/v1/... → HiveMind Proxy → Anthropic / OpenAI
                                             ↑
                                 Admission control (condition variable)
                                 Rate limit tracking (provider-aware)
+                                Per-agent rate buckets + fair-share governor
                                 AIMD backpressure + circuit breaker
                                 Token counting (budget enforcement)
                                 Provider-specific retry (429/502/529)
@@ -103,6 +104,28 @@ hivemind serve
 hivemind serve --upstream https://api.openai.com --insecure
 ```
 
+### Per-Agent Rate Limiting
+
+Multiple coding agents share one HiveMind without sharing one rate-limit window — a busy session no longer stalls the others. Every request is bucketed by identity, resolved in order:
+
+1. **Explicit header/query** — `x-hivemind-agent-id` / `x-hivemind-session-id` headers or `?agent_id=` (budgets and DB logging use this explicit channel only).
+2. **Session hint** — the Anthropic `metadata.user_id` field in the request body. Claude Code embeds a per-session UUID there, so same-key sessions separate automatically with zero configuration.
+3. **Fingerprint** — SHA-256 of credential + user-agent (`fp-…`), or user-agent only (`ua-…`). Raw API keys are never stored or logged.
+4. **`anonymous`** — one shared bucket when nothing identifies the caller.
+
+```bash
+hivemind proxy --rate-limit-scope global          # pre-1.0 behavior: one shared window
+hivemind proxy --agent-limit batch-bot:rpm=20,tpm=40000   # cap one agent (repeatable)
+```
+
+**Fair-share governor.** Per-agent windows isolate agents from each other, but the provider key is still shared. When combined in-window traffic exceeds the provider limit, every bucket's effective limit shrinks proportionally (`limit / aggregate`): heavy agents absorb the squeeze, light agents keep flowing, and the factor returns to 1.0 as the windows drain. Provider 429s and `retry-after` always pause everyone globally — header state reflects the shared key.
+
+**Residual limitation.** A tool that neither sets an explicit header nor sends `metadata.user_id` shares one bucket per credential+user-agent pair. For guaranteed session separation:
+
+```bash
+ANTHROPIC_CUSTOM_HEADERS="x-hivemind-session-id: my-session" claude
+```
+
 ### IDE Integration
 
 Generate config for your IDE/tool:
@@ -138,6 +161,8 @@ hivemind setup all         # Show all configs
 | `--aimd-decrease` | auto | AIMD multiplicative decrease (auto-detected from provider) |
 | `--total-budget` | unlimited | Global token budget |
 | `--agent-budget` | unlimited | Default per-agent token budget |
+| `--rate-limit-scope` | `per_agent` | `per_agent` buckets rate limits by session; `global` shares one window |
+| `--agent-limit` | none | Per-agent override (repeatable): `AGENT:rpm=N,tpm=M` |
 | `--insecure` | off | Disable upstream TLS certificate verification (dev only) |
 | `--log-level` | `INFO` | **`hivemind-proxy` only** — logging verbosity |
 
@@ -152,6 +177,10 @@ hivemind setup all         # Show all configs
 | `--agent-budget` | unlimited | Default per-agent token budget |
 | `--max-retries` | `3` | Max transparent retries |
 | `--min-concurrency` | `1` | Floor for AIMD backpressure |
+| `--rpm-limit` | auto | Override requests-per-minute limit (auto-detected from provider) |
+| `--tpm-limit` | auto | Override tokens-per-minute limit (auto-detected from provider) |
+| `--rate-limit-scope` | `per_agent` | `per_agent` buckets rate limits by session; `global` shares one window |
+| `--agent-limit` | none | Per-agent override (repeatable): `AGENT:rpm=N,tpm=M` |
 | `--insecure` | off | Disable upstream TLS certificate verification (dev only) |
 
 ### MCP Tools
@@ -178,6 +207,8 @@ Updates apply to the running MCP server (including the in-process proxy). Notabl
 | `latency_target_ms` | Backpressure latency target. |
 | `http_tls_verify` | Recreates the upstream httpx client with verification on or off (boolean). |
 | `max_retries` | Proxy retry policy. |
+| `rate_limit_scope` | Switches rate-limit windowing between per-agent buckets and one shared global window at runtime. |
+| `agent_limit_overrides` | Replaces the per-agent RPM/TPM override registry: `{agent_id: {"rpm": N, "tpm": M}}`. |
 | Budget fields | Token budget manager + config mirror. |
 
 ## Architecture
@@ -187,7 +218,7 @@ Updates apply to the running MCP server (including the in-process proxy). Notabl
 | # | Primitive | What it does | OS Analogy |
 |---|-----------|-------------|------------|
 | 1 | **Admission Control** | Concurrency gate — max N requests in-flight | Process scheduler |
-| 2 | **Rate Limit Tracking** | Parse `x-ratelimit-*` headers, pause proactively | I/O scheduling |
+| 2 | **Rate Limit Tracking** | Parse `x-ratelimit-*` headers, per-agent windows + fair-share governor, pause proactively | I/O scheduling |
 | 3 | **AIMD Backpressure** | Latency-based concurrency: low → increase, high → cut | TCP congestion control |
 | 4 | **Token Budgets** | Per-agent + global ceilings, warn at 85%, checkpoint at 100% | OOM killer |
 | 5 | **Priority Queue + DAG** | Shortest-job-first, dependency tracking, reprioritization | Nice levels + cgroups |

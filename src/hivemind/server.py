@@ -18,7 +18,7 @@ from .scheduler.backpressure import BackpressureController
 from .scheduler.budget import BudgetManager
 from .scheduler.providers import detect_provider, get_profile
 from .scheduler.queue import PriorityQueue
-from .scheduler.rate_limiter import RateLimiter
+from .scheduler.rate_limiter import RateLimiter, validate_agent_limits
 from .tools.setup import setup_tool, SUPPORTED_TOOLS
 from .storage.db import Database
 from .storage.models import HiveMindConfig
@@ -42,7 +42,10 @@ class HiveMindServer:
         # Core components
         self.db = Database(self.config.db_path)
         self.admission = AdmissionController(self.config.max_concurrency)
-        self.rate_limiter = RateLimiter(scope=self.config.rate_limit_scope)
+        self.rate_limiter = RateLimiter(
+            scope=self.config.rate_limit_scope,
+            agent_limits=self.config.agent_limit_overrides,
+        )
         if self.config.provider:
             self.rate_limiter.configure_from_profile(get_profile(self.config.provider))
         self.backpressure = BackpressureController(
@@ -254,6 +257,17 @@ class HiveMindServer:
                                 "enum": ["per_agent", "global"],
                                 "description": "Rate-limit window scope: per-agent buckets (sessions don't stall each other) or one shared global window",
                             },
+                            "agent_limit_overrides": {
+                                "type": "object",
+                                "description": "Per-agent rate-limit overrides {agent_id: {rpm, tpm}} — replaces the whole registry",
+                                "additionalProperties": {
+                                    "type": "object",
+                                    "properties": {
+                                        "rpm": {"type": "integer"},
+                                        "tpm": {"type": "integer"},
+                                    },
+                                },
+                            },
                         },
                     },
                 ),
@@ -453,6 +467,15 @@ class HiveMindServer:
                 return {"error": str(exc)}
             self.config.rate_limit_scope = scope
             updates["rate_limit_scope"] = scope
+
+        if "agent_limit_overrides" in arguments:
+            try:
+                overrides = validate_agent_limits(arguments["agent_limit_overrides"])
+            except ValueError as exc:
+                return {"error": str(exc)}
+            self.rate_limiter.set_agent_limits(overrides)
+            self.config.agent_limit_overrides = overrides
+            updates["agent_limit_overrides"] = overrides
 
         return {
             "updated": updates,

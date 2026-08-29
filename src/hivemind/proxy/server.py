@@ -198,13 +198,15 @@ class ProxyServer:
 
     async def _handle_request(self, request: Request) -> Response:
         """Handle a proxied request through the interceptor."""
-        # Explicit identity (budgets/DB logging) and rate-limit bucket key
-        # (falls back to a credential+UA fingerprint, never None).
-        agent_id = resolve_agent_id(request.headers, request.query_params)
-        rate_key = resolve_rate_key(request.headers, request.query_params)
-
-        # Read request body
+        # Read request body first — the session hint inside it (Anthropic
+        # metadata.user_id) feeds rate-key resolution below.
         body = await request.body()
+
+        # Explicit identity (budgets/DB logging) and rate-limit bucket key
+        # (falls back to body session hint, then credential+UA fingerprint;
+        # never None).
+        agent_id = resolve_agent_id(request.headers, request.query_params)
+        rate_key = resolve_rate_key(request.headers, request.query_params, body)
 
         # Build path
         path = f"/{request.path_params.get('path', '')}"
@@ -446,7 +448,7 @@ def _build_proxy(config: HiveMindConfig) -> ProxyServer:
     )
 
     admission = AdmissionController(config.max_concurrency)
-    rate_limiter = RateLimiter(scope=config.rate_limit_scope)
+    rate_limiter = RateLimiter(scope=config.rate_limit_scope, agent_limits=config.agent_limit_overrides)
     if config.provider:
         from ..scheduler.providers import get_profile
 

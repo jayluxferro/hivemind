@@ -16,12 +16,22 @@ Header-driven state is ALWAYS global regardless of scope: 429s, retry-after,
 and proactive throttling reflect the upstream provider's view of the shared
 API key, so they must pause everyone.
 
-Why no aggregate sliding-window ceiling in per_agent scope: a global counter
-held at the same RPM/TPM values would throttle every agent as soon as their
-combined traffic hit the limit — exactly the cross-agent stall this feature
-exists to remove. The genuine provider ceiling still arrives via response
-headers (above), which pause all agents when the shared key is truly
+Aggregate pressure in per_agent scope is handled by the fair-share governor
+rather than a hard shared window. A global counter held at the same RPM/TPM
+values would throttle every agent as soon as their combined traffic hit the
+limit — exactly the cross-agent stall per-agent scoping exists to remove.
+Instead, when combined in-window traffic exceeds the provider limit, every
+bucket's effective limit shrinks by the stateless factor limit/aggregate:
+heavy agents exceed the shrunken limit first and absorb the squeeze, light
+agents barely feel it, and the factor returns to 1.0 as the window drains
+(there is no AIMD state to get stuck low). The provider's true ceiling still
+arrives via response headers (above), pausing everyone when the key is truly
 saturated.
+
+Per-agent limit overrides (``agent_limits``) cap specific agents below the
+provider defaults — e.g. pin a background batch agent to 20 RPM while
+interactive sessions keep 50. Overrides are caps, not guarantees: under
+provider-key saturation the governor shrinks every bucket proportionally.
 """
 
 from __future__ import annotations
@@ -41,6 +51,42 @@ _WINDOW_SECONDS = 60.0
 # sliding windows by agent identity; "global" keeps one shared window.
 SCOPES = ("per_agent", "global")
 
+# Limit kinds allowed in per-agent overrides.
+AGENT_LIMIT_KINDS = ("rpm", "tpm")
+
+
+def validate_agent_limits(overrides: dict) -> dict[str, dict[str, int]]:
+    """Validate and normalize a per-agent limit-override registry.
+
+    Shape: ``{agent_id: {"rpm": int, "tpm": int}}`` — either key optional,
+    values positive ints. Fails loudly: a silently ignored typo would leave
+    an agent unthrottled against the shared provider key.
+    """
+    if not isinstance(overrides, dict):
+        raise ValueError(f"agent_limit_overrides must be a dict, got {type(overrides).__name__}")
+    normalized: dict[str, dict[str, int]] = {}
+    for agent_id, limits in overrides.items():
+        if not isinstance(agent_id, str) or not agent_id.strip():
+            raise ValueError(f"agent_limit_overrides keys must be non-empty strings, got {agent_id!r}")
+        if not isinstance(limits, dict):
+            raise ValueError(f"agent_limit_overrides[{agent_id!r}] must be a dict, got {type(limits).__name__}")
+        entry: dict[str, int] = {}
+        for kind, value in limits.items():
+            if kind not in AGENT_LIMIT_KINDS:
+                raise ValueError(
+                    f"agent_limit_overrides[{agent_id!r}] has unknown limit kind {kind!r}; "
+                    f"expected one of {AGENT_LIMIT_KINDS}"
+                )
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(f"agent_limit_overrides[{agent_id!r}][{kind!r}] must be a positive int, got {value!r}")
+            entry[kind] = value
+        if not entry:
+            raise ValueError(
+                f"agent_limit_overrides[{agent_id!r}] is empty; expected at least one of {AGENT_LIMIT_KINDS}"
+            )
+        normalized[agent_id.strip()] = entry
+    return normalized
+
 
 @dataclass
 class RateLimitWindow:
@@ -58,7 +104,7 @@ class RateLimitWindow:
 class RateLimiter:
     """Tracks rate limit state from API response headers and gates requests.
 
-    Two layers of protection:
+    Three layers of protection:
     1. Header-based: parses x-ratelimit-* / anthropic-ratelimit-* headers
        from API responses and throttles proactively when near limits.
        This layer is always global — it reflects the shared API key.
@@ -66,10 +112,15 @@ class RateLimiter:
        provider profile. Acts as a safety net when the provider sends
        no rate-limit headers (e.g. Ollama) or before the first response.
        This layer is scoped: per-agent by default, or global when
-       ``scope="global"``.
+       ``scope="global"``. The ``agent_limits`` registry can cap
+       individual agents below the configured defaults.
+    3. Fair-share governor (per_agent scope only): when combined in-window
+       traffic exceeds the provider limit, every bucket's effective limit
+       is scaled by limit/aggregate — contention costs the heaviest agents
+       first. Stateless: recomputed from the windows on every check.
     """
 
-    def __init__(self, *, scope: str = "per_agent") -> None:
+    def __init__(self, *, scope: str = "per_agent", agent_limits: dict | None = None) -> None:
         if scope not in SCOPES:
             raise ValueError(f"Invalid rate limiter scope {scope!r}; expected one of {SCOPES}")
         self._scope = scope
@@ -89,6 +140,10 @@ class RateLimiter:
         # Per-agent windows, keyed by agent_id (scope="per_agent" only).
         self._agent_requests: dict[str, deque[float]] = {}
         self._agent_tokens: dict[str, deque[tuple[float, int]]] = {}
+        # Per-agent limit overrides: agent_id -> {"rpm"/"tpm": positive int}.
+        # Validated eagerly so a bad registry fails at construction, not
+        # mid-traffic.
+        self._agent_limits: dict[str, dict[str, int]] = validate_agent_limits(agent_limits or {})
         self._provider_name: str | None = None
 
     @property
@@ -134,6 +189,19 @@ class RateLimiter:
                 self._rpm_limit,
                 self._tpm_limit,
             )
+
+    def set_agent_limits(self, overrides: dict) -> None:
+        """Replace the per-agent limit-override registry (validated, loud)."""
+        self._agent_limits = validate_agent_limits(overrides)
+        logger.info("Rate limiter: per-agent overrides set for %d agent(s)", len(self._agent_limits))
+
+    def _limit_for(self, agent_id: str | None, kind: str) -> int | None:
+        """An agent's base limit: override registry first, configured default else."""
+        if agent_id is not None:
+            override = self._agent_limits.get(agent_id)
+            if override is not None and kind in override:
+                return override[kind]
+        return self._rpm_limit if kind == "rpm" else self._tpm_limit
 
     # -- scoped window selection -------------------------------------------
 
@@ -190,13 +258,63 @@ class RateLimiter:
             return (usage[0][0] + _WINDOW_SECONDS) - now
         return 0.0
 
+    @staticmethod
+    def _count_requests(timestamps: deque[float], now: float) -> int:
+        """In-window request count (non-mutating; pruning lives elsewhere)."""
+        return sum(1 for ts in timestamps if now - ts <= _WINDOW_SECONDS)
+
+    @staticmethod
+    def _sum_tokens(usage: deque[tuple[float, int]], now: float) -> int:
+        """In-window token total (non-mutating; pruning lives elsewhere)."""
+        return sum(t for ts, t in usage if now - ts <= _WINDOW_SECONDS)
+
+    def _aggregate_counts(self) -> tuple[int, int]:
+        """In-window (requests, tokens) summed across ALL buckets.
+
+        The fair-share governor measures aggregate pressure on the shared
+        provider key from this — the global deque plus every per-agent deque.
+        """
+        now = time.monotonic()
+        requests = self._count_requests(self._request_timestamps, now)
+        tokens = self._sum_tokens(self._token_usage, now)
+        for dq in self._agent_requests.values():
+            requests += self._count_requests(dq, now)
+        for dq in self._agent_tokens.values():
+            tokens += self._sum_tokens(dq, now)
+        return requests, tokens
+
+    def _fair_share_factor(self, aggregate: int, provider_limit: int | None) -> float:
+        """Proportional squeeze when combined traffic exceeds the provider limit.
+
+        Pure function of current window state: 1.0 while the shared key has
+        headroom, ``provider_limit / aggregate`` when over. Self-heals as the
+        window drains — no AIMD state to get stuck low. Inactive in global
+        scope, where the single shared window already caps the aggregate.
+        """
+        if self._scope != "per_agent" or provider_limit is None or aggregate <= provider_limit:
+            return 1.0
+        return provider_limit / aggregate
+
+    def _governed_limit(self, base: int | None, provider_limit: int | None, aggregate: int) -> int | None:
+        """Shrink an agent's base limit by the fair-share factor under contention."""
+        if base is None:
+            return None
+        factor = self._fair_share_factor(aggregate, provider_limit)
+        if factor >= 1.0:
+            return base
+        return max(1, int(base * factor))
+
     def _rpm_wait_seconds(self, agent_id: str | None = None) -> float:
         """How long to wait based on RPM counter. 0 = no wait needed."""
-        return self._requests_wait(self._requests_window(agent_id), self._rpm_limit)
+        aggregate, _ = self._aggregate_counts()
+        limit = self._governed_limit(self._limit_for(agent_id, "rpm"), self._rpm_limit, aggregate)
+        return self._requests_wait(self._requests_window(agent_id), limit)
 
     def _tpm_wait_seconds(self, agent_id: str | None = None) -> float:
         """How long to wait based on TPM counter. 0 = no wait needed."""
-        return self._tokens_wait(self._tokens_window(agent_id), self._tpm_limit)
+        _, aggregate = self._aggregate_counts()
+        limit = self._governed_limit(self._limit_for(agent_id, "tpm"), self._tpm_limit, aggregate)
+        return self._tokens_wait(self._tokens_window(agent_id), limit)
 
     def _wait_seconds(self, agent_id: str | None) -> float:
         """Combined wait: global header pause + this agent's window wait."""
@@ -345,6 +463,7 @@ class RateLimiter:
         while self._token_usage and now - self._token_usage[0][0] > _WINDOW_SECONDS:
             self._token_usage.popleft()
         self._prune_agent_windows(now)
+        aggregate_requests, aggregate_tokens = self._aggregate_counts()
 
         result: dict = {
             "is_throttled": self.is_throttled,
@@ -355,6 +474,11 @@ class RateLimiter:
             "rpm_current": len(self._request_timestamps),
             "tpm_limit": self._tpm_limit,
             "tpm_current": sum(t for _, t in self._token_usage),
+            "fair_share": {
+                "requests_factor": round(self._fair_share_factor(aggregate_requests, self._rpm_limit), 3),
+                "tokens_factor": round(self._fair_share_factor(aggregate_tokens, self._tpm_limit), 3),
+            },
+            "agent_limits": {agent: dict(limits) for agent, limits in self._agent_limits.items()},
             "providers": {},
             "agents": {},
         }
@@ -370,6 +494,8 @@ class RateLimiter:
             result["agents"][agent_id] = {
                 "rpm_current": len(timestamps),
                 "tpm_current": token_total,
+                "rpm_limit": self._limit_for(agent_id, "rpm"),
+                "tpm_limit": self._limit_for(agent_id, "tpm"),
                 "is_throttled": self.agent_is_throttled(agent_id),
             }
         for provider, window in self._windows.items():

@@ -2,9 +2,12 @@
 
 import argparse
 
+import pytest
+
 from hivemind.cli_args import (
     apply_serve_cli_args_to_config,
     hivemind_config_from_proxy_cli_args,
+    parse_agent_limit_specs,
     register_proxy_cli_arguments,
     register_serve_cli_arguments,
 )
@@ -52,3 +55,38 @@ def test_apply_serve_cli_args_from_serve_parser():
     assert c.upstream_url == "https://api.openai.com"
     assert c.max_retries == 0
     assert c.http_tls_verify is False
+
+
+def test_proxy_cli_agent_limit_overrides():
+    parser = argparse.ArgumentParser()
+    register_proxy_cli_arguments(parser)
+    args = parser.parse_args(
+        ["--agent-limit", "batch-bot:rpm=20,tpm=40000", "--agent-limit", "interactive:rpm=50"],
+    )
+    c = hivemind_config_from_proxy_cli_args(args)
+    assert c.agent_limit_overrides == {
+        "batch-bot": {"rpm": 20, "tpm": 40000},
+        "interactive": {"rpm": 50},
+    }
+
+
+def test_serve_cli_agent_limit_overrides():
+    parser = argparse.ArgumentParser()
+    register_serve_cli_arguments(parser)
+    args = parser.parse_args(["--agent-limit", "bot:rpm=5"])
+    c = HiveMindConfig()
+    apply_serve_cli_args_to_config(c, args)
+    assert c.agent_limit_overrides == {"bot": {"rpm": 5}}
+
+
+def test_agent_limit_malformed_specs_raise():
+    for bad in ("no-colon", ":rpm=5", "bot:", "bot:qps=5", "bot:rpm=abc", "bot:rpm=0", "bot:rpm"):
+        with pytest.raises(ValueError):
+            parse_agent_limit_specs([bad])
+
+
+def test_config_validates_agent_limit_overrides():
+    with pytest.raises(ValueError):
+        HiveMindConfig(agent_limit_overrides={"a": {"rpm": 0}})
+    cfg = HiveMindConfig(agent_limit_overrides={"a": {"rpm": 10}})
+    assert cfg.to_dict()["agent_limit_overrides"] == {"a": {"rpm": 10}}

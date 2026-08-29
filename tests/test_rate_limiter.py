@@ -295,3 +295,128 @@ async def test_stats_expose_scope_and_agents():
     assert stats["scope"] == "per_agent"
     assert stats["agents"]["agent-a"]["rpm_current"] == 1
     assert stats["agents"]["agent-a"]["tpm_current"] == 1234
+
+
+# --- Fair-share governor tests ---
+
+
+@pytest.mark.asyncio
+async def test_fair_share_squeezes_all_agents_under_contention():
+    """Combined traffic over the provider limit shrinks every bucket."""
+    rl = RateLimiter()
+    rl.configure_from_profile(ANTHROPIC)  # 50 RPM
+
+    for _ in range(40):
+        rl.record_request(agent_id="agent-a")
+        rl.record_request(agent_id="agent-b")
+
+    # Aggregate 80 > 50 → factor 0.625 → effective limit 31. Each agent is at
+    # 40 — fine against its own 50-RPM window, but the governor throttles both.
+    assert rl._rpm_wait_seconds(agent_id="agent-a") > 0
+    assert rl._rpm_wait_seconds(agent_id="agent-b") > 0
+    assert rl.stats["fair_share"]["requests_factor"] == 0.625
+
+
+@pytest.mark.asyncio
+async def test_fair_share_spares_light_agents():
+    """The squeeze lands on the heavy agent; a light agent keeps flowing."""
+    rl = RateLimiter()
+    rl.configure_from_profile(ANTHROPIC)
+
+    for _ in range(50):
+        rl.record_request(agent_id="heavy")
+    for _ in range(10):
+        rl.record_request(agent_id="light")
+
+    # Aggregate 60 > 50 → factor ≈ 0.833 → effective limit 41:
+    # heavy (50) exceeds it; light (10) is nowhere near.
+    assert rl._rpm_wait_seconds(agent_id="heavy") > 0
+    assert rl._rpm_wait_seconds(agent_id="light") == 0.0
+
+
+@pytest.mark.asyncio
+async def test_fair_share_inactive_under_limit():
+    rl = RateLimiter()
+    rl.configure_from_profile(ANTHROPIC)
+
+    for _ in range(30):
+        rl.record_request(agent_id="agent-a")
+    for _ in range(15):
+        rl.record_request(agent_id="agent-b")
+
+    # Aggregate 45 ≤ 50 → no squeeze at all.
+    assert rl._rpm_wait_seconds(agent_id="agent-a") == 0.0
+    assert rl._rpm_wait_seconds(agent_id="agent-b") == 0.0
+    assert rl.stats["fair_share"]["requests_factor"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_fair_share_counts_unidentified_traffic():
+    """The anonymous/global bucket is part of the aggregate too."""
+    rl = RateLimiter()
+    rl.configure_from_profile(ANTHROPIC)
+
+    for _ in range(40):
+        rl.record_request(agent_id="agent-a")
+    for _ in range(40):
+        rl.record_request()  # unidentified → global window
+
+    # 80 combined > 50 → effective limit 31 for everyone, including the
+    # global bucket view.
+    assert rl._rpm_wait_seconds(agent_id="agent-a") > 0
+    assert rl._rpm_wait_seconds() > 0
+
+
+@pytest.mark.asyncio
+async def test_fair_share_not_applied_in_global_scope():
+    """Global scope needs no governor — the shared window IS the cap."""
+    rl = RateLimiter(scope="global")
+    rl.configure_from_profile(ANTHROPIC)
+
+    for _ in range(40):
+        rl.record_request(agent_id="agent-a")
+    assert rl.stats["fair_share"]["requests_factor"] == 1.0
+
+
+# --- Per-agent limit override tests ---
+
+
+@pytest.mark.asyncio
+async def test_agent_limit_override_throttles_one_agent():
+    rl = RateLimiter(agent_limits={"batch-bot": {"rpm": 5}})
+    rl.configure_from_profile(ANTHROPIC)  # everyone else: 50 RPM
+
+    for _ in range(5):
+        rl.record_request(agent_id="batch-bot")
+        rl.record_request(agent_id="interactive")
+
+    assert rl._rpm_wait_seconds(agent_id="batch-bot") > 0
+    assert rl._rpm_wait_seconds(agent_id="interactive") == 0.0
+    stats = rl.stats
+    assert stats["agents"]["batch-bot"]["rpm_limit"] == 5
+    assert stats["agents"]["interactive"]["rpm_limit"] == 50
+    assert stats["agent_limits"] == {"batch-bot": {"rpm": 5}}
+
+
+@pytest.mark.asyncio
+async def test_set_agent_limits_replaces_registry():
+    rl = RateLimiter(agent_limits={"a": {"rpm": 5}})
+    rl.set_agent_limits({"b": {"tpm": 1000}})
+    # "a" is gone — falls back to the unconfigured default (None, no profile).
+    assert rl._limit_for("a", "rpm") is None
+    assert rl._limit_for("b", "tpm") == 1000
+
+
+@pytest.mark.asyncio
+async def test_invalid_agent_limits_rejected():
+    with pytest.raises(ValueError):
+        RateLimiter(agent_limits={"a": {"rpm": 0}})
+    with pytest.raises(ValueError):
+        RateLimiter(agent_limits={"a": {"qps": 5}})
+    with pytest.raises(ValueError):
+        RateLimiter(agent_limits={"a": {}})
+    with pytest.raises(ValueError):
+        RateLimiter(agent_limits=["not-a-dict"])
+    rl = RateLimiter()
+    with pytest.raises(ValueError):
+        rl.set_agent_limits({"a": {"rpm": -3}})

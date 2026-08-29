@@ -172,6 +172,11 @@ class HiveMindConfig:
     # one session can't stall another; "global" shares one window (original
     # behavior). Header-driven throttling stays global either way.
     rate_limit_scope: str = "per_agent"
+    # Per-agent rate-limit overrides: {agent_id: {"rpm": int, "tpm": int}}.
+    # Agents missing a key fall back to rpm_limit/tpm_limit (then the provider
+    # profile). Overrides are caps — the fair-share governor can still shrink
+    # them under provider-key saturation.
+    agent_limit_overrides: dict[str, dict[str, int]] = field(default_factory=dict)
 
     # Storage
     db_path: str = "hivemind.db"
@@ -221,10 +226,11 @@ class HiveMindConfig:
         self.min_concurrency = max(0, min(self.min_concurrency, self.max_concurrency))
         # Fail loudly on a bad scope rather than silently defaulting — a typo'd
         # scope would otherwise flip the limiter semantics unnoticed.
-        from ..scheduler.rate_limiter import SCOPES
+        from ..scheduler.rate_limiter import SCOPES, validate_agent_limits
 
         if self.rate_limit_scope not in SCOPES:
             raise ValueError(f"Invalid rate_limit_scope {self.rate_limit_scope!r}; expected one of {SCOPES}")
+        self.agent_limit_overrides = validate_agent_limits(self.agent_limit_overrides)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -245,6 +251,7 @@ class HiveMindConfig:
             "rpm_limit": self.rpm_limit,
             "tpm_limit": self.tpm_limit,
             "rate_limit_scope": self.rate_limit_scope,
+            "agent_limit_overrides": {agent: dict(limits) for agent, limits in self.agent_limit_overrides.items()},
             "db_path": self.db_path,
             "http_tls_verify": self.http_tls_verify,
         }
