@@ -40,7 +40,7 @@ class HiveMindServer:
         self.config.apply_provider_defaults()
 
         # Core components
-        self.db = Database(self.config.db_path)
+        self.db = Database(self.config.db_url)
         self.admission = AdmissionController(self.config.max_concurrency)
         self.rate_limiter = RateLimiter(
             scope=self.config.rate_limit_scope,

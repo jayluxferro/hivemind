@@ -1,18 +1,13 @@
-"""Tests for the SQLite database layer."""
+"""Tests for the Postgres database layer."""
 
 import time
+
+import psycopg
 import pytest
 
 from hivemind.storage.db import Database
 from hivemind.storage.models import AgentMetrics, Task, TaskPriority, TaskState
-
-
-@pytest.fixture
-async def db(tmp_path):
-    database = Database(str(tmp_path / "test.db"))
-    await database.connect()
-    yield database
-    await database.close()
+from tests.conftest import HIVEMIND_TABLES, TEST_DB_URL
 
 
 @pytest.mark.asyncio
@@ -172,3 +167,31 @@ async def test_reset(db):
     await db.reset()
     tasks = await db.list_tasks()
     assert len(tasks) == 0
+
+
+@pytest.mark.asyncio
+async def test_connect_applies_migrations_and_is_idempotent(db):
+    # The conftest `db` fixture already applied migration v1 on its own
+    # connection; a second connection must see it applied and pass without
+    # re-applying or erroring (idempotency across connections).
+    second = Database(TEST_DB_URL)
+    try:
+        await second.connect()
+        assert await second.applied_versions() == [1]
+
+        async with second.db.cursor() as cur:
+            await cur.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'")
+            tables = {row["table_name"] for row in await cur.fetchall()}
+        assert set(HIVEMIND_TABLES) <= tables
+    finally:
+        await second.close()
+
+
+@pytest.mark.asyncio
+async def test_missing_postgres_fails_loud():
+    dead = Database("postgresql://nobody@127.0.0.1:1/nope")
+    try:
+        with pytest.raises((psycopg.Error, RuntimeError)):
+            await dead.connect()
+    finally:
+        await dead.close()

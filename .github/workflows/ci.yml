@@ -35,11 +35,20 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      - name: Start PostgreSQL and create hivemind role/databases
+        run: |
+          sudo systemctl start postgresql
+          sudo -u postgres psql -v ON_ERROR_STOP=1 -c "CREATE ROLE hivemind LOGIN PASSWORD 'hivemind'"
+          sudo -u postgres psql -v ON_ERROR_STOP=1 -c "CREATE DATABASE hivemind OWNER hivemind"
+          sudo -u postgres psql -v ON_ERROR_STOP=1 -c "CREATE DATABASE hivemind_test OWNER hivemind"
+
       - name: Install dependencies
         run: pip install -e ".[dev]"
 
       - name: Run tests
         run: python -m pytest tests/ -v --tb=short
+        env:
+          HIVEMIND_TEST_DB_URL: postgresql://hivemind:hivemind@localhost:5432/hivemind_test
 
       - name: Lint
         if: matrix.python-version == '3.12'

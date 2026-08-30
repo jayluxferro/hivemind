@@ -2,11 +2,24 @@
 
 from __future__ import annotations
 
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
+
+_DEFAULT_DB_URL = "postgresql://hivemind@localhost:5432/hivemind"
+
+
+def _default_db_url() -> str:
+    """Default Postgres DSN for config and ``--db`` options.
+
+    ``HIVEMIND_DB_URL`` overrides the default; the ``or`` guards
+    against an empty-string env value (lattice ``_db_default`` pattern).
+    """
+    dsn = os.environ.get("HIVEMIND_DB_URL", _DEFAULT_DB_URL)
+    return dsn or _DEFAULT_DB_URL
 
 
 class TaskState(str, Enum):
@@ -179,7 +192,7 @@ class HiveMindConfig:
     agent_limit_overrides: dict[str, dict[str, int]] = field(default_factory=dict)
 
     # Storage
-    db_path: str = "hivemind.db"
+    db_url: str = field(default_factory=_default_db_url)
 
     # Provider (auto-detected from upstream_url if not set)
     provider: str | None = None  # anthropic, openai, ollama, etc.
@@ -252,6 +265,6 @@ class HiveMindConfig:
             "tpm_limit": self.tpm_limit,
             "rate_limit_scope": self.rate_limit_scope,
             "agent_limit_overrides": {agent: dict(limits) for agent, limits in self.agent_limit_overrides.items()},
-            "db_path": self.db_path,
+            "db_url": self.db_url,
             "http_tls_verify": self.http_tls_verify,
         }

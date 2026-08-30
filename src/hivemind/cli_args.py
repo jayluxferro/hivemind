@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 
 from .scheduler.rate_limiter import AGENT_LIMIT_KINDS
-from .storage.models import HiveMindConfig
+from .storage.models import HiveMindConfig, _default_db_url
 
 
 def parse_agent_limit_specs(specs: list[str] | None) -> dict[str, dict[str, int]]:
@@ -44,7 +44,11 @@ def register_serve_cli_arguments(parser: argparse.ArgumentParser) -> None:
         help="Upstream API URL (auto-detects provider)",
     )
     parser.add_argument("--max-concurrency", type=int, default=5, help="Max concurrent requests")
-    parser.add_argument("--db", default="hivemind.db", help="Database path")
+    parser.add_argument(
+        "--db",
+        default=_default_db_url(),
+        help="Postgres connection string (HIVEMIND_DB_URL env overrides the default)",
+    )
     parser.add_argument(
         "--total-budget",
         type=int,
@@ -98,7 +102,7 @@ def apply_serve_cli_args_to_config(config: HiveMindConfig, args: argparse.Namesp
     if hasattr(args, "max_concurrency"):
         config.max_concurrency = args.max_concurrency
     if hasattr(args, "db") and str(getattr(args, "db", "")).strip():
-        config.db_path = str(args.db).strip()
+        config.db_url = str(args.db).strip()
     if hasattr(args, "total_budget") and args.total_budget is not None:
         config.total_token_budget = args.total_budget
     if hasattr(args, "agent_budget") and args.agent_budget is not None:
@@ -142,7 +146,11 @@ def register_proxy_cli_arguments(
     )
     parser.add_argument("--max-concurrency", type=int, default=5, help="Max concurrent requests")
     parser.add_argument("--min-concurrency", type=int, default=1, help="Floor for AIMD backpressure")
-    parser.add_argument("--db", default="hivemind.db", help="SQLite database path")
+    parser.add_argument(
+        "--db",
+        default=_default_db_url(),
+        help="Postgres connection string (HIVEMIND_DB_URL env overrides the default)",
+    )
     parser.add_argument("--max-retries", type=int, default=3, help="Max transparent retries on 429/502")
     parser.add_argument("--retry-base-delay", type=float, default=1.0, help="Base retry delay in seconds")
     parser.add_argument("--retry-max-delay", type=float, default=30.0, help="Max retry delay in seconds")
@@ -206,7 +214,7 @@ def register_proxy_cli_arguments(
 def hivemind_config_from_proxy_cli_args(args: argparse.Namespace) -> HiveMindConfig:
     """Build a `HiveMindConfig` from a namespace produced by `register_proxy_cli_arguments`."""
     upstream_url = str(args.upstream).strip() or "https://api.anthropic.com"
-    db_path = str(args.db).strip() or "hivemind.db"
+    db_url = str(args.db).strip() or _default_db_url()
     proxy_host = str(args.host).strip() or "127.0.0.1"
 
     config = HiveMindConfig(
@@ -215,7 +223,7 @@ def hivemind_config_from_proxy_cli_args(args: argparse.Namespace) -> HiveMindCon
         upstream_url=upstream_url,
         max_concurrency=args.max_concurrency,
         min_concurrency=args.min_concurrency,
-        db_path=db_path,
+        db_url=db_url,
         max_retries=args.max_retries,
         retry_base_delay=args.retry_base_delay,
         retry_max_delay=args.retry_max_delay,

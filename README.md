@@ -152,7 +152,7 @@ hivemind setup all         # Show all configs
 | `--upstream` | `https://api.anthropic.com` | Upstream API URL (provider auto-detected) |
 | `--max-concurrency` | `5` | Max concurrent in-flight requests |
 | `--min-concurrency` | `1` | Floor for AIMD backpressure |
-| `--db` | `hivemind.db` | SQLite database path |
+| `--db` | `postgresql://hivemind@localhost:5432/hivemind` | Postgres connection string (`HIVEMIND_DB_URL` env overrides) |
 | `--max-retries` | `3` | Max transparent retries on 429/502 |
 | `--retry-base-delay` | `1.0` | Base retry delay (seconds) |
 | `--retry-max-delay` | `30.0` | Max retry delay (seconds) |
@@ -172,7 +172,7 @@ hivemind setup all         # Show all configs
 |------|---------|-------------|
 | `--upstream` | `https://api.anthropic.com` | Upstream API URL |
 | `--max-concurrency` | `5` | Max concurrent requests |
-| `--db` | `hivemind.db` | Database path |
+| `--db` | `postgresql://hivemind@localhost:5432/hivemind` | Postgres connection string (`HIVEMIND_DB_URL` env overrides) |
 | `--total-budget` | unlimited | Global token budget |
 | `--agent-budget` | unlimited | Default per-agent token budget |
 | `--max-retries` | `3` | Max transparent retries |
@@ -210,6 +210,47 @@ Updates apply to the running MCP server (including the in-process proxy). Notabl
 | `rate_limit_scope` | Switches rate-limit windowing between per-agent buckets and one shared global window at runtime. |
 | `agent_limit_overrides` | Replaces the per-agent RPM/TPM override registry: `{agent_id: {"rpm": N, "tpm": M}}`. |
 | Budget fields | Token budget manager + config mirror. |
+
+## Database
+
+HiveMind persists tasks, agent metrics, and the request log to **PostgreSQL**
+(there is no SQLite fallback — the server fails loud at startup if Postgres
+is down).  The schema is created and migrated automatically on every start
+(`schema_migrations`), so no manual DDL is needed.
+
+### One-time setup (local)
+
+```bash
+# As the postgres superuser (socket trust on local Debian/Homebrew setups):
+sudo -u postgres psql -v ON_ERROR_STOP=1 -c "CREATE ROLE hivemind LOGIN"
+sudo -u postgres psql -v ON_ERROR_STOP=1 -c "CREATE DATABASE hivemind OWNER hivemind"
+sudo -u postgres psql -v ON_ERROR_STOP=1 -c "CREATE DATABASE hivemind_test OWNER hivemind"
+```
+
+Loopback is trust auth in the local default, so no password is needed:
+`postgresql://hivemind@localhost:5432/hivemind` (test DB:
+`postgresql://hivemind@localhost:5432/hivemind_test`).  Override the
+connection with `HIVEMIND_DB_URL`, or the test connection with
+`HIVEMIND_TEST_DB_URL`.
+
+> The standalone `hivemind proxy` accepts `--db` but does not open it —
+> request logging happens only in the embedded MCP-server proxy
+> (`hivemind serve`).
+
+### Migrating from SQLite
+
+If you have data in a pre-migration `hivemind.db`, import it once:
+
+```bash
+uv run python tools/pg-migrate/import_sqlite.py --dry-run   # plan only, touches nothing
+uv run python tools/pg-migrate/import_sqlite.py             # real import
+```
+
+`--fresh` (default) truncates the target tables first; `--no-fresh` skips
+tables that already have rows.  The importer asserts sqlite/PG column
+alignment before each table, verifies per-table counts afterwards (exit 1
+on mismatch), and advances the identity sequences that explicit-id COPYs
+bypass.
 
 ## Architecture
 
@@ -259,6 +300,11 @@ python -m evaluation.run_benchmark             # Full suite (all scenarios)
 pip install -e ".[dev]"
 python -m pytest tests/ -v
 ```
+
+Tests run against a real local Postgres — create the `hivemind_test`
+database during the one-time setup in the [Database](#database) section.
+Override the test connection with `HIVEMIND_TEST_DB_URL` when it differs
+from the default `postgresql://hivemind@localhost:5432/hivemind_test`.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for **pre-commit** (Ruff) and optional local **Gitleaks** usage.
 
