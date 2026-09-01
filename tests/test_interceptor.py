@@ -405,3 +405,32 @@ def test_forward_headers_strips_accept_encoding():
     assert "connection" not in lowered
     assert out["x-api-key"] == "k"
     assert out["content-type"] == "application/json"
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_queue_full_returns_429_fast(components):
+    """Regression: a deep rate-limiter queue once waited ~300s — every
+    layer's read ceiling — surfacing as a bare gateway ReadTimeout
+    (2026-09-01).  A projected wait beyond MAX_WAIT_S must fail fast with
+    a 429 + retry-after instead of queueing."""
+    from hivemind.scheduler.rate_limiter import MAX_WAIT_S
+
+    limiter = components["rate_limiter"]
+    limiter._wait_seconds = lambda agent_id: MAX_WAIT_S + 5.0
+
+    interceptor = Interceptor(upstream_url="https://api.anthropic.com", **components)
+    mock_client = AsyncMock()
+    interceptor._client = mock_client
+
+    result = await interceptor.handle_request(
+        method="POST",
+        path="/v1/messages",
+        headers={"content-type": "application/json", "x-api-key": "test"},
+        body=json.dumps({"messages": [{"role": "user", "content": "Hi"}]}).encode(),
+        agent_id="test-agent",
+    )
+
+    assert result.status_code == 429
+    assert mock_client.request.await_count == 0  # never reached upstream
+    assert int(result.headers["retry-after"]) >= MAX_WAIT_S
+    assert b"retry later" in result.body

@@ -81,6 +81,20 @@ async def test_wait_if_throttled():
 
 
 @pytest.mark.asyncio
+async def test_wait_cap_raises_throttle_wait_exceeded():
+    """Regression: an unbounded queue once stretched to ~300s — every
+    layer's read ceiling — surfacing as a bare gateway ReadTimeout with
+    zero downstream logs (2026-09-01).  A projected wait beyond MAX_WAIT_S
+    must raise so the interceptor can fail fast with a 429."""
+    from hivemind.scheduler.rate_limiter import MAX_WAIT_S, ThrottleWaitExceeded
+
+    rl = RateLimiter()
+    rl._wait_seconds = lambda agent_id: MAX_WAIT_S + 1.0  # simulate deep queue
+    with pytest.raises(ThrottleWaitExceeded):
+        await rl.wait_if_throttled()
+
+
+@pytest.mark.asyncio
 async def test_stats():
     rl = RateLimiter()
     stats = rl.stats

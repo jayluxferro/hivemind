@@ -24,7 +24,7 @@ from ..scheduler.admission import AdmissionController
 from ..scheduler.backpressure import BackpressureController
 from ..scheduler.budget import BudgetExhausted, BudgetManager
 from ..scheduler.providers import ProviderProfile, detect_provider
-from ..scheduler.rate_limiter import RateLimiter
+from ..scheduler.rate_limiter import RateLimiter, ThrottleWaitExceeded
 from .latency_tracker import LatencyTracker
 from .retry import RetryPolicy, is_retryable_error, is_retryable_status
 from .streaming import (
@@ -130,7 +130,12 @@ class Interceptor:
 
     async def start(self) -> None:
         self._client = httpx.AsyncClient(
-            timeout=httpx.Timeout(connect=10.0, read=300.0, write=30.0, pool=30.0),
+            # read=240.0 is DELIBERATELY below the rest of the chain's 300s
+            # ceiling: a stalled upstream must fail HERE first so the typed
+            # 504 propagates up before every upstream gateway aborts its own
+            # 300s read (which surfaced as a bare ReadTimeout with zero
+            # downstream logs, 2026-09-01).
+            timeout=httpx.Timeout(connect=10.0, read=240.0, write=30.0, pool=30.0),
             # The pool must not be the admission bottleneck: admission allows
             # up to max_concurrency (240 in the manifold config) in-flight
             # requests, but a 50-connection pool silently queued everything
@@ -263,7 +268,21 @@ class Interceptor:
                 response: httpx.Response | None = None
                 chunk_queue: asyncio.Queue | None = None
                 try:
-                    await self.rate_limiter.wait_if_throttled(agent_id=bucket)
+                    try:
+                        await self.rate_limiter.wait_if_throttled(agent_id=bucket)
+                    except ThrottleWaitExceeded as exc:
+                        # Fail fast instead of queueing for minutes: the client
+                        # retries later with a real signal instead of hanging
+                        # until every layer's read timeout aborts (2026-09-01).
+                        yield (
+                            b'{"error": "HiveMind: rate-limit queue full - retry later"}',
+                            StreamingResult(
+                                status_code=429,
+                                headers={"retry-after": str(max(1, int(exc.wait_s)))},
+                                error="rate_limit_queue_full",
+                            ),
+                        )
+                        return
 
                     response, chunk_queue = await stream_response(
                         self.client,
@@ -477,7 +496,15 @@ class Interceptor:
 
         for attempt in range(self.retry_policy.max_retries + 1):
             # 2. Wait if rate-limited
-            await self.rate_limiter.wait_if_throttled(agent_id=bucket)
+            try:
+                await self.rate_limiter.wait_if_throttled(agent_id=bucket)
+            except ThrottleWaitExceeded as exc:
+                # Fail fast instead of queueing for minutes (see streaming path).
+                return InterceptResult(
+                    status_code=429,
+                    headers={"retry-after": str(max(1, int(exc.wait_s)))},
+                    body=b'{"error": "HiveMind: rate-limit queue full - retry later"}',
+                )
 
             # 3. Forward request
             start = time.monotonic()

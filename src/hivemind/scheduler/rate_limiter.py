@@ -47,6 +47,21 @@ logger = logging.getLogger(__name__)
 # Length of the sliding window for local RPM/TPM counters.
 _WINDOW_SECONDS = 60.0
 
+# Maximum total time a request may sit in the rate-limiter queue.  Beyond
+# this the interceptor fails FAST with a 429 + retry-after instead of
+# letting the queue stretch for minutes (a deep burst queue once hit ~300s
+# — every layer's read ceiling — and surfaced as a bare gateway ReadTimeout).
+MAX_WAIT_S = 60.0
+
+
+class ThrottleWaitExceeded(Exception):
+    """Raised by wait_if_throttled when the projected queue wait exceeds MAX_WAIT_S."""
+
+    def __init__(self, wait_s: float) -> None:
+        super().__init__(f"rate-limit queue would wait {wait_s:.0f}s (> {MAX_WAIT_S:.0f}s)")
+        self.wait_s = wait_s
+
+
 # Valid values for the rate-limiter scope. "per_agent" buckets the local
 # sliding windows by agent identity; "global" keeps one shared window.
 SCOPES = ("per_agent", "global")
@@ -416,12 +431,20 @@ class RateLimiter:
 
         Waits on the global header pause plus this agent's scoped window,
         then records the request in that window.
+
+        Raises :exc:`ThrottleWaitExceeded` when the projected wait exceeds
+        :data:`MAX_WAIT_S` — beyond that the client is better served by a
+        fast 429 (retry later) than by a minute-long silent queue.  A deep
+        burst queue previously surfaced as a bare ReadTimeout at the
+        gateway (2026-09-01: ~300s queue == every layer's 300s ceiling).
         """
         total_waited = 0.0
         while True:
             wait_time = self._wait_seconds(agent_id)
             if wait_time <= 0:
                 break
+            if total_waited + wait_time > MAX_WAIT_S:
+                raise ThrottleWaitExceeded(total_waited + wait_time)
             logger.info(
                 "Rate limiter: waiting %.1fs before next request (agent=%s)",
                 wait_time,
