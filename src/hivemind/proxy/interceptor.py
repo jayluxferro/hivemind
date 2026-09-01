@@ -131,7 +131,11 @@ class Interceptor:
     async def start(self) -> None:
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(connect=10.0, read=300.0, write=30.0, pool=30.0),
-            limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
+            # The pool must not be the admission bottleneck: admission allows
+            # up to max_concurrency (240 in the manifold config) in-flight
+            # requests, but a 50-connection pool silently queued everything
+            # past the 50th at the LAST hop.  Match the admission ceiling.
+            limits=httpx.Limits(max_connections=240, max_keepalive_connections=100),
             follow_redirects=True,
             verify=self._tls_verify,
             # Empty user-agent default so httpx doesn't inject python-httpx/X.Y.Z;
