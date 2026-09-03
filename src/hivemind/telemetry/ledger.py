@@ -134,7 +134,7 @@ SELECT count(*) AS requests,
        sum(coalesce(tokens_in, 0))::bigint AS tokens_in,
        sum(coalesce(tokens_out, 0))::bigint AS tokens_out,
        coalesce(sum(cost_usd), 0)::double precision AS cost_usd,
-       count(*) FILTER (WHERE provider ILIKE '%ollama%') AS local_requests
+       count(*) FILTER (WHERE provider ILIKE '%%ollama%%') AS local_requests
 FROM mesh_telemetry.usage_cost
 WHERE {_WINDOW}
 """
@@ -167,8 +167,8 @@ LIMIT 50
 
 _SQL_LATENCY = f"""
 SELECT provider, count(*) AS requests,
-       round(percentile_cont(0.50) WITHIN GROUP (ORDER BY latency_ms), 1) AS p50_ms,
-       round(percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms), 1) AS p95_ms
+       round((percentile_cont(0.50) WITHIN GROUP (ORDER BY latency_ms))::numeric, 1) AS p50_ms,
+       round((percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms))::numeric, 1) AS p95_ms
 FROM mesh_telemetry.token_usage
 WHERE {_WINDOW}
   AND latency_ms IS NOT NULL

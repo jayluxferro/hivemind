@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from datetime import date
 
 import pytest
@@ -459,14 +460,18 @@ async def test_schema_ddl_executes_against_real_postgres():
 
     ledger = TelemetryLedger(os.environ["MESH_TEST_DSN"])
     await ledger.connect()
-    await ledger.record({
-        "agent_hash": "ddl-test",
-        "provider": "Anthropic",
-        "model": "ddl-model",
-        "tokens_in": 100, "tokens_out": 50,
-        "latency_ms": 2.0, "status": 200,
-    })
+    await ledger.record(
+        {
+            "agent_hash": "ddl-test",
+            "provider": "Anthropic",
+            "model": "ddl-model",
+            "tokens_in": 100,
+            "tokens_out": 50,
+            "latency_ms": 2.0,
+            "status": 200,
+        }
+    )
     await asyncio.sleep(1.5)
     rows = await ledger.fetch_dashboard(days=1)
-    assert rows["daily"] is not None  # queries ran against the live view
+    assert isinstance(rows, dict) and "error" not in rows  # live view queried
     await ledger.shutdown()
