@@ -157,7 +157,8 @@ def register_proxy_cli_arguments(
         default=None,
         metavar="DSN",
         help="Postgres DSN for the token ledger + cost dashboard (MESH_TELEMETRY_DSN env "
-        "fallback; unset = telemetry disabled, proxy behavior unchanged)",
+        "fallback; unset defaults to the request-log database — the ledger is "
+        "metadata-only and fail-open)",
     )
     parser.add_argument("--max-retries", type=int, default=3, help="Max transparent retries on 429/502")
     parser.add_argument("--retry-base-delay", type=float, default=1.0, help="Base retry delay in seconds")
