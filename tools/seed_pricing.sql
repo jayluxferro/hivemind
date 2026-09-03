@@ -57,13 +57,13 @@ CREATE TABLE IF NOT EXISTS mesh_telemetry.model_pricing (
 CREATE OR REPLACE VIEW mesh_telemetry.usage_cost AS
 SELECT u.*,
        CASE WHEN p.provider IS NULL THEN NULL
-            ELSE round((
+            ELSE round(CAST((
               (coalesce(u.tokens_in, 0) - coalesce(u.cache_write, 0) - coalesce(u.cache_read, 0))
                 * coalesce(p.price_in, 0)
               + coalesce(u.cache_read, 0)  * coalesce(p.price_cache_read, 0)
               + coalesce(u.cache_write, 0) * coalesce(p.price_cache_write, 0)
               + coalesce(u.tokens_out, 0)  * coalesce(p.price_out, 0)
-            ) / 1e6, 6)
+            ) / 1e6 AS numeric), 6)
        END AS cost_usd
 FROM mesh_telemetry.token_usage u
 LEFT JOIN mesh_telemetry.model_pricing p

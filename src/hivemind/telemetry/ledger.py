@@ -90,20 +90,20 @@ _SCHEMA_DDL = (
         PRIMARY KEY (provider, model)
     )
     """,
-    # SPEC §3 DDL, with the syntax error fixed: round(SUM / 1e6, 6) — the
+    # SPEC §3 DDL, with the syntax error fixed: round(SUM / 1e6 AS numeric), 6) — the
     # prices are per 1M tokens, so the dollar figure is the products divided
     # by 1e6, rounded to 6 decimals (microdollars).
     """
     CREATE OR REPLACE VIEW mesh_telemetry.usage_cost AS
     SELECT u.*,
            CASE WHEN p.provider IS NULL THEN NULL
-                ELSE round((
+                ELSE round(CAST((
                   (coalesce(u.tokens_in, 0) - coalesce(u.cache_write, 0) - coalesce(u.cache_read, 0))
                     * coalesce(p.price_in, 0)
                   + coalesce(u.cache_read, 0)  * coalesce(p.price_cache_read, 0)
                   + coalesce(u.cache_write, 0) * coalesce(p.price_cache_write, 0)
                   + coalesce(u.tokens_out, 0)  * coalesce(p.price_out, 0)
-                ) / 1e6, 6)
+                ) / 1e6 AS numeric), 6)
            END AS cost_usd
     FROM mesh_telemetry.token_usage u
     LEFT JOIN mesh_telemetry.model_pricing p

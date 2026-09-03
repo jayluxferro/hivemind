@@ -442,3 +442,31 @@ async def test_fetch_dashboard_reader_failure_raises_for_handler():
     ledger = TelemetryLedger("postgresql://fake", conn_factory=boom)
     with pytest.raises(ConnectionError):
         await ledger.fetch_dashboard(days=7)
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not os.environ.get("MESH_TEST_DSN"),
+    reason="set MESH_TEST_DSN to run against a real Postgres",
+)
+async def test_schema_ddl_executes_against_real_postgres():
+    """Regression: the view DDL used round(double precision, integer) which
+    does not exist in Postgres — every connect failed at ensure_schema and
+    the fail-open swallow silently dropped all telemetry (2026-09-03).
+    With MESH_TEST_DSN set this proves the full DDL (tables + view) parses
+    and a row round-trips."""
+    import os
+
+    ledger = TelemetryLedger(os.environ["MESH_TEST_DSN"])
+    await ledger.connect()
+    await ledger.record({
+        "agent_hash": "ddl-test",
+        "provider": "Anthropic",
+        "model": "ddl-model",
+        "tokens_in": 100, "tokens_out": 50,
+        "latency_ms": 2.0, "status": 200,
+    })
+    await asyncio.sleep(1.5)
+    rows = await ledger.fetch_dashboard(days=1)
+    assert rows["daily"] is not None  # queries ran against the live view
+    await ledger.shutdown()
