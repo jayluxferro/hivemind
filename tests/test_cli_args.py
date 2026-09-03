@@ -121,8 +121,8 @@ def test_proxy_cli_telemetry_dsn_flag_beats_env(monkeypatch):
     assert c.telemetry_dsn == "postgresql://flag@localhost:5432/telemetry"
 
 
-def test_proxy_cli_telemetry_dsn_unset_stays_none(monkeypatch):
+def test_proxy_cli_telemetry_dsn_unset_defaults_to_request_log_db(monkeypatch):
     monkeypatch.delenv("MESH_TELEMETRY_DSN", raising=False)
     c = _proxy_config([])
-    assert c.telemetry_dsn is None
-    assert c.to_dict()["telemetry_dsn"] is None
+    assert c.telemetry_dsn == "postgresql://hivemind@localhost:5432/hivemind"
+    assert c.to_dict()["telemetry_dsn"] == "postgresql://hivemind@localhost:5432/hivemind"

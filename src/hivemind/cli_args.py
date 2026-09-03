@@ -257,9 +257,10 @@ def hivemind_config_from_proxy_cli_args(args: argparse.Namespace) -> HiveMindCon
         config.agent_limit_overrides.update(parse_agent_limit_specs(args.agent_limit))
         config.normalize_runtime_limits()  # re-validate the merged registry loudly
 
-    # Token ledger: explicit flag wins; MESH_TELEMETRY_DSN env is the fallback.
-    # Neither set → telemetry_dsn stays None → NullLedger (zero behavior change).
-    telemetry_dsn = getattr(args, "telemetry_dsn", None) or os.environ.get("MESH_TELEMETRY_DSN")
+    # Token ledger: explicit flag wins; MESH_TELEMETRY_DSN env is the fallback;
+    # otherwise default to the same local Postgres DB as the request log
+    # (the ledger is metadata-only and fail-open, so the default is safe).
+    telemetry_dsn = getattr(args, "telemetry_dsn", None) or os.environ.get("MESH_TELEMETRY_DSN") or _default_db_url()
     if telemetry_dsn:
         config.telemetry_dsn = str(telemetry_dsn).strip() or None
     return config
