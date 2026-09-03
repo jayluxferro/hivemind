@@ -208,7 +208,7 @@ class Interceptor:
 
         Records one telemetry row AFTER the result is decided, on every exit
         path (circuit-open, admission timeout, upstream result) — exactly
-        once, fire-and-forget, never raising (SPEC-token-ledger D4).
+        once, fire-and-forget, never raising (docs/token-ledger.md D4).
         """
 
         # 0. Circuit breaker — fast-fail if the upstream is overwhelmed
@@ -280,7 +280,7 @@ class Interceptor:
         agent_id: str | None,
         rate_key: str | None,
     ) -> dict:
-        """Build the ledger row for a completed result (SPEC-token-ledger §4).
+        """Build the ledger row for a completed result (docs/token-ledger.md §4).
 
         Bucket precedence: rate_key (rate-limiter bucket, already hashed),
         else agent_id, else ``"anonymous"``.  Provider/model are OBSERVED
@@ -340,7 +340,7 @@ class Interceptor:
         any retries) and released exactly once.
 
         The whole body sits inside ONE try whose finally records the telemetry
-        row (SPEC-token-ledger §4).  Recording must live in an outermost
+        row (docs/token-ledger.md §4).  Recording must live in an outermost
         finally, not in code after a yield: the server closes the generator
         (GeneratorExit) right after the FIRST yield of an early error, which
         would skip any trailing statements.  A finally runs on normal
@@ -553,7 +553,7 @@ class Interceptor:
                                 # maxima (the /_stats aggregator's parse above
                                 # json.loads()s whole chunks and cannot see
                                 # SSE frames; the ledger rows must not miss
-                                # them, SPEC-token-ledger §4).
+                                # them, docs/token-ledger.md §4).
                                 for key, value in extract_cache_usage_from_sse(chunk).items():
                                     if key == "cache_creation_input_tokens":
                                         cache_write_tokens = max(cache_write_tokens, value)

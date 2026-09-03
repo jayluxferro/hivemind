@@ -115,7 +115,7 @@ class ProxyServer:
             ``days`` clamps to [1, 365], default 14.  A DB failure maps to an
             ``{"error": "telemetry unavailable"}`` payload with HTTP 200 — the
             page renders its "Telemetry unavailable" state, never an error
-            (SPEC-token-ledger §5, D4).
+            (docs/token-ledger.md §5, D4).
             """
             try:
                 days = int(request.query_params.get("days", 14))
