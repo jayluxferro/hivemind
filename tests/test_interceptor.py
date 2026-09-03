@@ -1,6 +1,9 @@
 """Tests for the proxy interceptor — the core proxy logic."""
 
+import asyncio
 import json
+
+import httpx
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
@@ -434,3 +437,309 @@ async def test_rate_limit_queue_full_returns_429_fast(components):
     assert mock_client.request.await_count == 0  # never reached upstream
     assert int(result.headers["retry-after"]) >= MAX_WAIT_S
     assert b"retry later" in result.body
+
+
+# --- token-ledger hooks (SPEC-token-ledger §4) --------------------------------
+
+
+class _RecordingLedger:
+    """Stand-in ledger capturing every scheduled row (with a fail option)."""
+
+    def __init__(self, fail: bool = False) -> None:
+        self.rows: list[dict] = []
+        self.fail = fail
+        self.record_calls = 0
+
+    async def record(self, row: dict) -> None:
+        self.record_calls += 1
+        if self.fail:
+            raise RuntimeError("ledger down")
+        self.rows.append(dict(row))
+
+
+@pytest.fixture
+def recording_ledger(monkeypatch):
+    ledger = _RecordingLedger()
+    monkeypatch.setattr("hivemind.proxy.interceptor.get_ledger", lambda: ledger)
+    return ledger
+
+
+async def _settle() -> None:
+    """Let the fire-and-forget record() task run to completion."""
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+
+def _anthropic_interceptor(components, **kwargs):
+    return Interceptor(
+        upstream_url="https://api.anthropic.com",
+        provider=ANTHROPIC,
+        **components,
+        **kwargs,
+    )
+
+
+@pytest.mark.asyncio
+async def test_telemetry_non_streaming_records_one_row(components, recording_ledger):
+    """One buffered request -> exactly one row with every expected field."""
+    body = json.dumps({"model": "claude-sonnet-4-20250514", "messages": [{"role": "user", "content": "Hi"}]}).encode()
+    mock_response = _make_response(
+        body=json.dumps(
+            {
+                "content": [{"type": "text", "text": "Hello"}],
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cache_creation_input_tokens": 5,
+                    "cache_read_input_tokens": 40,
+                },
+            }
+        ).encode()
+    )
+    interceptor = _anthropic_interceptor(components)
+    mock_client = AsyncMock()
+    mock_client.request = AsyncMock(return_value=mock_response)
+    interceptor._client = mock_client
+
+    result = await interceptor.handle_request(
+        method="POST",
+        path="/v1/messages",
+        headers={"content-type": "application/json", "x-api-key": "test"},
+        body=body,
+        agent_id="agent-1",
+        rate_key="bucket-7",
+    )
+    await _settle()
+
+    assert result.status_code == 200
+    assert recording_ledger.record_calls == 1
+    assert len(recording_ledger.rows) == 1
+    row = recording_ledger.rows[0]
+    assert row["agent_hash"] == "bucket-7"  # rate_key takes precedence
+    assert row["provider"] == "Anthropic"
+    assert row["model"] == "claude-sonnet-4-20250514"
+    assert row["tokens_in"] == 100
+    assert row["tokens_out"] == 50
+    assert row["cache_read"] == 40
+    assert row["cache_write"] == 5
+    assert row["reasoning"] is None
+    assert isinstance(row["latency_ms"], float)
+    assert row["status"] == 200
+
+
+@pytest.mark.asyncio
+async def test_telemetry_anonymous_when_unidentified(interceptor, recording_ledger):
+    """No agent_id/rate_key and no model in the body -> 'anonymous'/'unknown'."""
+    mock_client = AsyncMock()
+    mock_client.request = AsyncMock(return_value=_make_response())
+    interceptor._client = mock_client
+
+    result = await interceptor.handle_request(
+        method="POST",
+        path="/v1/messages",
+        headers={},
+        body=b"{}",
+    )
+    await _settle()
+
+    assert result.status_code == 200
+    assert len(recording_ledger.rows) == 1
+    row = recording_ledger.rows[0]
+    assert row["agent_hash"] == "anonymous"
+    assert row["provider"] == "unknown"  # this fixture builds no provider profile
+    assert row["model"] == "unknown"
+    assert row["status"] == 200
+
+
+@pytest.mark.asyncio
+async def test_telemetry_error_row_recorded_for_failed_request(interceptor, recording_ledger):
+    """A non-retryable upstream error still yields a row with the real status."""
+    mock_response = _make_response(status_code=502, body=b'{"error": "bad gateway"}')
+    mock_client = AsyncMock()
+    mock_client.request = AsyncMock(return_value=mock_response)
+    interceptor._client = mock_client
+
+    result = await interceptor.handle_request(
+        method="POST",
+        path="/v1/messages",
+        headers={},
+        body=b"{}",
+        agent_id="agent-1",
+    )
+    await _settle()
+
+    assert result.status_code == 502
+    assert len(recording_ledger.rows) == 1
+    assert recording_ledger.rows[0]["status"] == 502
+    assert recording_ledger.rows[0]["agent_hash"] == "agent-1"
+
+
+@pytest.mark.asyncio
+async def test_telemetry_recorder_failure_never_breaks_request(components, monkeypatch):
+    """A raising ledger must not disturb the request path (D4 fail-open)."""
+    ledger = _RecordingLedger(fail=True)
+    monkeypatch.setattr("hivemind.proxy.interceptor.get_ledger", lambda: ledger)
+
+    interceptor = _anthropic_interceptor(components)
+    mock_client = AsyncMock()
+    mock_client.request = AsyncMock(return_value=_make_response())
+    interceptor._client = mock_client
+
+    result = await interceptor.handle_request(
+        method="POST",
+        path="/v1/messages",
+        headers={},
+        body=b"{}",
+    )
+    await _settle()
+
+    assert result.status_code == 200
+    assert ledger.record_calls == 1  # hook fired; the raise stayed inside the task
+
+
+class _CacheSSEStream(httpx.AsyncByteStream):
+    """Anthropic lifecycle with cache usage carried in message_start."""
+
+    async def __aiter__(self):
+        yield (
+            b'event: message_start\ndata: {"type": "message_start", "message": {"usage": '
+            b'{"input_tokens": 12, "cache_creation_input_tokens": 5, "cache_read_input_tokens": 40}}}\n\n'
+        )
+        yield b'event: content_block_delta\ndata: {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Hello"}}\n\n'
+        yield b'event: message_delta\ndata: {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 7}}\n\n'
+        yield b'event: message_stop\ndata: {"type": "message_stop"}\n\n'
+
+
+def _stream_body() -> bytes:
+    return json.dumps(
+        {
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 100,
+            "stream": True,
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+    ).encode()
+
+
+@pytest.mark.asyncio
+async def test_telemetry_streaming_full_drain_records_one_row(components, recording_ledger):
+    """One committed SSE stream, fully consumed -> exactly one row."""
+
+    def handler(request):
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=_CacheSSEStream())
+
+    interceptor = _anthropic_interceptor(components)
+    interceptor._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        final = None
+        async for _chunk, result in interceptor.handle_streaming_request(
+            "POST",
+            "/v1/messages",
+            {"content-type": "application/json", "accept": "text/event-stream"},
+            _stream_body(),
+            agent_id="agent-1",
+            rate_key="bucket-9",
+        ):
+            if result is not None:
+                final = result
+        await _settle()
+
+        assert final is not None and final.status_code == 200
+        assert final.tokens_in == 12
+        assert final.tokens_out == 7
+        assert recording_ledger.record_calls == 1
+        assert len(recording_ledger.rows) == 1
+        row = recording_ledger.rows[0]
+        assert row["agent_hash"] == "bucket-9"
+        assert row["provider"] == "Anthropic"
+        assert row["model"] == "claude-sonnet-4-20250514"
+        assert row["tokens_in"] == 12
+        assert row["tokens_out"] == 7
+        assert row["cache_read"] == 40  # SSE per-key maxima, not lost to frame splitting
+        assert row["cache_write"] == 5
+        assert row["status"] == 200
+        assert isinstance(row["latency_ms"], float)
+    finally:
+        await interceptor.stop()
+
+
+@pytest.mark.asyncio
+async def test_telemetry_streaming_early_error_aclose_records_once(components, recording_ledger):
+    """Server closes the generator right after the FIRST yield of an early
+    error (401 flow): the outermost finally must still record exactly once."""
+
+    def handler(request):
+        return httpx.Response(
+            401,
+            headers={"content-type": "application/json"},
+            content=b'{"type": "error", "error": {"type": "authentication_error", "message": "invalid key"}}',
+        )
+
+    interceptor = _anthropic_interceptor(components)
+    interceptor._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        gen = interceptor.handle_streaming_request(
+            "POST",
+            "/v1/messages",
+            {"content-type": "application/json", "accept": "text/event-stream"},
+            _stream_body(),
+            agent_id="agent-1",
+            rate_key="bucket-1",
+        )
+        iterator = gen.__aiter__()
+        chunk, result = await iterator.__anext__()
+        assert result.status_code == 401
+        assert chunk
+        await gen.aclose()  # GeneratorExit lands inside the streaming path
+        await _settle()
+
+        assert recording_ledger.record_calls == 1
+        assert len(recording_ledger.rows) == 1
+        row = recording_ledger.rows[0]
+        assert row["agent_hash"] == "bucket-1"
+        assert row["provider"] == "Anthropic"
+        assert row["model"] == "claude-sonnet-4-20250514"
+        assert row["status"] == 401
+        assert row["tokens_in"] is None
+    finally:
+        await interceptor.stop()
+
+
+@pytest.mark.asyncio
+async def test_telemetry_streaming_mid_stream_abort_records_once(components, recording_ledger):
+    """Gate-2 abort after committed bytes still lands exactly one row."""
+
+    class _AbruptSSE(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b'event: message_start\ndata: {"type": "message_start", "message": {"usage": {"input_tokens": 10}}}\n\n'
+            raise httpx.ReadError("")
+
+    def handler(request):
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=_AbruptSSE())
+
+    interceptor = _anthropic_interceptor(components)
+    interceptor._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        final = None
+        async for _chunk, result in interceptor.handle_streaming_request(
+            "POST",
+            "/v1/messages",
+            {"content-type": "application/json", "accept": "text/event-stream"},
+            _stream_body(),
+            agent_id="agent-1",
+        ):
+            if result is not None:
+                final = result
+        await _settle()
+
+        assert final is not None and final.status_code == 200  # committed status frozen
+        assert final.error and "ReadError" in final.error
+        assert recording_ledger.record_calls == 1
+        assert len(recording_ledger.rows) == 1
+        row = recording_ledger.rows[0]
+        assert row["status"] == 200
+        assert row["tokens_in"] == 10
+        assert row["tokens_out"] is None
+        assert row["agent_hash"] == "agent-1"
+    finally:
+        await interceptor.stop()

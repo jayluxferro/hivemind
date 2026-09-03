@@ -194,6 +194,11 @@ class HiveMindConfig:
     # Storage
     db_url: str = field(default_factory=_default_db_url)
 
+    # Token ledger (Postgres DSN for mesh_telemetry; None disables telemetry
+    # entirely — the interceptor then records into a no-op NullLedger, so an
+    # unset DSN changes zero behavior).
+    telemetry_dsn: str | None = None
+
     # Provider (auto-detected from upstream_url if not set)
     provider: str | None = None  # anthropic, openai, ollama, etc.
 
@@ -266,5 +271,6 @@ class HiveMindConfig:
             "rate_limit_scope": self.rate_limit_scope,
             "agent_limit_overrides": {agent: dict(limits) for agent, limits in self.agent_limit_overrides.items()},
             "db_url": self.db_url,
+            "telemetry_dsn": self.telemetry_dsn,
             "http_tls_verify": self.http_tls_verify,
         }

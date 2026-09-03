@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 
 from .scheduler.rate_limiter import AGENT_LIMIT_KINDS
 from .storage.models import HiveMindConfig, _default_db_url
@@ -151,6 +152,13 @@ def register_proxy_cli_arguments(
         default=_default_db_url(),
         help="Postgres connection string (HIVEMIND_DB_URL env overrides the default)",
     )
+    parser.add_argument(
+        "--telemetry-dsn",
+        default=None,
+        metavar="DSN",
+        help="Postgres DSN for the token ledger + cost dashboard (MESH_TELEMETRY_DSN env "
+        "fallback; unset = telemetry disabled, proxy behavior unchanged)",
+    )
     parser.add_argument("--max-retries", type=int, default=3, help="Max transparent retries on 429/502")
     parser.add_argument("--retry-base-delay", type=float, default=1.0, help="Base retry delay in seconds")
     parser.add_argument("--retry-max-delay", type=float, default=30.0, help="Max retry delay in seconds")
@@ -248,4 +256,10 @@ def hivemind_config_from_proxy_cli_args(args: argparse.Namespace) -> HiveMindCon
     if getattr(args, "agent_limit", None):
         config.agent_limit_overrides.update(parse_agent_limit_specs(args.agent_limit))
         config.normalize_runtime_limits()  # re-validate the merged registry loudly
+
+    # Token ledger: explicit flag wins; MESH_TELEMETRY_DSN env is the fallback.
+    # Neither set → telemetry_dsn stays None → NullLedger (zero behavior change).
+    telemetry_dsn = getattr(args, "telemetry_dsn", None) or os.environ.get("MESH_TELEMETRY_DSN")
+    if telemetry_dsn:
+        config.telemetry_dsn = str(telemetry_dsn).strip() or None
     return config

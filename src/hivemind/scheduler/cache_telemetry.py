@@ -37,17 +37,13 @@ def _cache_fields_from_usage(usage: dict) -> dict[str, int]:
     return out
 
 
-def extract_cache_usage(body: bytes) -> dict[str, int]:
-    """Pull cache-related usage numbers from a response body (empty if absent).
+def _cache_usage_from_payload(data) -> dict[str, int]:
+    """Cache fields from one decoded JSON payload (empty if absent).
 
-    Handles both shapes: non-streaming responses (``usage`` at the top level)
-    and streaming SSE events, where the full usage block rides nested inside
-    ``message_start`` → ``message`` → ``usage``.
+    Handles both response shapes: non-streaming bodies (``usage`` at the top
+    level) and streaming events, where the full usage block rides nested
+    inside ``message_start`` → ``message`` → ``usage``.
     """
-    try:
-        data = json.loads(body)
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return {}
     if not isinstance(data, dict):
         return {}
     usage = data.get("usage")
@@ -55,6 +51,51 @@ def extract_cache_usage(body: bytes) -> dict[str, int]:
         message = data.get("message")
         usage = message.get("usage") if isinstance(message, dict) else None
     return _cache_fields_from_usage(usage)
+
+
+def extract_cache_usage(body: bytes) -> dict[str, int]:
+    """Pull cache-related usage numbers from a non-streaming response body.
+
+    ``json.loads`` needs the WHOLE body to be one JSON document, so this is
+    only valid for buffered bodies — see ``extract_cache_usage_from_sse`` for
+    SSE byte chunks.
+    """
+    try:
+        data = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return {}
+    return _cache_usage_from_payload(data)
+
+
+def extract_cache_usage_from_sse(chunk: bytes) -> dict[str, int]:
+    """Cache fields from an SSE byte chunk (multi-line event/data frames).
+
+    Streaming chunks are not one JSON document — they carry ``event:`` and
+    ``data:`` lines, often several payloads, occasionally a ``[DONE]`` marker
+    or garbage from a dying upstream.  This walks every ``data:`` line
+    individually and merges per-key MAXIMA across payloads: Anthropic usage
+    blocks are cumulative snapshots (``message_start`` then ``message_delta``),
+    so the max is the snapshot that wins.  Best-effort: a payload split across
+    a chunk boundary is skipped rather than misread.
+    """
+    merged: dict[str, int] = {}
+    try:
+        lines = chunk.decode("utf-8", errors="replace").splitlines()
+    except Exception:  # pragma: no cover - decode with errors=replace cannot raise
+        return merged
+    for line in lines:
+        if not line.startswith("data: "):
+            continue
+        payload = line[6:].strip()
+        if not payload or payload == "[DONE]":
+            continue
+        try:
+            fields = _cache_usage_from_payload(json.loads(payload))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        for key, value in fields.items():
+            merged[key] = max(merged.get(key, 0), value)
+    return merged
 
 
 def request_uses_cache_control(body: bytes) -> bool:

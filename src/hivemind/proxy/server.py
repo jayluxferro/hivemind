@@ -9,6 +9,7 @@ token budgets). The provider is auto-detected from the upstream URL.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 
@@ -25,6 +26,8 @@ from ..scheduler.rate_limiter import RateLimiter
 from ..scheduler.providers import detect_provider
 from ..storage.db import Database
 from ..storage.models import HiveMindConfig
+from ..telemetry.dashboard import PAGE_HTML
+from ..telemetry.ledger import NullLedger, TelemetryLedger, get_ledger, set_ledger
 from .identity import resolve_agent_id, resolve_rate_key
 from .interceptor import Interceptor
 from .latency_tracker import LatencyTracker
@@ -76,6 +79,10 @@ class ProxyServer:
         )
         self._app: Starlette | None = None
         self._server_task: asyncio.Task | None = None
+        # Ledger wired in _on_startup when config.telemetry_dsn is set; the
+        # module-level get_ledger() defaults to a no-op NullLedger until then
+        # (and after shutdown), so telemetry is always fail-open.
+        self._telemetry_ledger: TelemetryLedger | None = None
 
     def _build_app(self) -> Starlette:
         async def proxy_handler(request: Request) -> Response:
@@ -88,12 +95,42 @@ class ProxyServer:
             )
 
         async def stats_handler(request: Request) -> Response:
-            import json
-
             stats = self.get_stats()
             return Response(
                 content=json.dumps(stats, indent=2),
                 media_type="application/json",
+            )
+
+        async def telemetry_page_handler(request: Request) -> Response:
+            """Token-ledger dashboard — single self-contained HTML page."""
+            return Response(
+                content=PAGE_HTML,
+                media_type="text/html",
+                headers={"cache-control": "no-store"},
+            )
+
+        async def telemetry_data_handler(request: Request) -> Response:
+            """Dashboard JSON (mesh_telemetry.usage_cost aggregates).
+
+            ``days`` clamps to [1, 365], default 14.  A DB failure maps to an
+            ``{"error": "telemetry unavailable"}`` payload with HTTP 200 — the
+            page renders its "Telemetry unavailable" state, never an error
+            (SPEC-token-ledger §5, D4).
+            """
+            try:
+                days = int(request.query_params.get("days", 14))
+            except (TypeError, ValueError):
+                days = 14
+            days = max(1, min(365, days))
+            try:
+                payload = await get_ledger().fetch_dashboard(days=days)
+            except Exception as exc:
+                logger.debug("telemetry dashboard unavailable (fail-open): %s", exc)
+                payload = {"error": "telemetry unavailable"}
+            return Response(
+                content=json.dumps(payload),
+                media_type="application/json",
+                headers={"cache-control": "no-store"},
             )
 
         async def cache_probe_handler(request: Request) -> Response:
@@ -175,6 +212,9 @@ class ProxyServer:
                 Route("/_health", health_handler, methods=["GET"]),
                 Route("/_stats", stats_handler, methods=["GET"]),
                 Route("/_probe/cache", cache_probe_handler, methods=["POST"]),
+                # Token-ledger dashboard (before the catch-all proxy route)
+                Route("/_telemetry", telemetry_page_handler, methods=["GET"]),
+                Route("/_telemetry/data", telemetry_data_handler, methods=["GET"]),
                 # Catch-all proxy route
                 Route("/{path:path}", proxy_handler, methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"]),
             ],
@@ -184,15 +224,29 @@ class ProxyServer:
 
     async def _on_startup(self) -> None:
         await self.interceptor.start()
+        telemetry_dsn = getattr(self.config, "telemetry_dsn", None)
+        if telemetry_dsn:
+            # Best-effort: TelemetryLedger.connect() never raises (fail-open),
+            # and an unhealthy PG still leaves the dashboard's data endpoint
+            # answering "telemetry unavailable" rather than erroring.
+            ledger = TelemetryLedger(telemetry_dsn)
+            set_ledger(ledger)
+            self._telemetry_ledger = ledger
+            await ledger.connect()
         logger.info(
-            "HiveMind proxy started on %s:%d → %s (max_concurrency=%d)",
+            "HiveMind proxy started on %s:%d → %s (max_concurrency=%d%s)",
             self.config.proxy_host,
             self.config.proxy_port,
             self.config.upstream_url,
             self.config.max_concurrency,
+            "" if telemetry_dsn else ", telemetry disabled",
         )
 
     async def _on_shutdown(self) -> None:
+        if self._telemetry_ledger is not None:
+            await self._telemetry_ledger.shutdown()
+            self._telemetry_ledger = None
+            set_ledger(NullLedger())
         await self.interceptor.stop()
         logger.info("HiveMind proxy stopped")
 

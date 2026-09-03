@@ -90,3 +90,39 @@ def test_config_validates_agent_limit_overrides():
         HiveMindConfig(agent_limit_overrides={"a": {"rpm": 0}})
     cfg = HiveMindConfig(agent_limit_overrides={"a": {"rpm": 10}})
     assert cfg.to_dict()["agent_limit_overrides"] == {"a": {"rpm": 10}}
+
+
+# --- token ledger DSN (SPEC-token-ledger §5) ----------------------------------
+
+
+def _proxy_config(argv):
+    parser = argparse.ArgumentParser()
+    register_proxy_cli_arguments(parser)
+    args = parser.parse_args(argv)
+    return hivemind_config_from_proxy_cli_args(args)
+
+
+def test_proxy_cli_telemetry_dsn_flag(monkeypatch):
+    monkeypatch.delenv("MESH_TELEMETRY_DSN", raising=False)
+    c = _proxy_config(["--telemetry-dsn", "postgresql://user:pass@db:5432/mesh"])
+    assert c.telemetry_dsn == "postgresql://user:pass@db:5432/mesh"
+    assert c.to_dict()["telemetry_dsn"] == "postgresql://user:pass@db:5432/mesh"
+
+
+def test_proxy_cli_telemetry_dsn_env_fallback(monkeypatch):
+    monkeypatch.setenv("MESH_TELEMETRY_DSN", "postgresql://env@localhost:5432/telemetry")
+    c = _proxy_config([])  # no flag -> env fallback
+    assert c.telemetry_dsn == "postgresql://env@localhost:5432/telemetry"
+
+
+def test_proxy_cli_telemetry_dsn_flag_beats_env(monkeypatch):
+    monkeypatch.setenv("MESH_TELEMETRY_DSN", "postgresql://env@localhost:5432/telemetry")
+    c = _proxy_config(["--telemetry-dsn", "postgresql://flag@localhost:5432/telemetry"])
+    assert c.telemetry_dsn == "postgresql://flag@localhost:5432/telemetry"
+
+
+def test_proxy_cli_telemetry_dsn_unset_stays_none(monkeypatch):
+    monkeypatch.delenv("MESH_TELEMETRY_DSN", raising=False)
+    c = _proxy_config([])
+    assert c.telemetry_dsn is None
+    assert c.to_dict()["telemetry_dsn"] is None

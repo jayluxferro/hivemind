@@ -252,6 +252,48 @@ alignment before each table, verifies per-table counts afterwards (exit 1
 on mismatch), and advances the identity sequences that explicit-id COPYs
 bypass.
 
+### Token ledger + cost dashboard (optional)
+
+A second, opt-in Postgres database records one row per completed cloud-bound
+request — token + cache counters, provider/model as observed, latency, final
+status — and a dashboard answers "what did this actually cost, per day /
+model / agent bucket?" from it.  It is deliberately separate from the
+request-log DB: telemetry must never disturb the proxy, so everything about
+it fails open and is disabled by default.
+
+```bash
+# Enable it (either form):
+hivemind proxy --telemetry-dsn postgresql://hivemind@localhost:5432/hivemind
+MESH_TELEMETRY_DSN=postgresql://hivemind@localhost:5432/hivemind hivemind proxy
+
+# One-time pricing seed (schema is self-managed; this adds USD-per-1M-token rows):
+psql "$MESH_TELEMETRY_DSN" -f tools/seed_pricing.sql   # PLACEHOLDER prices — verify first
+```
+
+Schema, index, and the costing view under `mesh_telemetry` are created
+automatically by the ledger itself (no manual DDL).  The schema and seed SQL
+live in `tools/seed_pricing.sql` and are idempotent.
+
+Dashboard, served by the proxy (same port as the agents' upstream):
+
+| Endpoint | Description |
+|---|---|
+| `/_telemetry` | Single self-contained HTML page (inline CSS/JS, no CDN) |
+| `/_telemetry/data?days=N` | JSON aggregates (`N` clamps to 1–365, default 14) |
+
+Fail-open contract: if Postgres is unreachable — or `--telemetry-dsn` is
+unset — the proxy behaves exactly as before.  Writes are fire-and-forget
+through a bounded queue drained by one background writer; rows are dropped
+(at DEBUG log) rather than ever blocking or failing a request.  The data
+endpoint answers `{"error": "telemetry unavailable"}` with HTTP 200 on any
+DB failure.  No prompt content is stored — only the hashed rate-limit bucket
+(agent_hash), provider/model names, and counters.
+
+> Pricing is **hand-maintained** (never auto-fetched) and seeded with
+> placeholder numbers — verify every row against provider price pages before
+> trusting the cost column.  Models without a pricing row cost NULL, which
+> the dashboard shows as uncosted rather than guessing.
+
 ## Architecture
 
 ### Five Scheduling Primitives
