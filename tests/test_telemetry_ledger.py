@@ -21,7 +21,7 @@ from hivemind.telemetry.ledger import (
     _insert_params,
     _QUEUE_MAX,
     _SQL_AGENTS,
-    _SQL_DAILY,
+    _SQL_DAILY_AGENTS,
     _SQL_LATENCY,
     _SQL_TOP_MODELS,
     NullLedger,
@@ -281,22 +281,22 @@ async def test_fetch_dashboard_shapes_payload_and_parameterizes_days():
     holder = FakeConn()
     day = date(2026, 9, 1)
     holder.fetchall_rows = {
-        _SQL_DAILY: [
+        _SQL_DAILY_AGENTS: [
             {
                 "day": day,
-                "provider": "Anthropic",
+                "agent_hash": "fp-abc123",
                 "requests": 10,
                 "tokens_in": 1000,
                 "tokens_out": 500,
-                "cost_usd": 0.0123,
+                "errors": 1,
             },
             {
                 "day": day,
-                "provider": "Ollama (local)",
+                "agent_hash": "Other",
                 "requests": 4,
                 "tokens_in": 400,
                 "tokens_out": 300,
-                "cost_usd": 0.0,
+                "errors": 0,
             },
         ],
         _SQL_TOP_MODELS: [
@@ -306,6 +306,7 @@ async def test_fetch_dashboard_shapes_payload_and_parameterizes_days():
                 "requests": 9,
                 "tokens_in": 900,
                 "tokens_out": 400,
+                "cache_read": 300,
                 "cost_usd": 0.0111,
             },
             {
@@ -314,6 +315,7 @@ async def test_fetch_dashboard_shapes_payload_and_parameterizes_days():
                 "requests": 4,
                 "tokens_in": 400,
                 "tokens_out": 300,
+                "cache_read": 0,
                 "cost_usd": 0.0,
             },
         ],
@@ -323,6 +325,8 @@ async def test_fetch_dashboard_shapes_payload_and_parameterizes_days():
                 "requests": 25,
                 "tokens_in": 2500,
                 "tokens_out": 1000,
+                "cache_read": 1500,
+                "cache_write": 40,
                 "cost_usd": 0.03,
                 "errors": 3,
             }
@@ -347,6 +351,8 @@ async def test_fetch_dashboard_shapes_payload_and_parameterizes_days():
         "errors": 3,
         "tokens_in": 1400,
         "tokens_out": 800,
+        "cache_read": 600,
+        "cache_write": 25,
         "cost_usd": 0.0123,
         "local_requests": 4,
     }
@@ -363,25 +369,31 @@ async def test_fetch_dashboard_shapes_payload_and_parameterizes_days():
         "error_rate": round(3 / 14, 4),
         "tokens_in": 1400,
         "tokens_out": 800,
+        "cache_read": 600,
+        "cache_write": 25,
         "cost_usd": 0.0123,
         "local_requests": 4,
         "local_share_pct": round(4 / 14 * 100.0, 2),
     }
-    assert payload["daily"][0] == {
+    assert payload["daily_agents"][0] == {
         "day": "2026-09-01",
-        "provider": "Anthropic",
+        "agent_hash": "fp-abc123",
         "requests": 10,
         "tokens_in": 1000,
         "tokens_out": 500,
-        "cost_usd": 0.0123,
+        "errors": 1,
     }
+    assert payload["daily_agents"][1]["agent_hash"] == "Other"
     assert payload["top_models"][0]["model"] == "deepseek-chat"
+    assert payload["top_models"][0]["cache_read"] == 300
     assert payload["agents"] == [
         {
             "agent_hash": "bucket-1",
             "requests": 25,
             "tokens_in": 2500,
             "tokens_out": 1000,
+            "cache_read": 1500,
+            "cache_write": 40,
             "cost_usd": 0.03,
             "errors": 3,
             "error_rate": 0.12,
@@ -392,10 +404,13 @@ async def test_fetch_dashboard_shapes_payload_and_parameterizes_days():
     # Everything must be JSON-serializable (no Decimal/date leakage).
     json.dumps(payload)
 
-    # Every read query is parameterized on the day window.
+    # Every read query is parameterized on the day window.  The daily-agents
+    # query carries the window twice (ranking CTE + outer query) and so takes
+    # the parameter twice.
     read_params = [params for sql, params in holder.executed if params is not None]
     assert len(read_params) == 5
-    assert all(p == (7,) for p in read_params)
+    assert read_params.count((7, 7)) == 1  # _SQL_DAILY_AGENTS
+    assert read_params.count((7,)) == 4
     # Schema DDL also ran on the reader connection (self-healing view).  The
     # multi-line statements begin with a newline, so match on content.
     ddl = [sql for sql, _ in holder.executed if "CREATE" in sql]
@@ -421,11 +436,13 @@ async def test_fetch_dashboard_with_no_rows():
         "error_rate": 0.0,
         "tokens_in": 0,
         "tokens_out": 0,
+        "cache_read": 0,
+        "cache_write": 0,
         "cost_usd": 0.0,
         "local_requests": 0,
         "local_share_pct": 0.0,
     }
-    assert payload["daily"] == []
+    assert payload["daily_agents"] == []
     assert payload["top_models"] == []
     assert payload["agents"] == []
     assert payload["latency"] == []

@@ -20,6 +20,10 @@ method, pinned down for this SPEC):
 - a plain HTML table with the same data below every chart
 - dynamic text is inserted with textContent only (labels are untrusted)
 - data failures render "telemetry unavailable", never a JS error
+- live dashboard: polls /_telemetry/data every 10s (skipped while the tab is
+  hidden, in-flight fetches never overlap); the primary dimension is AGENT
+  usage over time — provider is only shown where it still carries signal
+  (model/latency cards), and cost appears only when pricing rows exist
 """
 
 PAGE_HTML = """<!doctype html>
@@ -159,8 +163,7 @@ PAGE_HTML = """<!doctype html>
 <main id="main"><p class="empty">Loading telemetry&hellip;</p></main>
 
 <footer>
-  Costs come from <code>mesh_telemetry.model_pricing</code> — seed or edit it with
-  <code>tools/seed_pricing.sql</code>; models without a pricing row carry no cost (never guessed).
+  Live dashboard — refreshes every 10s while the tab is visible (window selector applies on change).
   Ledger writes are fail-open: if Postgres is unreachable telemetry is dropped and the proxy keeps
   serving. No prompt content is ever stored — only hashed agent buckets and numbers.
 </footer>
@@ -176,6 +179,16 @@ const OTHER_COLOR = "#8f8f8f";
 const SVG_NS = "http://www.w3.org/2000/svg";
 
 const state = { days: 14 };
+// Live dashboard: poll the data endpoint.  Skipped while the tab is hidden
+// (no wasted queries); an in-flight fetch never overlaps the next tick.
+const REFRESH_MS = 10000;
+let inflight = false;
+const shortHash = (h) => (h && h.length > 12 ? h.slice(0, 12) + "…" : h);
+// Cache hit rate: read tokens over total input (read + fresh in).  NULL-safe.
+const hitRate = (r) => {
+  const total = (r.cache_read || 0) + (r.tokens_in || 0);
+  return total > 0 ? (r.cache_read || 0) / total : null;
+};
 
 /* ============ tiny DOM helpers (data only ever via textContent) ============ */
 function el(tag, cls, text) {
@@ -308,12 +321,13 @@ function stackedDaily(holder, title, rows, pick, fmt, tipFor, order) {
     let m = per.get(r.day);
     if (!m) { m = new Map(); per.set(r.day, m); }
     let acc = m.get(r.series);
-    if (!acc) { acc = { value: 0, cost: 0, tokensIn: 0, tokensOut: 0, requests: 0 }; m.set(r.series, acc); }
+    if (!acc) { acc = { value: 0, cost: 0, tokensIn: 0, tokensOut: 0, requests: 0, errors: 0 }; m.set(r.series, acc); }
     acc.value += pick(r);
     acc.cost += r.cost_usd;
     acc.tokensIn += r.tokens_in;
     acc.tokensOut += r.tokens_out;
     acc.requests += r.requests;
+    acc.errors += r.errors || 0;
   }
   days.sort();
   const series = chartSeries(rows, order); // stack order == page order
@@ -336,7 +350,9 @@ function stackedDaily(holder, title, rows, pick, fmt, tipFor, order) {
   box.appendChild(el("h3", null, title));
 
   if (series.length >= 2) {
-    box.appendChild(legendEl(series.map((s) => ({ name: s, color: providerColor(s, order) }))));
+    // Legend labels are shortened hashes for agent series; tooltips keep the
+    // full hash. "Other" is already short and passes through unchanged.
+    box.appendChild(legendEl(series.map((s) => ({ name: shortHash(s), color: providerColor(s, order) }))));
   }
 
   const svg = svgEl("svg", { viewBox: "0 0 " + W + " " + H });
@@ -402,7 +418,7 @@ function topModelBars(holder, title, models, order) {
   const H = mT + rowH * rows.length + 26;
   const x0 = labelW + 4;
   const plotW = W - x0 - mR;
-  const max = niceMax(Math.max.apply(null, rows.map((m) => m.cost_usd)));
+  const max = niceMax(Math.max.apply(null, rows.map((m) => m.tokens_in + m.tokens_out)));
   const x = (v) => x0 + (v / max) * plotW;
 
   const present = [];
@@ -416,28 +432,31 @@ function topModelBars(holder, title, models, order) {
   for (let i = 1; i <= 4; i++) {
     const t = (max / 4) * i;
     svg.appendChild(svgEl("line", { x1: x(t), x2: x(t), y1: mT - 4, y2: H - 20, class: "grid" }));
-    svg.appendChild(textEl("text", fmtMoney(t), { x: x(t), y: H - 6, "text-anchor": "middle", class: "tick-label" }));
+    svg.appendChild(textEl("text", fmtTokens(t), { x: x(t), y: H - 6, "text-anchor": "middle", class: "tick-label" }));
   }
   rows.forEach((m, i) => {
     const cy = mT + i * rowH + rowH / 2;
+    const tokens = m.tokens_in + m.tokens_out;
     svg.appendChild(textEl("text", m.model, { x: labelW - 8, y: cy, "text-anchor": "end", class: "row-label" }));
     svg.appendChild(textEl("text", m.provider, { x: labelW - 8, y: cy + 13, "text-anchor": "end", class: "tick-label" }));
     const color = providerColor(m.provider, order);
-    const bw = Math.max(2, x(m.cost_usd) - x0);
+    const bw = Math.max(2, x(tokens) - x0);
     const rect = svgEl("rect", { x: x0, y: cy - 7, width: bw, height: 14, rx: Math.min(4, 7) });
     rect.style.fill = color;
     svg.appendChild(rect);
     // Hit target: the whole row band right of the labels.
     const hit = svgEl("rect", { x: x0, y: cy - 12, width: plotW + mR, height: 24, fill: "transparent" });
-    bindHover(hit, m.model, [
+    const tipRows = [
       { swatch: color, label: "provider", value: m.provider },
       { label: "requests", value: fmtInt(m.requests) },
       { label: "tokens in/out", value: fmtInt(m.tokens_in) + " / " + fmtInt(m.tokens_out) },
-      { label: "cost", value: fmtMoney(m.cost_usd) },
-    ]);
+      { label: "cache reads", value: fmtInt(m.cache_read || 0) },
+    ];
+    if (m.cost_usd > 0) tipRows.push({ label: "cost", value: fmtMoney(m.cost_usd) });
+    bindHover(hit, m.model, tipRows);
     svg.appendChild(hit);
     // Value at the tip (ranked bars — every bar is an endpoint).
-    svg.appendChild(textEl("text", fmtMoney(m.cost_usd), { x: x(m.cost_usd) + 6, y: cy + 3.5, class: "bar-label" }));
+    svg.appendChild(textEl("text", fmtTokens(tokens), { x: x(tokens) + 6, y: cy + 3.5, class: "bar-label" }));
   });
   box.appendChild(svg);
   holder.appendChild(box);
@@ -530,13 +549,16 @@ function dataTable(holder, caption, headers, rows) {
 function renderTiles(main, t) {
   const tiles = el("div", "tiles");
   const defs = [
-    { label: "Total cost", value: fmtMoney(t.cost_usd) },
     { label: "Requests", value: fmtInt(t.requests) },
     { label: "Tokens in", value: fmtInt(t.tokens_in) },
     { label: "Tokens out", value: fmtInt(t.tokens_out) },
+    { label: "Cache reads", value: fmtTokens(t.cache_read) },
     { label: "Error rate", value: fmtPct(t.error_rate) },
     { label: "Local share", value: (t.local_share_pct || 0).toFixed(1) + "%" },
   ];
+  // Cost is secondary and only honest when pricing rows exist — hide the
+  // tile entirely when the window is unpriced rather than showing "$0".
+  if (t.cost_usd > 0) defs.push({ label: "Total cost", value: fmtMoney(t.cost_usd) });
   for (const d of defs) {
     const tile = el("div", "tile");
     tile.appendChild(el("div", "label", d.label));
@@ -546,73 +568,66 @@ function renderTiles(main, t) {
   main.appendChild(tiles);
 }
 
-function renderDaily(main, data, order) {
+function renderDailyAgents(main, data, order) {
   const card = el("section", "card");
-  card.appendChild(el("h2", null, "Daily usage"));
+  card.appendChild(el("h2", null, "Daily usage per agent"));
   card.appendChild(el("p", "sub",
-    "Cost and tokens per day, stacked by provider in one fixed color order. The “Local share” " +
-    "tile counts requests this proxy forwarded to a local Ollama upstream."));
+    "Tokens per day, stacked by agent (top 5 by window tokens; the rest fold into “Other”). " +
+    "The provider dimension is not charted — mid-pipeline upstreams all detect as one profile."));
 
-  if (!data.daily.length) {
+  if (!data.daily_agents.length) {
     card.appendChild(el("p", "empty", "No telemetry in this window yet."));
     main.appendChild(card);
     return;
   }
-  const rows = data.daily.map((r) => ({
-    day: r.day, provider: r.provider, series: foldedName(r.provider, order),
-    cost_usd: r.cost_usd, tokens_in: r.tokens_in, tokens_out: r.tokens_out, requests: r.requests,
+  const rows = data.daily_agents.map((r) => ({
+    day: r.day, agent_hash: r.agent_hash, series: foldedName(r.agent_hash, order),
+    tokens_in: r.tokens_in, tokens_out: r.tokens_out, requests: r.requests, errors: r.errors,
   }));
-
-  const costBox = el("div", "subchart");
-  stackedDaily(costBox, "Cost per day", rows, (r) => r.cost_usd, fmtMoney,
-    (e, d) => [
-      { label: "day", value: d },
-      { label: "requests", value: fmtInt(e.requests) },
-      { label: "cost", value: fmtMoney(e.cost) },
-      { label: "tokens in/out", value: fmtInt(e.tokensIn) + " / " + fmtInt(e.tokensOut) },
-    ], order);
-  card.appendChild(costBox);
-  const tableRows = data.daily.slice()
-    .sort((a, b) => (b.day < a.day ? -1 : b.day > a.day ? 1 : 0));
-  dataTable(card, "Same data as the chart above (cost).", ["Day", "Provider", "Requests", "Tokens in", "Tokens out", "Cost"],
-    tableRows.map((r) => [
-      { text: r.day }, { text: r.provider }, { text: fmtInt(r.requests) },
-      { text: fmtInt(r.tokens_in) }, { text: fmtInt(r.tokens_out) }, { text: fmtMoney(r.cost_usd) },
-    ]));
 
   const tokenBox = el("div", "subchart");
   stackedDaily(tokenBox, "Tokens per day", rows, (r) => r.tokens_in + r.tokens_out, fmtTokens,
-    (e, d) => [
+    (e, d, s) => [
       { label: "day", value: d },
+      { label: "agent", value: s },
       { label: "requests", value: fmtInt(e.requests) },
-      { label: "tokens in", value: fmtInt(e.tokensIn) },
-      { label: "tokens out", value: fmtInt(e.tokensOut) },
+      { label: "tokens in/out", value: fmtInt(e.tokensIn) + " / " + fmtInt(e.tokensOut) },
+      { label: "errors", value: fmtInt(e.errors) },
     ], order);
   card.appendChild(tokenBox);
-  dataTable(card, "Same data as the chart above (tokens).", ["Day", "Provider", "Requests", "Tokens in", "Tokens out", "Cost"],
+  const tableRows = data.daily_agents.slice()
+    .sort((a, b) => (b.day < a.day ? -1 : b.day > a.day ? 1 : 0));
+  dataTable(card, "Same data as the chart above.", ["Day", "Agent (hash)", "Requests", "Tokens in", "Tokens out", "Errors"],
     tableRows.map((r) => [
-      { text: r.day }, { text: r.provider }, { text: fmtInt(r.requests) },
-      { text: fmtInt(r.tokens_in) }, { text: fmtInt(r.tokens_out) }, { text: fmtMoney(r.cost_usd) },
+      { text: r.day }, { text: r.agent_hash, cls: "agent-hash", title: "rate-limit bucket hash (agent identity)" },
+      { text: fmtInt(r.requests) }, { text: fmtInt(r.tokens_in) }, { text: fmtInt(r.tokens_out) },
+      { text: fmtInt(r.errors) },
     ]));
   main.appendChild(card);
 }
 
 function renderModels(main, data, order) {
   const card = el("section", "card");
-  card.appendChild(el("h2", null, "Top models by cost"));
+  card.appendChild(el("h2", null, "Top models by tokens"));
   card.appendChild(el("p", "sub",
-    "Only models with a pricing row in mesh_telemetry.model_pricing are costed; pricing is never " +
-    "auto-fetched — edit tools/seed_pricing.sql."));
+    "Ranked by tokens consumed, not cost — cache reads are the actionable money signal for " +
+    "multi-agent runs (low hit rate = repeated full-context sends)."));
   if (data.top_models.length) {
-    topModelBars(card, "Cost by model", data.top_models, order);
-    dataTable(card, "Same data as the chart above.", ["Model", "Provider", "Requests", "Tokens in", "Tokens out", "Cost"],
-      data.top_models.map((m) => [
-        { text: m.model }, { text: m.provider }, { text: fmtInt(m.requests) },
-        { text: fmtInt(m.tokens_in) }, { text: fmtInt(m.tokens_out) }, { text: fmtMoney(m.cost_usd) },
-      ]));
+    topModelBars(card, "Tokens by model", data.top_models, order);
+    const hasCost = data.top_models.some((m) => m.cost_usd > 0);
+    const headers = ["Model", "Provider", "Requests", "Tokens in", "Tokens out", "Cache reads"];
+    if (hasCost) headers.push("Cost");
+    dataTable(card, "Same data as the chart above.", headers,
+      data.top_models.map((m) => {
+        const cells = [
+          { text: m.model }, { text: m.provider }, { text: fmtInt(m.requests) },
+          { text: fmtInt(m.tokens_in) }, { text: fmtInt(m.tokens_out) }, { text: fmtInt(m.cache_read || 0) },
+        ];
+        if (hasCost) cells.push({ text: fmtMoney(m.cost_usd) });
+        return cells;
+      }));
   } else {
-    card.appendChild(el("p", "empty",
-      "No priced models in this window. Models need rows in mesh_telemetry.model_pricing — see tools/seed_pricing.sql."));
+    card.appendChild(el("p", "empty", "No requests in this window."));
   }
   main.appendChild(card);
 }
@@ -647,41 +662,42 @@ function renderAgents(main, data) {
   }
   const maxCost = Math.max.apply(null, data.agents.map((a) => a.cost_usd));
   const table = el("table", "datatable");
-  table.appendChild(el("caption", null, "One row per agent hash; the final column is the proportional cost share."));
+  table.appendChild(el("caption", null, "One row per agent hash. Cache hit = tokens served from cache over total input."));
   const thead = el("thead");
   const hr = el("tr");
-  for (const h of ["Agent (hash)", "Requests", "Tokens in", "Tokens out", "Cost", "Error rate", "Cost share"]) {
-    hr.appendChild(el("th", null, h));
-  }
+  const headers = ["Agent (hash)", "Requests", "Tokens in", "Tokens out", "Cache reads", "Cache hit", "Error rate"];
+  if (maxCost > 0) headers.push("Cost", "Cost share");
+  for (const h of headers) hr.appendChild(el("th", null, h));
   thead.appendChild(hr);
   table.appendChild(thead);
   const tbody = el("tbody");
   data.agents.forEach((a) => {
     const tr = el("tr");
+    const rate = hitRate(a);
     const cells = [
       { text: a.agent_hash, cls: "agent-hash", title: "rate-limit bucket hash (agent identity)" },
       { text: fmtInt(a.requests) },
       { text: fmtInt(a.tokens_in) },
       { text: fmtInt(a.tokens_out) },
-      { text: fmtMoney(a.cost_usd) },
+      { text: fmtInt(a.cache_read || 0) },
+      { text: rate == null ? "—" : fmtPct(rate) },
       { text: fmtPct(a.error_rate), title: a.errors + " of " + a.requests + " requests returned status >= 400" },
     ];
+    if (maxCost > 0) cells.push({ text: fmtMoney(a.cost_usd) });
     for (const cell of cells) {
       const td = el("td", cell.cls || null, cell.text);
       if (cell.title) td.title = cell.title;
       tr.appendChild(td);
     }
-    const shareTd = el("td");
     if (maxCost > 0) {
+      const shareTd = el("td");
       const share = Math.max(2, (a.cost_usd / maxCost) * 100);
       const bar = el("span", "cost-bar", "");
       bar.style.width = share.toFixed(1) + "px";
       bar.style.background = "#8da0cb";
       shareTd.appendChild(bar);
-    } else {
-      shareTd.textContent = "—";
+      tr.appendChild(shareTd);
     }
-    tr.appendChild(shareTd);
     tbody.appendChild(tr);
   });
   table.appendChild(tbody);
@@ -707,19 +723,24 @@ function render(payload) {
     renderError(payload && payload.error !== "telemetry unavailable" ? payload.error : null);
     return;
   }
-  // Page-wide provider order — hue identity stays stable across every chart.
-  const all = [];
-  for (const list of [payload.daily, payload.top_models, payload.latency]) {
+  // Stable hue identity: one alpha-ordered palette per dimension — agent
+  // hashes for the daily chart, provider names for model/latency charts.
+  const agentOrder = [];
+  for (const r of payload.daily_agents || []) {
+    if (!agentOrder.includes(r.agent_hash)) agentOrder.push(r.agent_hash);
+  }
+  agentOrder.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  const providerOrder = [];
+  for (const list of [payload.top_models, payload.latency]) {
     for (const r of list) {
-      if (r.provider && !all.includes(r.provider)) all.push(r.provider);
+      if (r.provider && !providerOrder.includes(r.provider)) providerOrder.push(r.provider);
     }
   }
-  all.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
-  const order = all;
+  providerOrder.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
 
   renderTiles(main, payload.totals);
-  renderDaily(main, payload, order);
-  renderModels(main, payload, order);
+  renderDailyAgents(main, payload, agentOrder);
+  renderModels(main, payload, providerOrder);
   renderLatency(main, payload);
   renderAgents(main, payload);
   const stamp = String(payload.generated_at || "").replace("T", " ").replace("+00:00", " UTC");
@@ -727,6 +748,8 @@ function render(payload) {
 }
 
 async function load() {
+  if (inflight) return; // never overlap a slow poll with the next tick
+  inflight = true;
   const main = document.getElementById("main");
   main.classList.add("loading"); // keep the previous frame visible at reduced opacity
   let payload;
@@ -737,6 +760,7 @@ async function load() {
     payload = { error: "Dashboard request failed: " + String(err) };
   }
   main.classList.remove("loading");
+  inflight = false;
   render(payload);
 }
 
@@ -745,7 +769,11 @@ document.getElementById("days").addEventListener("change", (ev) => {
   load();
 });
 
+// Initial load + live refresh.  Hidden tabs skip ticks (no wasted queries);
+// the first visible tick after returning to the tab refreshes immediately.
 load();
+setInterval(() => { if (!document.hidden) load(); }, REFRESH_MS);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) load(); });
 </script>
 </body>
 </html>

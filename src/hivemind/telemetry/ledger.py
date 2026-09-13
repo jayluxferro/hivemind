@@ -115,17 +115,32 @@ _SCHEMA_DDL = (
 
 _WINDOW = "ts >= now() - make_interval(days => %s)"
 
-_SQL_DAILY = f"""
+# Daily usage per agent — the primary dashboard dimension.  The provider
+# dimension is deliberately NOT charted: for proxy-in-a-pipeline deployments
+# every upstream detects as the same profile ("Generic"), so it carries no
+# signal.  Top-5 agents by window tokens get their own series; the rest fold
+# into "Other" in SQL so the payload stays small regardless of agent count.
+_SQL_DAILY_AGENTS = f"""
+WITH ranked AS (
+    SELECT agent_hash,
+           sum(coalesce(tokens_in, 0) + coalesce(tokens_out, 0)) AS window_tokens
+    FROM mesh_telemetry.token_usage
+    WHERE {_WINDOW}
+    GROUP BY agent_hash
+    ORDER BY window_tokens DESC
+    LIMIT 5
+)
 SELECT date_trunc('day', ts)::date AS day,
-       provider,
+       CASE WHEN r.agent_hash IS NULL THEN 'Other' ELSE u.agent_hash END AS agent_hash,
        count(*) AS requests,
        sum(coalesce(tokens_in, 0))::bigint AS tokens_in,
        sum(coalesce(tokens_out, 0))::bigint AS tokens_out,
-       round(coalesce(sum(cost_usd), 0), 6) AS cost_usd
-FROM mesh_telemetry.usage_cost
+       count(*) FILTER (WHERE status >= 400) AS errors
+FROM mesh_telemetry.token_usage u
+LEFT JOIN ranked r ON r.agent_hash = u.agent_hash
 WHERE {_WINDOW}
 GROUP BY 1, 2
-ORDER BY day ASC, provider ASC
+ORDER BY day ASC, agent_hash ASC
 """
 
 _SQL_TOTALS = f"""
@@ -133,22 +148,26 @@ SELECT count(*) AS requests,
        count(*) FILTER (WHERE status >= 400) AS errors,
        sum(coalesce(tokens_in, 0))::bigint AS tokens_in,
        sum(coalesce(tokens_out, 0))::bigint AS tokens_out,
+       sum(coalesce(cache_read, 0))::bigint AS cache_read,
+       sum(coalesce(cache_write, 0))::bigint AS cache_write,
        coalesce(sum(cost_usd), 0)::double precision AS cost_usd,
        count(*) FILTER (WHERE provider ILIKE '%%ollama%%') AS local_requests
 FROM mesh_telemetry.usage_cost
 WHERE {_WINDOW}
 """
 
+# Ranked by tokens, not cost — token usage is the primary signal; cost is a
+# secondary column that only populates when a pricing row exists.
 _SQL_TOP_MODELS = f"""
 SELECT provider, model, count(*) AS requests,
        sum(coalesce(tokens_in, 0))::bigint AS tokens_in,
        sum(coalesce(tokens_out, 0))::bigint AS tokens_out,
+       sum(coalesce(cache_read, 0))::bigint AS cache_read,
        round(coalesce(sum(cost_usd), 0), 6) AS cost_usd
 FROM mesh_telemetry.usage_cost
 WHERE {_WINDOW}
 GROUP BY provider, model
-HAVING coalesce(sum(cost_usd), 0) > 0
-ORDER BY cost_usd DESC, requests DESC
+ORDER BY (sum(coalesce(tokens_in, 0)) + sum(coalesce(tokens_out, 0))) DESC, requests DESC
 LIMIT 10
 """
 
@@ -156,12 +175,14 @@ _SQL_AGENTS = f"""
 SELECT agent_hash, count(*) AS requests,
        sum(coalesce(tokens_in, 0))::bigint AS tokens_in,
        sum(coalesce(tokens_out, 0))::bigint AS tokens_out,
+       sum(coalesce(cache_read, 0))::bigint AS cache_read,
+       sum(coalesce(cache_write, 0))::bigint AS cache_write,
        round(coalesce(sum(cost_usd), 0), 6) AS cost_usd,
        count(*) FILTER (WHERE status >= 400) AS errors
 FROM mesh_telemetry.usage_cost
 WHERE {_WINDOW}
 GROUP BY agent_hash
-ORDER BY cost_usd DESC, requests DESC
+ORDER BY (sum(coalesce(tokens_in, 0)) + sum(coalesce(tokens_out, 0))) DESC, requests DESC
 LIMIT 50
 """
 
@@ -329,14 +350,16 @@ class TelemetryLedger:
         try:
             await conn.set_autocommit(True)
             await self._ensure_schema(conn)  # self-healing: view may not exist yet
-            daily = await _fetch_all(conn, _SQL_DAILY, (days,))
+            # The window predicate appears twice (ranking CTE + outer query),
+            # so the parameter is passed twice.
+            daily_agents = await _fetch_all(conn, _SQL_DAILY_AGENTS, (days, days))
             totals = await _fetch_one(conn, _SQL_TOTALS, (days,))
             top_models = await _fetch_all(conn, _SQL_TOP_MODELS, (days,))
             agents = await _fetch_all(conn, _SQL_AGENTS, (days,))
             latency = await _fetch_all(conn, _SQL_LATENCY, (days,))
         finally:
             await _safe_close(conn)
-        return _shape_dashboard(days, totals, daily, top_models, agents, latency)
+        return _shape_dashboard(days, totals, daily_agents, top_models, agents, latency)
 
 
 class NullLedger:
@@ -376,7 +399,7 @@ def get_ledger() -> TelemetryLedger | NullLedger:
 def _shape_dashboard(
     days: int,
     totals: dict | None,
-    daily: list[dict],
+    daily_agents: list[dict],
     top_models: list[dict],
     agents: list[dict],
     latency: list[dict],
@@ -389,6 +412,9 @@ def _shape_dashboard(
     def _cost(value: Any) -> float:
         return 0.0 if value is None else float(value)
 
+    def _int(value: Any) -> int:
+        return int(value or 0)
+
     shaped_agents = []
     for row in agents:
         agent_requests = int(row["requests"])
@@ -399,6 +425,8 @@ def _shape_dashboard(
                 "requests": agent_requests,
                 "tokens_in": int(row["tokens_in"]),
                 "tokens_out": int(row["tokens_out"]),
+                "cache_read": _int(row.get("cache_read")),
+                "cache_write": _int(row.get("cache_write")),
                 "cost_usd": _cost(row["cost_usd"]),
                 "errors": agent_errors,
                 "error_rate": round(agent_errors / agent_requests, 4) if agent_requests else 0.0,
@@ -412,22 +440,24 @@ def _shape_dashboard(
             "requests": requests,
             "errors": errors,
             "error_rate": round(errors / requests, 4) if requests else 0.0,
-            "tokens_in": int((totals or {}).get("tokens_in") or 0),
-            "tokens_out": int((totals or {}).get("tokens_out") or 0),
+            "tokens_in": _int((totals or {}).get("tokens_in")),
+            "tokens_out": _int((totals or {}).get("tokens_out")),
+            "cache_read": _int((totals or {}).get("cache_read")),
+            "cache_write": _int((totals or {}).get("cache_write")),
             "cost_usd": _cost((totals or {}).get("cost_usd")),
             "local_requests": local_requests,
             "local_share_pct": round(local_requests / requests * 100.0, 2) if requests else 0.0,
         },
-        "daily": [
+        "daily_agents": [
             {
                 "day": str(row["day"]),
-                "provider": row["provider"],
+                "agent_hash": row["agent_hash"],
                 "requests": int(row["requests"]),
                 "tokens_in": int(row["tokens_in"]),
                 "tokens_out": int(row["tokens_out"]),
-                "cost_usd": _cost(row["cost_usd"]),
+                "errors": int(row["errors"]),
             }
-            for row in daily
+            for row in daily_agents
         ],
         "top_models": [
             {
@@ -436,6 +466,7 @@ def _shape_dashboard(
                 "requests": int(row["requests"]),
                 "tokens_in": int(row["tokens_in"]),
                 "tokens_out": int(row["tokens_out"]),
+                "cache_read": _int(row.get("cache_read")),
                 "cost_usd": _cost(row["cost_usd"]),
             }
             for row in top_models

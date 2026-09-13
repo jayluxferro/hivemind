@@ -26,7 +26,7 @@ PAGE_MARKERS = (
     b"token ledger",
     b"/_telemetry/data",
     b"Telemetry unavailable",
-    b"seed_pricing.sql",
+    b"fail-open",
     b"<script",
     b"<style",
 )
