@@ -92,6 +92,29 @@ def test_config_validates_agent_limit_overrides():
     assert cfg.to_dict()["agent_limit_overrides"] == {"a": {"rpm": 10}}
 
 
+def test_max_rate_wait_flag_on_both_parsers():
+    parser = argparse.ArgumentParser()
+    register_proxy_cli_arguments(parser)
+    args = parser.parse_args(["--max-rate-wait", "30"])
+    c = hivemind_config_from_proxy_cli_args(args)
+    assert c.max_rate_wait_s == 30.0
+
+    parser2 = argparse.ArgumentParser()
+    register_serve_cli_arguments(parser2)
+    args2 = parser2.parse_args(["--max-rate-wait", "15.5"])
+    c2 = HiveMindConfig()
+    apply_serve_cli_args_to_config(c2, args2)
+    assert c2.max_rate_wait_s == 15.5
+
+
+def test_max_rate_wait_default_and_validation():
+    assert HiveMindConfig().max_rate_wait_s == 240.0
+    with pytest.raises(ValueError):
+        HiveMindConfig(max_rate_wait_s=0)
+    with pytest.raises(ValueError):
+        HiveMindConfig(max_rate_wait_s=-1)
+
+
 # --- token ledger DSN (SPEC-token-ledger §5) ----------------------------------
 
 

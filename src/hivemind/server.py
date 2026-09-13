@@ -45,6 +45,7 @@ class HiveMindServer:
         self.rate_limiter = RateLimiter(
             scope=self.config.rate_limit_scope,
             agent_limits=self.config.agent_limit_overrides,
+            max_wait_s=self.config.max_rate_wait_s,
         )
         if self.config.provider:
             self.rate_limiter.configure_from_profile(get_profile(self.config.provider))

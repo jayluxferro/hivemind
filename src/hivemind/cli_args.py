@@ -94,6 +94,12 @@ def register_serve_cli_arguments(parser: argparse.ArgumentParser) -> None:
         metavar="AGENT:rpm=N,tpm=M",
         help="Per-agent rate-limit override (repeatable), e.g. --agent-limit batch-bot:rpm=20",
     )
+    parser.add_argument(
+        "--max-rate-wait",
+        type=float,
+        default=None,
+        help="Max seconds a rate-limited request holds before a 429 (default: 240)",
+    )
 
 
 def apply_serve_cli_args_to_config(config: HiveMindConfig, args: argparse.Namespace) -> None:
@@ -123,6 +129,9 @@ def apply_serve_cli_args_to_config(config: HiveMindConfig, args: argparse.Namesp
     if getattr(args, "agent_limit", None):
         config.agent_limit_overrides.update(parse_agent_limit_specs(args.agent_limit))
         config.normalize_runtime_limits()  # re-validate the merged registry loudly
+    if getattr(args, "max_rate_wait", None) is not None:
+        config.max_rate_wait_s = args.max_rate_wait
+        config.normalize_runtime_limits()  # fail loudly on a bad value
 
 
 def register_proxy_cli_arguments(
@@ -218,6 +227,12 @@ def register_proxy_cli_arguments(
         metavar="AGENT:rpm=N,tpm=M",
         help="Per-agent rate-limit override (repeatable), e.g. --agent-limit batch-bot:rpm=20",
     )
+    parser.add_argument(
+        "--max-rate-wait",
+        type=float,
+        default=None,
+        help="Max seconds a rate-limited request holds before a 429 (default: 240)",
+    )
 
 
 def hivemind_config_from_proxy_cli_args(args: argparse.Namespace) -> HiveMindConfig:
@@ -257,6 +272,9 @@ def hivemind_config_from_proxy_cli_args(args: argparse.Namespace) -> HiveMindCon
     if getattr(args, "agent_limit", None):
         config.agent_limit_overrides.update(parse_agent_limit_specs(args.agent_limit))
         config.normalize_runtime_limits()  # re-validate the merged registry loudly
+    if getattr(args, "max_rate_wait", None) is not None:
+        config.max_rate_wait_s = args.max_rate_wait
+        config.normalize_runtime_limits()  # fail loudly on a bad value
 
     # Token ledger: explicit flag wins; MESH_TELEMETRY_DSN env is the fallback;
     # otherwise default to the same local Postgres DB as the request log

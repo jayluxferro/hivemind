@@ -502,7 +502,11 @@ def _build_proxy(config: HiveMindConfig) -> ProxyServer:
     )
 
     admission = AdmissionController(config.max_concurrency)
-    rate_limiter = RateLimiter(scope=config.rate_limit_scope, agent_limits=config.agent_limit_overrides)
+    rate_limiter = RateLimiter(
+        scope=config.rate_limit_scope,
+        agent_limits=config.agent_limit_overrides,
+        max_wait_s=config.max_rate_wait_s,
+    )
     if config.provider:
         from ..scheduler.providers import get_profile
 

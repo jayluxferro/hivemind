@@ -95,6 +95,55 @@ async def test_wait_cap_raises_throttle_wait_exceeded():
 
 
 @pytest.mark.asyncio
+async def test_custom_max_wait_cap_honored():
+    """The queue cap is per-instance, so operators can tune the hold time."""
+    from hivemind.scheduler.rate_limiter import ThrottleWaitExceeded
+
+    rl = RateLimiter(max_wait_s=10.0)
+    rl._wait_seconds = lambda agent_id: 11.0  # beyond the custom cap
+    with pytest.raises(ThrottleWaitExceeded) as exc_info:
+        await rl.wait_if_throttled()
+    assert exc_info.value.cap_s == 10.0
+
+
+@pytest.mark.asyncio
+async def test_wait_within_cap_holds_and_proceeds(monkeypatch):
+    """A queue wait inside the cap must hold (not 429) and then proceed.
+
+    This is the behavior that keeps coding agents alive: their request
+    stays open until a slot frees instead of erroring out.
+    """
+    rl = RateLimiter(max_wait_s=5.0)
+    calls = {"n": 0}
+
+    def fake_wait(agent_id=None):
+        calls["n"] += 1
+        return 1.0 if calls["n"] == 1 else 0.0  # wait once, then clear
+
+    rl._wait_seconds = fake_wait
+    slept: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        slept.append(seconds)
+
+    monkeypatch.setattr("hivemind.scheduler.rate_limiter.asyncio.sleep", fake_sleep)
+    waited = await rl.wait_if_throttled()
+    assert waited == 1.0
+    assert slept == [1.0]
+    assert rl.stats["rpm_current"] == 1  # request recorded after the hold
+
+
+@pytest.mark.asyncio
+async def test_invalid_max_wait_rejected():
+    with pytest.raises(ValueError):
+        RateLimiter(max_wait_s=0)
+    with pytest.raises(ValueError):
+        RateLimiter(max_wait_s=-5)
+    with pytest.raises(ValueError):
+        RateLimiter(max_wait_s="lots")  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
 async def test_stats():
     rl = RateLimiter()
     stats = rl.stats

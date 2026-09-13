@@ -163,6 +163,7 @@ hivemind setup all         # Show all configs
 | `--agent-budget` | unlimited | Default per-agent token budget |
 | `--rate-limit-scope` | `per_agent` | `per_agent` buckets rate limits by session; `global` shares one window |
 | `--agent-limit` | none | Per-agent override (repeatable): `AGENT:rpm=N,tpm=M` |
+| `--max-rate-wait` | `240` | Max seconds a rate-limited request holds inside HiveMind before a 429 (`HIVEMIND_MAX_RATE_WAIT_S`) |
 | `--insecure` | off | Disable upstream TLS certificate verification (dev only) |
 | `--log-level` | `INFO` | **`hivemind-proxy` only** — logging verbosity |
 
@@ -181,6 +182,7 @@ hivemind setup all         # Show all configs
 | `--tpm-limit` | auto | Override tokens-per-minute limit (auto-detected from provider) |
 | `--rate-limit-scope` | `per_agent` | `per_agent` buckets rate limits by session; `global` shares one window |
 | `--agent-limit` | none | Per-agent override (repeatable): `AGENT:rpm=N,tpm=M` |
+| `--max-rate-wait` | `240` | Max seconds a rate-limited request holds inside HiveMind before a 429 (`HIVEMIND_MAX_RATE_WAIT_S`) |
 | `--insecure` | off | Disable upstream TLS certificate verification (dev only) |
 
 ### MCP Tools

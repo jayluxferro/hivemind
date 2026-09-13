@@ -22,6 +22,28 @@ def _default_db_url() -> str:
     return dsn or _DEFAULT_DB_URL
 
 
+# Default max seconds a rate-limited request may hold inside hivemind.
+# Imported from the rate limiter so the single source of truth stays there.
+def _default_max_rate_wait_s() -> float:
+    """Default rate-limit queue cap for config, from HIVEMIND_MAX_RATE_WAIT_S.
+
+    Fails loudly on an unparseable or non-positive env value — a silent
+    fallback would change queueing semantics without the operator noticing.
+    """
+    from ..scheduler.rate_limiter import MAX_WAIT_S
+
+    raw = os.environ.get("HIVEMIND_MAX_RATE_WAIT_S")
+    if raw is None or not raw.strip():
+        return MAX_WAIT_S
+    try:
+        value = float(raw)
+    except ValueError:
+        raise ValueError(f"HIVEMIND_MAX_RATE_WAIT_S must be a positive number of seconds, got {raw!r}") from None
+    if value <= 0:
+        raise ValueError(f"HIVEMIND_MAX_RATE_WAIT_S must be a positive number of seconds, got {value!r}")
+    return value
+
+
 class TaskState(str, Enum):
     PENDING = "pending"
     QUEUED = "queued"
@@ -190,6 +212,12 @@ class HiveMindConfig:
     # profile). Overrides are caps — the fair-share governor can still shrink
     # them under provider-key saturation.
     agent_limit_overrides: dict[str, dict[str, int]] = field(default_factory=dict)
+    # Max seconds a rate-limited request may hold inside hivemind before the
+    # interceptor fails fast with a 429 + retry-after.  Held requests proceed
+    # transparently when a slot frees, so agents see no error at all for
+    # typical queues.  Bounded under the surrounding layers' 300s read
+    # timeouts (default 240).  Env: HIVEMIND_MAX_RATE_WAIT_S.
+    max_rate_wait_s: float = field(default_factory=_default_max_rate_wait_s)
 
     # Storage
     db_url: str = field(default_factory=_default_db_url)
@@ -249,6 +277,12 @@ class HiveMindConfig:
         if self.rate_limit_scope not in SCOPES:
             raise ValueError(f"Invalid rate_limit_scope {self.rate_limit_scope!r}; expected one of {SCOPES}")
         self.agent_limit_overrides = validate_agent_limits(self.agent_limit_overrides)
+        if (
+            not isinstance(self.max_rate_wait_s, (int, float))
+            or isinstance(self.max_rate_wait_s, bool)
+            or self.max_rate_wait_s <= 0
+        ):
+            raise ValueError(f"max_rate_wait_s must be a positive number of seconds, got {self.max_rate_wait_s!r}")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -269,6 +303,7 @@ class HiveMindConfig:
             "rpm_limit": self.rpm_limit,
             "tpm_limit": self.tpm_limit,
             "rate_limit_scope": self.rate_limit_scope,
+            "max_rate_wait_s": self.max_rate_wait_s,
             "agent_limit_overrides": {agent: dict(limits) for agent, limits in self.agent_limit_overrides.items()},
             "db_url": self.db_url,
             "telemetry_dsn": self.telemetry_dsn,

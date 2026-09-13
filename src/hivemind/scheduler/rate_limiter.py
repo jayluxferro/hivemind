@@ -47,19 +47,26 @@ logger = logging.getLogger(__name__)
 # Length of the sliding window for local RPM/TPM counters.
 _WINDOW_SECONDS = 60.0
 
-# Maximum total time a request may sit in the rate-limiter queue.  Beyond
-# this the interceptor fails FAST with a 429 + retry-after instead of
-# letting the queue stretch for minutes (a deep burst queue once hit ~300s
-# — every layer's read ceiling — and surfaced as a bare gateway ReadTimeout).
-MAX_WAIT_S = 60.0
+# Default maximum total time a request may sit in the rate-limiter queue.
+# 240s is deliberately under the 300s read-timeout ceilings that surround
+# hivemind in layered proxy pipelines: up to this cap the request simply
+# HOLDS inside hivemind and proceeds when a slot frees, so coding agents
+# never see an error for typical queues.  Beyond the cap the interceptor
+# fails fast with a 429 + retry-after instead of queueing silently into a
+# bare gateway ReadTimeout (a deep burst queue once hit ~300s — every
+# layer's read ceiling — and surfaced as exactly that).  Per-instance
+# override via ``max_wait_s`` (config ``max_rate_wait_s`` /
+# ``HIVEMIND_MAX_RATE_WAIT_S``).
+MAX_WAIT_S = 240.0
 
 
 class ThrottleWaitExceeded(Exception):
-    """Raised by wait_if_throttled when the projected queue wait exceeds MAX_WAIT_S."""
+    """Raised by wait_if_throttled when the projected queue wait exceeds the cap."""
 
-    def __init__(self, wait_s: float) -> None:
-        super().__init__(f"rate-limit queue would wait {wait_s:.0f}s (> {MAX_WAIT_S:.0f}s)")
+    def __init__(self, wait_s: float, cap_s: float = MAX_WAIT_S) -> None:
+        super().__init__(f"rate-limit queue would wait {wait_s:.0f}s (> {cap_s:.0f}s)")
         self.wait_s = wait_s
+        self.cap_s = cap_s
 
 
 # Valid values for the rate-limiter scope. "per_agent" buckets the local
@@ -135,9 +142,18 @@ class RateLimiter:
        first. Stateless: recomputed from the windows on every check.
     """
 
-    def __init__(self, *, scope: str = "per_agent", agent_limits: dict | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        scope: str = "per_agent",
+        agent_limits: dict | None = None,
+        max_wait_s: float = MAX_WAIT_S,
+    ) -> None:
         if scope not in SCOPES:
             raise ValueError(f"Invalid rate limiter scope {scope!r}; expected one of {SCOPES}")
+        if not isinstance(max_wait_s, (int, float)) or isinstance(max_wait_s, bool) or max_wait_s <= 0:
+            raise ValueError(f"max_wait_s must be a positive number of seconds, got {max_wait_s!r}")
+        self._max_wait_s = float(max_wait_s)
         self._scope = scope
         self._windows: dict[str, RateLimitWindow] = {}
         self._lock = asyncio.Lock()
@@ -433,18 +449,20 @@ class RateLimiter:
         then records the request in that window.
 
         Raises :exc:`ThrottleWaitExceeded` when the projected wait exceeds
-        :data:`MAX_WAIT_S` — beyond that the client is better served by a
-        fast 429 (retry later) than by a minute-long silent queue.  A deep
-        burst queue previously surfaced as a bare ReadTimeout at the
-        gateway (2026-09-01: ~300s queue == every layer's 300s ceiling).
+        the instance cap (default :data:`MAX_WAIT_S`) — beyond that the
+        client is better served by a fast 429 (retry later) than by a
+        silent queue, and the surrounding proxy layers' read timeouts
+        would abort the request anyway.  Up to the cap the request holds
+        here and proceeds when a slot frees, so agents see no error at
+        all for typical queues.
         """
         total_waited = 0.0
         while True:
             wait_time = self._wait_seconds(agent_id)
             if wait_time <= 0:
                 break
-            if total_waited + wait_time > MAX_WAIT_S:
-                raise ThrottleWaitExceeded(total_waited + wait_time)
+            if total_waited + wait_time > self._max_wait_s:
+                raise ThrottleWaitExceeded(total_waited + wait_time, self._max_wait_s)
             logger.info(
                 "Rate limiter: waiting %.1fs before next request (agent=%s)",
                 wait_time,
