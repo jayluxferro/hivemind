@@ -1,4 +1,4 @@
-"""Self-contained cost-dashboard page served at GET /_telemetry.
+"""Self-contained token-ledger dashboard page served at GET /_telemetry.
 
 Single HTML file: inline CSS + vanilla JS, no CDN, no build step, works
 offline.  All charts are plain SVG built in JS.  Visual rules (dataviz
@@ -23,7 +23,8 @@ method, pinned down for this SPEC):
 - live dashboard: polls /_telemetry/data every 10s (skipped while the tab is
   hidden, in-flight fetches never overlap); the primary dimension is AGENT
   usage over time — provider is only shown where it still carries signal
-  (model/latency cards), and cost appears only when pricing rows exist
+  (model/latency cards).  Cost is NOT displayed anywhere: pricing is not
+  used, so showing dollars would be guessing under a confident number.
 """
 
 PAGE_HTML = """<!doctype html>
@@ -114,10 +115,6 @@ PAGE_HTML = """<!doctype html>
   .datatable th:first-child, .datatable td:first-child { text-align: left; }
   .datatable tr:last-child td { border-bottom: none; }
   td.agent-hash { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11.5px; }
-  td .cost-bar {
-    display: inline-block; height: 8px; border-radius: 2px;
-    vertical-align: -1px; margin-left: 8px;
-  }
 
   #tooltip {
     position: fixed; pointer-events: none; z-index: 30;
@@ -210,13 +207,6 @@ function textEl(tag, text, attrs) {
 
 /* ============ formatting ============ */
 function fmtInt(v) { return Math.round(v).toLocaleString("en-US"); }
-function fmtMoney(v) {
-  if (v == null || !isFinite(v)) return "—";
-  if (v === 0) return "$0";
-  if (v < 0.01) return "$" + v.toFixed(4);
-  if (v < 1) return "$" + v.toFixed(3);
-  return "$" + v.toLocaleString("en-US", { maximumFractionDigits: 2 });
-}
 function fmtTokens(v) {
   if (v == null || !isFinite(v)) return "—";
   if (v >= 1e9) return (v / 1e9).toFixed(1) + "B";
@@ -315,15 +305,14 @@ function legendEl(items) {
  * =================================================================== */
 function stackedDaily(holder, title, rows, pick, fmt, tipFor, order) {
   const days = [];
-  const per = new Map(); // day -> Map(series -> {value, cost, tokensIn, tokensOut, requests})
+  const per = new Map(); // day -> Map(series -> {value, tokensIn, tokensOut, requests, errors})
   for (const r of rows) {
     if (!days.includes(r.day)) days.push(r.day);
     let m = per.get(r.day);
     if (!m) { m = new Map(); per.set(r.day, m); }
     let acc = m.get(r.series);
-    if (!acc) { acc = { value: 0, cost: 0, tokensIn: 0, tokensOut: 0, requests: 0, errors: 0 }; m.set(r.series, acc); }
+    if (!acc) { acc = { value: 0, tokensIn: 0, tokensOut: 0, requests: 0, errors: 0 }; m.set(r.series, acc); }
     acc.value += pick(r);
-    acc.cost += r.cost_usd;
     acc.tokensIn += r.tokens_in;
     acc.tokensOut += r.tokens_out;
     acc.requests += r.requests;
@@ -452,7 +441,6 @@ function topModelBars(holder, title, models, order) {
       { label: "tokens in/out", value: fmtInt(m.tokens_in) + " / " + fmtInt(m.tokens_out) },
       { label: "cache reads", value: fmtInt(m.cache_read || 0) },
     ];
-    if (m.cost_usd > 0) tipRows.push({ label: "cost", value: fmtMoney(m.cost_usd) });
     bindHover(hit, m.model, tipRows);
     svg.appendChild(hit);
     // Value at the tip (ranked bars — every bar is an endpoint).
@@ -556,9 +544,6 @@ function renderTiles(main, t) {
     { label: "Error rate", value: fmtPct(t.error_rate) },
     { label: "Local share", value: (t.local_share_pct || 0).toFixed(1) + "%" },
   ];
-  // Cost is secondary and only honest when pricing rows exist — hide the
-  // tile entirely when the window is unpriced rather than showing "$0".
-  if (t.cost_usd > 0) defs.push({ label: "Total cost", value: fmtMoney(t.cost_usd) });
   for (const d of defs) {
     const tile = el("div", "tile");
     tile.appendChild(el("div", "label", d.label));
@@ -610,22 +595,15 @@ function renderModels(main, data, order) {
   const card = el("section", "card");
   card.appendChild(el("h2", null, "Top models by tokens"));
   card.appendChild(el("p", "sub",
-    "Ranked by tokens consumed, not cost — cache reads are the actionable money signal for " +
-    "multi-agent runs (low hit rate = repeated full-context sends)."));
+    "Ranked by tokens consumed.  Cache reads are the actionable signal for multi-agent runs " +
+    "(low hit rate = repeated full-context sends)."));
   if (data.top_models.length) {
     topModelBars(card, "Tokens by model", data.top_models, order);
-    const hasCost = data.top_models.some((m) => m.cost_usd > 0);
-    const headers = ["Model", "Provider", "Requests", "Tokens in", "Tokens out", "Cache reads"];
-    if (hasCost) headers.push("Cost");
-    dataTable(card, "Same data as the chart above.", headers,
-      data.top_models.map((m) => {
-        const cells = [
-          { text: m.model }, { text: m.provider }, { text: fmtInt(m.requests) },
-          { text: fmtInt(m.tokens_in) }, { text: fmtInt(m.tokens_out) }, { text: fmtInt(m.cache_read || 0) },
-        ];
-        if (hasCost) cells.push({ text: fmtMoney(m.cost_usd) });
-        return cells;
-      }));
+    dataTable(card, "Same data as the chart above.", ["Model", "Provider", "Requests", "Tokens in", "Tokens out", "Cache reads"],
+      data.top_models.map((m) => [
+        { text: m.model }, { text: m.provider }, { text: fmtInt(m.requests) },
+        { text: fmtInt(m.tokens_in) }, { text: fmtInt(m.tokens_out) }, { text: fmtInt(m.cache_read || 0) },
+      ]));
   } else {
     card.appendChild(el("p", "empty", "No requests in this window."));
   }
@@ -660,14 +638,13 @@ function renderAgents(main, data) {
     main.appendChild(card);
     return;
   }
-  const maxCost = Math.max.apply(null, data.agents.map((a) => a.cost_usd));
   const table = el("table", "datatable");
   table.appendChild(el("caption", null, "One row per agent hash. Cache hit = tokens served from cache over total input."));
   const thead = el("thead");
   const hr = el("tr");
-  const headers = ["Agent (hash)", "Requests", "Tokens in", "Tokens out", "Cache reads", "Cache hit", "Error rate"];
-  if (maxCost > 0) headers.push("Cost", "Cost share");
-  for (const h of headers) hr.appendChild(el("th", null, h));
+  for (const h of ["Agent (hash)", "Requests", "Tokens in", "Tokens out", "Cache reads", "Cache hit", "Error rate"]) {
+    hr.appendChild(el("th", null, h));
+  }
   thead.appendChild(hr);
   table.appendChild(thead);
   const tbody = el("tbody");
@@ -683,20 +660,10 @@ function renderAgents(main, data) {
       { text: rate == null ? "—" : fmtPct(rate) },
       { text: fmtPct(a.error_rate), title: a.errors + " of " + a.requests + " requests returned status >= 400" },
     ];
-    if (maxCost > 0) cells.push({ text: fmtMoney(a.cost_usd) });
     for (const cell of cells) {
       const td = el("td", cell.cls || null, cell.text);
       if (cell.title) td.title = cell.title;
       tr.appendChild(td);
-    }
-    if (maxCost > 0) {
-      const shareTd = el("td");
-      const share = Math.max(2, (a.cost_usd / maxCost) * 100);
-      const bar = el("span", "cost-bar", "");
-      bar.style.width = share.toFixed(1) + "px";
-      bar.style.background = "#8da0cb";
-      shareTd.appendChild(bar);
-      tr.appendChild(shareTd);
     }
     tbody.appendChild(tr);
   });
