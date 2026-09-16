@@ -542,7 +542,6 @@ function renderTiles(main, t) {
     { label: "Tokens out", value: fmtInt(t.tokens_out) },
     { label: "Cache reads", value: fmtTokens(t.cache_read) },
     { label: "Error rate", value: fmtPct(t.error_rate) },
-    { label: "Local share", value: (t.local_share_pct || 0).toFixed(1) + "%" },
   ];
   for (const d of defs) {
     const tile = el("div", "tile");

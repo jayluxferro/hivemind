@@ -354,7 +354,6 @@ async def test_fetch_dashboard_shapes_payload_and_parameterizes_days():
         "cache_read": 600,
         "cache_write": 25,
         "cost_usd": 0.0123,
-        "local_requests": 4,
     }
 
     ledger = TelemetryLedger("postgresql://fake", conn_factory=_fake_factory(holder))
@@ -372,8 +371,6 @@ async def test_fetch_dashboard_shapes_payload_and_parameterizes_days():
         "cache_read": 600,
         "cache_write": 25,
         "cost_usd": 0.0123,
-        "local_requests": 4,
-        "local_share_pct": round(4 / 14 * 100.0, 2),
     }
     assert payload["daily_agents"][0] == {
         "day": "2026-09-01",
@@ -426,7 +423,6 @@ async def test_fetch_dashboard_with_no_rows():
         "tokens_in": 0,
         "tokens_out": 0,
         "cost_usd": 0.0,
-        "local_requests": 0,
     }
     ledger = TelemetryLedger("postgresql://fake", conn_factory=_fake_factory(holder))
     payload = await ledger.fetch_dashboard(days=14)
@@ -439,8 +435,6 @@ async def test_fetch_dashboard_with_no_rows():
         "cache_read": 0,
         "cache_write": 0,
         "cost_usd": 0.0,
-        "local_requests": 0,
-        "local_share_pct": 0.0,
     }
     assert payload["daily_agents"] == []
     assert payload["top_models"] == []

@@ -150,8 +150,7 @@ SELECT count(*) AS requests,
        sum(coalesce(tokens_out, 0))::bigint AS tokens_out,
        sum(coalesce(cache_read, 0))::bigint AS cache_read,
        sum(coalesce(cache_write, 0))::bigint AS cache_write,
-       coalesce(sum(cost_usd), 0)::double precision AS cost_usd,
-       count(*) FILTER (WHERE provider ILIKE '%%ollama%%') AS local_requests
+       coalesce(sum(cost_usd), 0)::double precision AS cost_usd
 FROM mesh_telemetry.usage_cost
 WHERE {_WINDOW}
 """
@@ -407,7 +406,6 @@ def _shape_dashboard(
     """Normalize dict_row output into a JSON-safe payload (dates, Decimal-free)."""
     requests = int((totals or {}).get("requests") or 0)
     errors = int((totals or {}).get("errors") or 0)
-    local_requests = int((totals or {}).get("local_requests") or 0)
 
     def _cost(value: Any) -> float:
         return 0.0 if value is None else float(value)
@@ -445,8 +443,6 @@ def _shape_dashboard(
             "cache_read": _int((totals or {}).get("cache_read")),
             "cache_write": _int((totals or {}).get("cache_write")),
             "cost_usd": _cost((totals or {}).get("cost_usd")),
-            "local_requests": local_requests,
-            "local_share_pct": round(local_requests / requests * 100.0, 2) if requests else 0.0,
         },
         "daily_agents": [
             {
