@@ -25,6 +25,15 @@ Retention (D10): a background pruner deletes rows older than
 ``retention_days`` once on connect and then every 24h.  It is fail-open and
 cancelled in ``shutdown()`` before the writer connection is reset.
 
+Token semantics: ``tokens_in`` is the FRESH (uncached) input portion on
+DeepSeek's Anthropic-compatible shim — cache reads are reported in
+``cache_read`` and excluded from ``tokens_in``.  Real input is therefore
+``cache_read + tokens_in``, and the cache-hit share is
+``cache_read / (cache_read + tokens_in)`` (exposed as ``cache_hit_pct``
+in the dashboard payload).  ``conversation_hash`` is the sha256-truncated
+client session header, so new-session starts are distinguishable from
+mid-session cache misses in analysis.
+
 Schema is self-managed (D6): connect() runs CREATE SCHEMA/TABLE/INDEX/VIEW
 IF NOT EXISTS per SPEC §3.  NOTE: the usage_cost view DDL in SPEC §3 does
 not parse as written — ``round(...) / 1e6, 6`` leaves the ``, 6`` outside
@@ -58,8 +67,8 @@ DEFAULT_RETENTION_DAYS = 90
 _INSERT_SQL = """
 INSERT INTO mesh_telemetry.token_usage
     (agent_hash, provider, model, tokens_in, tokens_out, cache_read,
-     cache_write, reasoning, latency_ms, status)
-VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+     cache_write, reasoning, latency_ms, status, conversation_hash)
+VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
 """
 
 # Must stay in sync with the VALUES list above.
@@ -74,6 +83,7 @@ _COLUMN_ORDER = (
     "reasoning",
     "latency_ms",
     "status",
+    "conversation_hash",
 )
 
 # One statement per execute (fake connections in tests record each call).
@@ -86,16 +96,24 @@ _SCHEMA_DDL = (
         agent_hash   TEXT NOT NULL,          -- hivemind rate-limit bucket (already hashed)
         provider     TEXT NOT NULL,          -- observed (detect_provider profile name)
         model        TEXT NOT NULL,          -- observed from the request body
-        tokens_in    BIGINT,                 -- all optional: providers vary
+        tokens_in    BIGINT,                 -- FRESH input tokens: DeepSeek's Anthropic shim
+                                             -- reports cache reads separately, so tokens_in
+                                             -- excludes them; other providers vary (see module
+                                             -- docstring)
         tokens_out   BIGINT,
         cache_read   BIGINT,
         cache_write  BIGINT,
         reasoning    BIGINT,
         latency_ms   DOUBLE PRECISION,
-        status       INTEGER NOT NULL
+        status       INTEGER NOT NULL,
+        conversation_hash TEXT,              -- sha256[:16] of the client session header
+                                             -- (x-claude-code-session-id et al); NULL = none sent
     )
     """,
     "CREATE INDEX IF NOT EXISTS token_usage_ts_idx ON mesh_telemetry.token_usage (ts)",
+    # Existing databases predate the column; CREATE TABLE IF NOT EXISTS does
+    # not touch them, so this ALTER is the migration.
+    "ALTER TABLE mesh_telemetry.token_usage ADD COLUMN IF NOT EXISTS conversation_hash TEXT",
     """
     CREATE TABLE IF NOT EXISTS mesh_telemetry.model_pricing (
         provider          TEXT NOT NULL,
@@ -179,6 +197,11 @@ SELECT count(*) AS requests,
        sum(coalesce(tokens_out, 0))::bigint AS tokens_out,
        sum(coalesce(cache_read, 0))::bigint AS cache_read,
        sum(coalesce(cache_write, 0))::bigint AS cache_write,
+       -- tokens_in is fresh-only on the dominant provider, so the real input
+       -- is cache_read + tokens_in and the ratio is the cache-hit share.
+       round(100.0 * sum(coalesce(cache_read, 0)) /
+             nullif(sum(coalesce(cache_read, 0)) + sum(coalesce(tokens_in, 0)), 0), 1)
+             AS cache_hit_pct,
        coalesce(sum(cost_usd), 0)::double precision AS cost_usd
 FROM mesh_telemetry.usage_cost
 WHERE {_RANGE}
@@ -191,6 +214,9 @@ SELECT provider, model, count(*) AS requests,
        sum(coalesce(tokens_in, 0))::bigint AS tokens_in,
        sum(coalesce(tokens_out, 0))::bigint AS tokens_out,
        sum(coalesce(cache_read, 0))::bigint AS cache_read,
+       round(100.0 * sum(coalesce(cache_read, 0)) /
+             nullif(sum(coalesce(cache_read, 0)) + sum(coalesce(tokens_in, 0)), 0), 1)
+             AS cache_hit_pct,
        round(coalesce(sum(cost_usd), 0), 6) AS cost_usd
 FROM mesh_telemetry.usage_cost
 WHERE {_RANGE}
@@ -1055,6 +1081,8 @@ def _shape_overview(
             "tokens_out": _int((totals or {}).get("tokens_out")),
             "cache_read": _int((totals or {}).get("cache_read")),
             "cache_write": _int((totals or {}).get("cache_write")),
+            "cache_hit_pct": None if (totals or {}).get("cache_hit_pct") is None
+            else float((totals or {})["cache_hit_pct"]),
             "cost_usd": _cost((totals or {}).get("cost_usd")),
         },
         "daily_agents": [
@@ -1076,6 +1104,8 @@ def _shape_overview(
                 "tokens_in": int(row["tokens_in"]),
                 "tokens_out": int(row["tokens_out"]),
                 "cache_read": _int(row.get("cache_read")),
+                "cache_hit_pct": None if row.get("cache_hit_pct") is None
+                else float(row["cache_hit_pct"]),
                 "cost_usd": _cost(row["cost_usd"]),
             }
             for row in top_models

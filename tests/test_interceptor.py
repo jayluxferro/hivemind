@@ -743,3 +743,62 @@ async def test_telemetry_streaming_mid_stream_abort_records_once(components, rec
         assert row["agent_hash"] == "agent-1"
     finally:
         await interceptor.stop()
+
+
+# --- conversation hash (ledger attribution) --------------------------------
+
+
+def test_conversation_hash_prefers_the_first_session_header():
+    from hivemind.proxy.interceptor import _conversation_hash
+
+    headers = {
+        "x-claude-code-session-id": "sess-aaa",
+        "x-cursor-session-id": "sess-bbb",
+    }
+    assert _conversation_hash(headers) == _conversation_hash(
+        {"x-claude-code-session-id": "sess-aaa"}
+    )
+    # Deterministic and hashed, never the raw value.
+    import hashlib
+
+    expected = hashlib.sha256(b"sess-aaa").hexdigest()[:16]
+    assert _conversation_hash(headers) == expected
+    assert "sess-aaa" not in expected
+
+
+def test_conversation_hash_falls_back_across_header_kinds():
+    from hivemind.proxy.interceptor import _conversation_hash
+
+    assert _conversation_hash({"x-cursor-session-id": "c1"}) is not None
+    assert _conversation_hash({"x-codex-session-id": "c2"}) is not None
+    assert _conversation_hash({"authorization": "bearer x"}) is None
+    assert _conversation_hash({}) is None
+    assert _conversation_hash({"x-claude-code-session-id": "  "}) is None
+
+
+async def test_usage_row_carries_conversation_hash(components):
+    """The ledger row must carry the hashed session header so analysis can
+    separate new-session starts from mid-session cache misses."""
+    interceptor = Interceptor(upstream_url="https://api.anthropic.com", **components)
+    await interceptor.start()
+    try:
+        row = interceptor._usage_row(
+            _result(), body=b'{"model": "m"}', agent_id="a", rate_key=None,
+            headers={"x-claude-code-session-id": "sess-1"},
+        )
+        from hivemind.proxy.interceptor import _conversation_hash
+
+        assert row["conversation_hash"] == _conversation_hash(
+            {"x-claude-code-session-id": "sess-1"}
+        )
+        assert interceptor._usage_row(
+            _result(), body=b'{}', agent_id="a", rate_key=None
+        )["conversation_hash"] is None
+    finally:
+        await interceptor.stop()
+
+
+def _result():
+    from hivemind.proxy.interceptor import InterceptResult
+
+    return InterceptResult(status_code=200, headers={}, body=b"{}")

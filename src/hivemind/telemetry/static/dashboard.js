@@ -652,6 +652,12 @@
       { label: "Tokens out", value: num(t.tokens_out), fmt: C.fmtInt },
       { label: "Cache reads", value: num(t.cache_read), fmt: C.fmtTokens },
       {
+        label: "Cache hit",
+        value: num(t.cache_hit_pct),
+        fmt: C.fmtPct,
+        title: "share of real input tokens served from the provider cache (cache_read / (cache_read + tokens_in)); tokens_in is fresh-only on DeepSeek",
+      },
+      {
         label: "Error rate",
         value: num(t.error_rate),
         fmt: C.fmtPct,

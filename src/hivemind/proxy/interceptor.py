@@ -15,6 +15,7 @@ Sits between agents and the upstream API. For each request:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import time
@@ -66,6 +67,26 @@ _FORWARD_DROP = frozenset(
 def _forward_headers(headers: dict[str, str]) -> dict[str, str]:
     """Strip hop-by-hop + accept-encoding; httpx re-adds its own capability set."""
     return {k: v for k, v in headers.items() if k.lower() not in _FORWARD_DROP}
+
+
+# The client session headers lattice keys its per-session brief cache on —
+# same set, so a ledger row can be attributed to the same conversation that
+# produced the injected brief.
+_SESSION_HEADERS = ("x-claude-code-session-id", "x-cursor-session-id", "x-codex-session-id")
+
+
+def _conversation_hash(headers: dict[str, str]) -> str | None:
+    """sha256[:16] of the first present session header (None = none sent).
+
+    Hashed like agent buckets — the raw session id is never stored.  The
+    hash separates new-session starts from mid-session cache misses in
+    ledger analysis, where the rate-limit bucket alone cannot.
+    """
+    for name in _SESSION_HEADERS:
+        value = headers.get(name)
+        if value and value.strip():
+            return hashlib.sha256(value.strip().encode("utf-8")).hexdigest()[:16]
+    return None
 
 
 def _model_from_request_body(body: bytes) -> str:
@@ -247,7 +268,7 @@ class Interceptor:
                     await self.admission.release()
 
         # Ledger hook: AFTER the response completes; swallowed, never awaited.
-        self._record_usage(result, body=body, agent_id=agent_id, rate_key=rate_key)
+        self._record_usage(result, body=body, agent_id=agent_id, rate_key=rate_key, headers=headers)
         return result
 
     def _record_usage(
@@ -257,6 +278,7 @@ class Interceptor:
         body: bytes,
         agent_id: str | None,
         rate_key: str | None,
+        headers: dict[str, str] | None = None,
     ) -> None:
         """Fire-and-forget ledger write for one completed request (D4).
 
@@ -265,7 +287,9 @@ class Interceptor:
         (including a hostile ledger) is logged at DEBUG and swallowed.
         """
         try:
-            row = self._usage_row(result, body=body, agent_id=agent_id, rate_key=rate_key)
+            row = self._usage_row(
+                result, body=body, agent_id=agent_id, rate_key=rate_key, headers=headers
+            )
             ledger = get_ledger()
             task = asyncio.get_running_loop().create_task(ledger.record(row))
             task.add_done_callback(_discard_task_exception)
@@ -279,6 +303,7 @@ class Interceptor:
         body: bytes,
         agent_id: str | None,
         rate_key: str | None,
+        headers: dict[str, str] | None = None,
     ) -> dict:
         """Build the ledger row for a completed result (docs/token-ledger.md §4).
 
@@ -287,6 +312,8 @@ class Interceptor:
         values (D2): the profile display name, and the model from the request
         body.  Usage columns are optional — providers vary; missing or zero
         counts record as NULL rather than a guessed number.
+        ``conversation_hash`` comes from the client session header when one
+        was sent (see :func:`_conversation_hash`).
         """
         cache_read = getattr(result, "_cache_read_tokens", None)
         cache_write = getattr(result, "_cache_write_tokens", None)
@@ -314,6 +341,7 @@ class Interceptor:
             "reasoning": None,  # no provider in the chain reports it separately yet
             "latency_ms": latency or None,
             "status": getattr(result, "status_code", None) or 200,
+            "conversation_hash": _conversation_hash(headers) if headers else None,
         }
 
     async def handle_streaming_request(
@@ -624,7 +652,7 @@ class Interceptor:
             # Ledger hook: AFTER the response completes, on every exit path.
             # Fire-and-forget; must never raise (D4).
             try:
-                self._record_usage(result, body=body, agent_id=agent_id, rate_key=rate_key)
+                self._record_usage(result, body=body, agent_id=agent_id, rate_key=rate_key, headers=headers)
             except Exception:  # pragma: no cover — _record_usage already swallows
                 logger.debug("telemetry record hook failed (fail-open)", exc_info=True)
 

@@ -278,7 +278,7 @@ async def test_connect_runs_schema_ddl():
     ledger = TelemetryLedger("postgresql://fake", conn_factory=_fake_factory(conn))
     await ledger.connect()
     statements = [sql for sql, _ in conn.executed]
-    assert len(statements) == 5
+    assert len(statements) == 6
     assert statements[0] == "CREATE SCHEMA IF NOT EXISTS mesh_telemetry"
     assert "CREATE TABLE IF NOT EXISTS mesh_telemetry.token_usage" in statements[1]
     assert "usage_cost" in statements[-1]
@@ -497,6 +497,7 @@ def _overview_fixtures(holder: FakeConn) -> None:
             "tokens_out": 800,
             "cache_read": 600,
             "cache_write": 25,
+            "cache_hit_pct": 30.0,
             "cost_usd": 0.0123,
         }
     }
@@ -523,6 +524,8 @@ async def test_fetch_overview_shapes_payload_and_windows_the_reads():
         "tokens_out": 800,
         "cache_read": 600,
         "cache_write": 25,
+        # 600 / (600 + 1400) — real input is cache_read + fresh-only tokens_in.
+        "cache_hit_pct": 30.0,
         "cost_usd": 0.0123,
     }
     assert payload["daily_agents"][0] == {
@@ -598,6 +601,7 @@ async def test_fetch_overview_with_no_rows():
         "tokens_out": 0,
         "cache_read": 0,
         "cache_write": 0,
+        "cache_hit_pct": None,  # 0 / 0 — no ratio to report
         "cost_usd": 0.0,
     }
     assert payload["daily_agents"] == []
