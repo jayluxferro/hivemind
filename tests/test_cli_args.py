@@ -149,3 +149,63 @@ def test_proxy_cli_telemetry_dsn_unset_defaults_to_request_log_db(monkeypatch):
     c = _proxy_config([])
     assert c.telemetry_dsn == "postgresql://hivemind@localhost:5432/hivemind"
     assert c.to_dict()["telemetry_dsn"] == "postgresql://hivemind@localhost:5432/hivemind"
+
+
+# --- token ledger retention (SPEC-analytics D10) ------------------------------
+
+
+def test_telemetry_retention_days_flag_on_both_parsers():
+    c = _proxy_config(["--telemetry-retention-days", "30"])
+    assert c.telemetry_retention_days == 30
+
+    parser = argparse.ArgumentParser()
+    register_serve_cli_arguments(parser)
+    args = parser.parse_args(["--telemetry-retention-days", "7"])
+    c2 = HiveMindConfig()
+    apply_serve_cli_args_to_config(c2, args)
+    assert c2.telemetry_retention_days == 7
+
+
+def test_telemetry_retention_days_defaults_and_env_fallback(monkeypatch):
+    monkeypatch.delenv("HIVEMIND_TELEMETRY_RETENTION_DAYS", raising=False)
+    c = _proxy_config([])
+    assert c.telemetry_retention_days == 90
+    assert c.to_dict()["telemetry_retention_days"] == 90
+
+    monkeypatch.setenv("HIVEMIND_TELEMETRY_RETENTION_DAYS", "7")
+    assert _proxy_config([]).telemetry_retention_days == 7  # no flag -> env
+
+
+def test_telemetry_retention_days_flag_beats_env(monkeypatch):
+    monkeypatch.setenv("HIVEMIND_TELEMETRY_RETENTION_DAYS", "7")
+    assert _proxy_config(["--telemetry-retention-days", "365"]).telemetry_retention_days == 365
+
+
+def test_telemetry_retention_days_invalid_env_is_fatal(monkeypatch):
+    # Deliberately fail-loud: a typo'd env var must not silently become 90
+    # (and silently keep months of rows).
+    for bad in ("nope", "0", "-3", "1.5", ""):
+        monkeypatch.setenv("HIVEMIND_TELEMETRY_RETENTION_DAYS", bad)
+        if bad == "":
+            assert HiveMindConfig().telemetry_retention_days == 90  # blank == unset
+            continue
+        with pytest.raises(ValueError):
+            HiveMindConfig()
+        with pytest.raises(ValueError):
+            _proxy_config([])
+
+
+def test_telemetry_retention_days_validation():
+    assert HiveMindConfig(telemetry_retention_days=1).telemetry_retention_days == 1
+    assert HiveMindConfig(telemetry_retention_days=365).telemetry_retention_days == 365
+    for bad in (0, -1, True, "90", 1.5):
+        with pytest.raises(ValueError):
+            HiveMindConfig(telemetry_retention_days=bad)
+
+
+def test_telemetry_retention_days_flag_revalidates(monkeypatch):
+    # The CLI path re-runs validation, so a bad flag value is caught here too.
+    with pytest.raises(ValueError):
+        _proxy_config(["--telemetry-retention-days", "0"])
+    with pytest.raises(SystemExit):
+        _proxy_config(["--telemetry-retention-days", "not-a-number"])

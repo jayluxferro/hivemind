@@ -44,6 +44,30 @@ def _default_max_rate_wait_s() -> float:
     return value
 
 
+def _default_telemetry_retention_days() -> int:
+    """Default token-ledger retention for config, from HIVEMIND_TELEMETRY_RETENTION_DAYS.
+
+    Fails loudly on an unparseable or sub-day env value — silently falling back
+    would change how much history the pruner keeps without the operator
+    noticing, and the pruner deletes data (unlike the rate-limit cap next door,
+    a wrong value here is destructive, not just surprising).
+    """
+    from ..telemetry.ledger import DEFAULT_RETENTION_DAYS
+
+    raw = os.environ.get("HIVEMIND_TELEMETRY_RETENTION_DAYS")
+    if raw is None or not raw.strip():
+        return DEFAULT_RETENTION_DAYS
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError(
+            f"HIVEMIND_TELEMETRY_RETENTION_DAYS must be a whole number of days >= 1, got {raw!r}"
+        ) from None
+    if value < 1:
+        raise ValueError(f"HIVEMIND_TELEMETRY_RETENTION_DAYS must be a whole number of days >= 1, got {value!r}")
+    return value
+
+
 class TaskState(str, Enum):
     PENDING = "pending"
     QUEUED = "queued"
@@ -226,6 +250,10 @@ class HiveMindConfig:
     # entirely — the interceptor then records into a no-op NullLedger, so an
     # unset DSN changes zero behavior).
     telemetry_dsn: str | None = None
+    # Days of ledger history to keep.  The ledger prunes rows older than this
+    # on connect and every 24h afterwards (fail-open).  Env:
+    # HIVEMIND_TELEMETRY_RETENTION_DAYS.
+    telemetry_retention_days: int = field(default_factory=_default_telemetry_retention_days)
 
     # Provider (auto-detected from upstream_url if not set)
     provider: str | None = None  # anthropic, openai, ollama, etc.
@@ -283,6 +311,14 @@ class HiveMindConfig:
             or self.max_rate_wait_s <= 0
         ):
             raise ValueError(f"max_rate_wait_s must be a positive number of seconds, got {self.max_rate_wait_s!r}")
+        if (
+            not isinstance(self.telemetry_retention_days, int)
+            or isinstance(self.telemetry_retention_days, bool)
+            or self.telemetry_retention_days < 1
+        ):
+            raise ValueError(
+                f"telemetry_retention_days must be a whole number of days >= 1, got {self.telemetry_retention_days!r}"
+            )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -307,5 +343,6 @@ class HiveMindConfig:
             "agent_limit_overrides": {agent: dict(limits) for agent, limits in self.agent_limit_overrides.items()},
             "db_url": self.db_url,
             "telemetry_dsn": self.telemetry_dsn,
+            "telemetry_retention_days": self.telemetry_retention_days,
             "http_tls_verify": self.http_tls_verify,
         }

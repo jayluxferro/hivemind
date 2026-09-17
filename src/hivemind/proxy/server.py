@@ -12,6 +12,8 @@ import asyncio
 import json
 import logging
 import time
+from datetime import timedelta
+from typing import Any
 
 import uvicorn
 from starlette.applications import Starlette
@@ -26,7 +28,9 @@ from ..scheduler.rate_limiter import RateLimiter
 from ..scheduler.providers import detect_provider
 from ..storage.db import Database
 from ..storage.models import HiveMindConfig
-from ..telemetry.dashboard import PAGE_HTML
+from ..telemetry import query as tq
+from ..telemetry.dashboard import read_static, render_page
+from ..telemetry.export import csv_header, csv_row, export_filename, jsonl_row
 from ..telemetry.ledger import NullLedger, TelemetryLedger, get_ledger, set_ledger
 from .identity import resolve_agent_id, resolve_rate_key
 from .interceptor import Interceptor
@@ -101,37 +105,157 @@ class ProxyServer:
                 media_type="application/json",
             )
 
-        async def telemetry_page_handler(request: Request) -> Response:
-            """Token-ledger dashboard — single self-contained HTML page."""
+        def _json(payload: Any, status_code: int = 200) -> Response:
+            """JSON response with the telemetry no-store contract."""
             return Response(
-                content=PAGE_HTML,
+                content=json.dumps(payload),
+                status_code=status_code,
+                media_type="application/json",
+                headers={"cache-control": "no-store"},
+            )
+
+        async def telemetry_page_handler(request: Request) -> Response:
+            """Token-ledger dashboard shell (assets live under /_telemetry/static)."""
+            return Response(
+                content=render_page(),
                 media_type="text/html",
                 headers={"cache-control": "no-store"},
             )
 
-        async def telemetry_data_handler(request: Request) -> Response:
-            """Dashboard JSON (mesh_telemetry.usage_cost aggregates).
+        async def telemetry_static_handler(request: Request) -> Response:
+            """Whitelisted dashboard asset bytes.
 
-            ``days`` clamps to [1, 365], default 14.  A DB failure maps to an
+            The filename is a dict key, never a path: only the three names in
+            ``STATIC_ASSETS`` can be served, so traversal is not "blocked" —
+            it is unrepresentable.  Versioned URLs (``?v=…``) are safe to
+            cache forever; the version changes when the bytes do.
+            """
+            asset = read_static(request.path_params.get("filename", ""))
+            if asset is None:
+                return _json({"error": "not found"}, status_code=404)
+            data, content_type = asset
+            return Response(
+                content=data,
+                media_type=content_type,
+                headers={"cache-control": "public, max-age=31536000, immutable"},
+            )
+
+        async def telemetry_data_handler(request: Request) -> Response:
+            """Overview JSON for a display range (mesh_telemetry aggregates).
+
+            ``from``/``to`` are ISO 8601 (naive read as UTC); the legacy
+            ``days=N`` alias clamps to [1, 365] and defaults to 14, and an
+            explicit from/to always wins.  A DB failure maps to an
             ``{"error": "telemetry unavailable"}`` payload with HTTP 200 — the
             page renders its "Telemetry unavailable" state, never an error
-            (docs/token-ledger.md §5, D4).
+            (docs/token-ledger-analytics.md, D4).
             """
+            params = request.query_params
+            days_window = tq.parse_days(params)
+            if days_window is None:
+                from_ts, to_ts = tq.parse_range(params)
+            else:
+                from_ts, to_ts = days_window
             try:
-                days = int(request.query_params.get("days", 14))
-            except (TypeError, ValueError):
-                days = 14
-            days = max(1, min(365, days))
-            try:
-                payload = await get_ledger().fetch_dashboard(days=days)
+                payload = await get_ledger().fetch_overview(from_ts, to_ts)
             except Exception as exc:
-                logger.debug("telemetry dashboard unavailable (fail-open): %s", exc)
+                logger.debug("telemetry overview unavailable (fail-open): %s", exc)
                 payload = {"error": "telemetry unavailable"}
-            return Response(
-                content=json.dumps(payload),
-                media_type="application/json",
-                headers={"cache-control": "no-store"},
+            return _json(payload)
+
+        async def telemetry_requests_handler(request: Request) -> Response:
+            """One page of raw request rows — metadata only (SPEC D5/D8)."""
+            params = request.query_params
+            from_ts, to_ts = tq.parse_range(params)
+            filters = tq.parse_request_filters(params)
+            try:
+                payload = await get_ledger().fetch_requests(from_ts, to_ts, **filters)
+            except Exception as exc:
+                logger.debug("telemetry requests unavailable (fail-open): %s", exc)
+                payload = {"error": "telemetry unavailable"}
+            return _json(payload)
+
+        async def telemetry_facets_handler(request: Request) -> Response:
+            """Distinct agent/model/provider values for the drill-down pickers."""
+            params = request.query_params
+            from_ts, to_ts = tq.parse_range(params)
+            try:
+                payload = await get_ledger().fetch_facets(from_ts, to_ts)
+            except Exception as exc:
+                logger.debug("telemetry facets unavailable (fail-open): %s", exc)
+                payload = {"error": "telemetry unavailable"}
+            return _json(payload)
+
+        async def telemetry_series_handler(request: Request) -> Response:
+            """Bucketed activity over time (hour|day, default hour).
+
+            Above ``MAX_HOUR_BUCKET_DAYS`` the hour bucket is unreadable
+            (thousands of 1px columns), so the server degrades it to day
+            rather than trusting the client to ask for the right thing.
+            """
+            params = request.query_params
+            from_ts, to_ts = tq.parse_range(params)
+            bucket = str(params.get("bucket") or "hour").strip().lower()
+            if bucket not in ("hour", "day"):
+                bucket = "hour"
+            if bucket == "hour" and to_ts - from_ts > timedelta(days=tq.MAX_HOUR_BUCKET_DAYS):
+                bucket = "day"
+            try:
+                payload = await get_ledger().fetch_series(from_ts, to_ts, bucket, **tq.parse_series_filters(params))
+            except Exception as exc:
+                logger.debug("telemetry series unavailable (fail-open): %s", exc)
+                payload = {"error": "telemetry unavailable"}
+            return _json(payload)
+
+        async def telemetry_export_handler(request: Request, ext: str) -> Response:
+            """Stream a filtered CSV/JSONL export from a server-side cursor.
+
+            The pre-flight count runs BEFORE any header is committed: a down
+            database must answer with the standard ``telemetry unavailable``
+            JSON, never a truncated 200 stream (SPEC D9).  Once the first byte
+            is out the status is decided, so a mid-stream failure is
+            documented truncation — logged at DEBUG, and the stream ends
+            cleanly rather than turning into an ASGI error.
+            """
+            params = request.query_params
+            from_ts, to_ts = tq.parse_range(params)
+            filters = tq.parse_request_filters(params)
+            ledger = get_ledger()
+            try:
+                # The count is not sent anywhere: it exists to prove the query
+                # path (and its schema) is reachable before we commit to a body.
+                await ledger.count_requests(from_ts, to_ts, filters=filters)
+            except Exception as exc:
+                logger.debug("telemetry export pre-flight failed (fail-open): %s", exc)
+                return _json({"error": "telemetry unavailable"})
+
+            render_row = csv_row if ext == "csv" else jsonl_row
+            head = csv_header() if ext == "csv" else ""
+
+            async def export_body():
+                try:
+                    if head:
+                        yield head
+                    async for batch in ledger.export_rows(from_ts, to_ts, filters=filters):
+                        for row in batch:
+                            yield render_row(row)
+                except Exception as exc:
+                    logger.debug("telemetry export truncated (fail-open): %s", exc)
+
+            return StreamingResponse(
+                export_body(),
+                media_type="text/csv; charset=utf-8" if ext == "csv" else "application/x-ndjson",
+                headers={
+                    "cache-control": "no-store",
+                    "content-disposition": (f'attachment; filename="{export_filename(ext, from_ts, to_ts)}"'),
+                },
             )
+
+        async def telemetry_export_csv_handler(request: Request) -> Response:
+            return await telemetry_export_handler(request, "csv")
+
+        async def telemetry_export_jsonl_handler(request: Request) -> Response:
+            return await telemetry_export_handler(request, "jsonl")
 
         async def cache_probe_handler(request: Request) -> Response:
             """Active prompt-cache probe: send one cache_control-bearing body
@@ -212,9 +336,17 @@ class ProxyServer:
                 Route("/_health", health_handler, methods=["GET"]),
                 Route("/_stats", stats_handler, methods=["GET"]),
                 Route("/_probe/cache", cache_probe_handler, methods=["POST"]),
-                # Token-ledger dashboard (before the catch-all proxy route)
+                # Token-ledger dashboard (every route registered BEFORE the
+                # catch-all proxy route below, which would otherwise swallow
+                # /_telemetry/* and forward it upstream).
                 Route("/_telemetry", telemetry_page_handler, methods=["GET"]),
                 Route("/_telemetry/data", telemetry_data_handler, methods=["GET"]),
+                Route("/_telemetry/requests", telemetry_requests_handler, methods=["GET"]),
+                Route("/_telemetry/facets", telemetry_facets_handler, methods=["GET"]),
+                Route("/_telemetry/series", telemetry_series_handler, methods=["GET"]),
+                Route("/_telemetry/export.csv", telemetry_export_csv_handler, methods=["GET"]),
+                Route("/_telemetry/export.jsonl", telemetry_export_jsonl_handler, methods=["GET"]),
+                Route("/_telemetry/static/{filename}", telemetry_static_handler, methods=["GET"]),
                 # Catch-all proxy route
                 Route("/{path:path}", proxy_handler, methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"]),
             ],
@@ -229,7 +361,9 @@ class ProxyServer:
             # Best-effort: TelemetryLedger.connect() never raises (fail-open),
             # and an unhealthy PG still leaves the dashboard's data endpoint
             # answering "telemetry unavailable" rather than erroring.
-            ledger = TelemetryLedger(telemetry_dsn)
+            # Retention (D10) rides along: a successful connect starts the
+            # pruner, so history stays bounded without operator cron jobs.
+            ledger = TelemetryLedger(telemetry_dsn, retention_days=self.config.telemetry_retention_days)
             set_ledger(ledger)
             self._telemetry_ledger = ledger
             await ledger.connect()

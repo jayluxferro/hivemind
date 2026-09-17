@@ -1,0 +1,257 @@
+/* Hivemind telemetry dashboard styles.
+ *
+ * Ported from the Phase 1 single-file page (docs/token-ledger.md §5): the
+ * tokens at the top are unchanged, so the Phase 1 look survives the split into
+ * static assets.  The Phase 2 views add nav tabs, a date-range row with preset
+ * chips, an opt-in auto-refresh checkbox, request-table sort/pagination
+ * controls, a side panel for one request, filter dropdowns and status-bar
+ * labels — all of them at the bottom, in the same token vocabulary.
+ *
+ * Offline-only: no @import, no url(), no external font.  The shell that loads
+ * this file comes from the same origin and there is no network fallback by
+ * design (SPEC D11) — a font or icon fetched from somewhere else would be the
+ * one thing on the page that cannot load in an air-gapped deployment.
+ */
+
+:root { color-scheme: dark; }
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  background: #111;
+  color: #e8e8e8;
+  font: 14px/1.45 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+header {
+  display: flex; flex-wrap: wrap; gap: 8px 20px; align-items: center;
+  justify-content: space-between;
+  padding: 18px 24px;
+  border-bottom: 1px solid #2a2a2a;
+}
+header h1 { margin: 0; font-size: 18px; font-weight: 650; letter-spacing: .2px; }
+.controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px; color: #b8b8b8; }
+.controls select {
+  background: #1c1c1c; color: #e8e8e8;
+  border: 1px solid #3a3a3a; border-radius: 6px;
+  padding: 4px 8px; font-size: 13px;
+}
+main { max-width: 1060px; margin: 0 auto; padding: 22px 24px 80px; }
+main.loading { opacity: .45; transition: opacity .15s ease; }
+#updated { color: #8f8f8f; font-size: 12px; }
+
+.tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px; margin: 20px 0 26px;
+}
+.tile {
+  background: #181818; border: 1px solid #2a2a2a; border-radius: 8px;
+  padding: 11px 14px;
+}
+.tile .label { color: #9d9d9d; font-size: 12px; }
+.tile .value { font-size: 21px; font-weight: 650; margin-top: 3px; }
+
+.card {
+  background: #161616; border: 1px solid #2a2a2a; border-radius: 10px;
+  padding: 18px 20px; margin-bottom: 22px;
+}
+/* Tiles inside a card sit under its heading, not under the page header. */
+.card .tiles { margin: 14px 0 4px; }
+.card h2 { margin: 0 0 3px; font-size: 16px; font-weight: 650; }
+.card .sub { margin: 0 0 14px; color: #9d9d9d; font-size: 12.5px; }
+.subchart { margin: 8px 0 20px; }
+.subchart h3 { margin: 0 0 2px; font-size: 13.5px; font-weight: 600; }
+
+.legend {
+  display: flex; flex-wrap: wrap; gap: 5px 16px;
+  margin: 2px 0 8px; color: #cfcfcf; font-size: 12.5px;
+}
+.legend .sw {
+  width: 10px; height: 10px; border-radius: 2px;
+  display: inline-block; margin-right: 5px; vertical-align: -1px;
+}
+
+svg { display: block; width: 100%; height: auto; overflow: visible; }
+svg .grid { stroke: #333; stroke-width: 1; }
+svg .tick-label { fill: #9d9d9d; font-size: 11px; }
+svg .bar-label { fill: #dcdcdc; font-size: 11px; }
+svg .row-label { fill: #cfcfcf; font-size: 11.5px; }
+svg .bar-label-in { fill: #171717; font-size: 11px; font-weight: 600; }
+/* Status codes are numbers read as a column — they line up or they are noise. */
+svg .status-label { font-variant-numeric: tabular-nums; fill: #c9c9c9; }
+/* The 2px single-series line and its crosshair (line mode only). */
+svg .series-line { stroke: #66c2a5; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+svg .crosshair { stroke: #6a6a6a; stroke-width: 1; stroke-dasharray: 3 3; }
+/* Marks own the pointer; their labels never should.  Without this, hovering
+   the value label sitting on top of a bar's oversized hit target would fall
+   through to nothing and the tooltip would flicker. */
+svg text { pointer-events: none; }
+
+table.datatable {
+  width: 100%; border-collapse: collapse; margin-top: 12px;
+  font-size: 12.5px; font-variant-numeric: tabular-nums;
+}
+.datatable caption {
+  text-align: left; color: #8f8f8f; font-size: 11.5px;
+  padding-bottom: 6px;
+}
+.datatable th {
+  color: #9d9d9d; font-weight: 550; text-align: right;
+  border-bottom: 1px solid #3a3a3a; padding: 4px 10px; white-space: nowrap;
+}
+.datatable td {
+  padding: 4px 10px; text-align: right;
+  border-bottom: 1px solid #232323; white-space: nowrap;
+}
+.datatable th:first-child, .datatable td:first-child { text-align: left; }
+.datatable tr:last-child td { border-bottom: none; }
+td.agent-hash { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11.5px; }
+
+.empty { color: #9d9d9d; padding: 10px 2px; font-size: 13px; }
+.error {
+  background: #1d1613; border: 1px solid #4a2f24; border-radius: 8px;
+  padding: 22px; margin: 22px 0; color: #f0e2da;
+}
+.error h2 { margin: 0 0 6px; font-size: 16px; }
+.error p { margin: 0; color: #c9a99a; }
+footer {
+  max-width: 1060px; margin: 0 auto; padding: 0 24px 44px;
+  color: #8f8f8f; font-size: 12px; line-height: 1.7;
+}
+footer code { color: #b8b8b8; }
+
+/* ==========================================================================
+ * Phase 2 — navigation, range controls, filters, requests table, side panel.
+ * Everything below is additive; the tokens above are the Phase 1 look.
+ * ========================================================================== */
+
+/* --- view tabs ---------------------------------------------------------- */
+.tabs { display: flex; flex-wrap: wrap; gap: 4px; }
+.tab {
+  font: inherit; font-size: 13px;
+  background: transparent; color: #b8b8b8;
+  border: 1px solid transparent; border-radius: 6px;
+  padding: 4px 10px; cursor: pointer;
+}
+.tab:hover { color: #e8e8e8; background: #1a1a1a; }
+.tab.on { color: #f2f2f2; background: #202020; border-color: #3a3a3a; font-weight: 600; }
+/* A real link that happens to look like a tab (the drill-down targets). */
+a.tab { text-decoration: none; }
+
+/* --- links and buttons -------------------------------------------------- */
+a { color: #8da0cb; }
+a:hover { color: #a8b8dc; }
+.controls a, .panel a {
+  color: #b8b8b8; font-size: 12.5px; text-decoration: none;
+  border-bottom: 1px dotted #4a4a4a; padding-bottom: 1px;
+}
+.controls a:hover, .panel a:hover { color: #f2f2f2; border-bottom-color: #8f8f8f; }
+.btn {
+  font: inherit; font-size: 12.5px;
+  background: #1c1c1c; color: #e8e8e8;
+  border: 1px solid #3a3a3a; border-radius: 6px;
+  padding: 4px 10px; cursor: pointer;
+}
+.btn:hover:not(:disabled) { background: #242424; }
+.btn:disabled { color: #6a6a6a; border-color: #2f2f2f; cursor: default; }
+/* Both <button> and <a> wear .btn (the export links are real anchors). */
+a.btn { text-decoration: none; display: inline-block; }
+
+/* --- date range row + preset chips ------------------------------------- */
+.range { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; }
+.range label { color: #9d9d9d; font-size: 12px; }
+.range input[type="date"] {
+  background: #1c1c1c; color: #e8e8e8;
+  border: 1px solid #3a3a3a; border-radius: 6px;
+  padding: 3px 6px; font: inherit; font-size: 12.5px;
+}
+.range input[type="date"]:focus, .controls select:focus, .filters select:focus {
+  outline: 1px solid #5a5a5a; outline-offset: 1px;
+}
+.chips { display: flex; flex-wrap: wrap; gap: 4px; }
+.chip {
+  font: inherit; font-size: 12px;
+  background: transparent; color: #b8b8b8;
+  border: 1px solid #333; border-radius: 999px;
+  padding: 2px 9px; cursor: pointer;
+}
+.chip:hover { color: #e8e8e8; border-color: #4a4a4a; }
+.chip.on { background: #2a2a2a; color: #f2f2f2; border-color: #5a5a5a; }
+
+/* --- opt-in auto-refresh ------------------------------------------------ */
+.toggle { display: flex; align-items: center; gap: 5px; color: #9d9d9d; font-size: 12.5px; cursor: pointer; }
+.toggle input { accent-color: #66c2a5; margin: 0; }
+
+/* --- view-level picker row --------------------------------------------- */
+.picker { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 0 0 18px; }
+.picker label { color: #9d9d9d; font-size: 12.5px; }
+.picker select {
+  background: #1c1c1c; color: #e8e8e8;
+  border: 1px solid #3a3a3a; border-radius: 6px;
+  padding: 5px 8px; font-size: 13px; max-width: 420px;
+}
+
+/* --- requests filter row ------------------------------------------------ */
+.filters {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px;
+  padding-bottom: 14px; margin-bottom: 4px; border-bottom: 1px solid #232323;
+}
+.filters label { color: #9d9d9d; font-size: 12px; }
+.filters select {
+  background: #1c1c1c; color: #e8e8e8;
+  border: 1px solid #3a3a3a; border-radius: 6px;
+  padding: 4px 8px; font-size: 12.5px; max-width: 260px;
+}
+
+/* --- sortable requests table -------------------------------------------- */
+.datatable th.sortable { cursor: pointer; user-select: none; }
+.datatable th.sortable:hover { color: #e8e8e8; }
+.datatable th.sorted { color: #f2f2f2; font-weight: 650; }
+.datatable tbody tr.clickable { cursor: pointer; }
+.datatable tbody tr.clickable:hover td { background: #1d1d1d; }
+.datatable tbody tr.clickable:focus-visible { outline: 1px solid #5a5a5a; outline-offset: -1px; }
+.cell-ts { font-variant-numeric: tabular-nums; color: #cfcfcf; }
+/* A status cell wears the fact, not a traffic light: only the failing band
+   gets ink, and it is muted — status is never a Set2 hue. */
+.status-ok { color: #cfcfcf; }
+.status-bad { color: #e0a08c; font-weight: 600; }
+
+/* --- pagination --------------------------------------------------------- */
+.pager { display: flex; align-items: center; gap: 10px; margin-top: 12px; }
+.pager .of { color: #9d9d9d; font-size: 12.5px; font-variant-numeric: tabular-nums; }
+
+/* --- request detail side panel ----------------------------------------- */
+.panel {
+  position: fixed; top: 0; right: 0; bottom: 0; width: 380px;
+  background: #161616; border-left: 1px solid #2a2a2a;
+  box-shadow: -14px 0 34px rgba(0, 0, 0, .5);
+  padding: 18px 20px 26px; overflow-y: auto; z-index: 40;
+  display: flex; flex-direction: column; gap: 12px;
+}
+.panel[hidden] { display: none; }
+.panel h3 { margin: 0; font-size: 14.5px; font-weight: 650; }
+.panel .panel-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.panel .close {
+  font: inherit; font-size: 16px; line-height: 1;
+  background: transparent; color: #9d9d9d;
+  border: 1px solid #3a3a3a; border-radius: 6px;
+  padding: 3px 8px; cursor: pointer;
+}
+.panel .close:hover { color: #f2f2f2; border-color: #5a5a5a; }
+.kv { display: grid; grid-template-columns: 132px minmax(0, 1fr); gap: 5px 12px; margin: 0; font-size: 12.5px; }
+.kv dt { color: #9d9d9d; }
+.kv dd {
+  margin: 0; color: #e8e8e8; font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+.kv dd.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11.5px; }
+.panel .note { margin-top: auto; }
+
+/* --- small print -------------------------------------------------------- */
+.note { color: #8f8f8f; font-size: 12px; margin: 14px 0 0; }
+.note code { color: #b8b8b8; }
+
+@media (max-width: 760px) {
+  header { align-items: flex-start; }
+  .panel { width: 100%; }
+  main { padding: 18px 16px 60px; }
+}

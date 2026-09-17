@@ -109,6 +109,10 @@ documented SQL file (`tools/seed_pricing.sql`) the operator runs/edits by hand.
 
 ## 5. Dashboard (single page, served by hivemind)
 
+> **Superseded by `docs/token-ledger-analytics.md` (Phase 2)** — the data contract
+> moved from `days` to `from`/`to`; `days` remains as a compatibility alias.
+> This section documents the Phase 1 page for history.
+
 - `GET /_telemetry` — HTML page (single file, inline CSS + vanilla JS, no
   build step, no framework).
 - `GET /_telemetry/data?days=14` — JSON with:

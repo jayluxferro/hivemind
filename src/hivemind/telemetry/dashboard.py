@@ -1,8 +1,17 @@
-"""Self-contained token-ledger dashboard page served at GET /_telemetry.
+"""Telemetry dashboard shell + static assets served at ``/_telemetry``.
 
-Single HTML file: inline CSS + vanilla JS, no CDN, no build step, works
-offline.  All charts are plain SVG built in JS.  Visual rules (dataviz
-method, pinned down for this SPEC):
+Phase 2 split the old single-file page: this module serves a small HTML shell
+and the three real assets next to it (``static/dashboard.css``, ``charts.js``,
+``dashboard.js``) from the installed package, so the page is offline-only —
+no CDN, no build step, no framework.  The shell carries zero inline CSS/JS and
+zero absolute URLs; the assets are looked up through :data:`STATIC_ASSETS`
+(a filename whitelist: user input never reaches a filesystem path) and are
+cache-busted with ``?v=<sha256[:8]>`` computed from their contents, so a
+changed asset is fetched without anyone remembering to bump a version.
+
+Visual rules (dataviz method, pinned down for this SPEC) — these live in
+``static/charts.js`` now, and are listed here because they are the contract
+the assets are written against:
 
 - dark surface (#111); neutral ink for all text/axes/legends, never the
   series color
@@ -20,727 +29,115 @@ method, pinned down for this SPEC):
 - a plain HTML table with the same data below every chart
 - dynamic text is inserted with textContent only (labels are untrusted)
 - data failures render "telemetry unavailable", never a JS error
-- live dashboard: polls /_telemetry/data every 10s (skipped while the tab is
-  hidden, in-flight fetches never overlap); the primary dimension is AGENT
-  usage over time — provider is only shown where it still carries signal
-  (model/latency cards).  Cost is NOT displayed anywhere: pricing is not
-  used, so showing dollars would be guessing under a confident number.
+- the primary dimension is AGENT usage over time — provider is only shown
+  where it still carries signal (model/latency cards).  Cost is NOT
+  displayed anywhere: pricing is not maintained, so showing dollars would be
+  guessing under a confident number.
+
+Auto-refresh is opt-in in Phase 2: a checkbox, default OFF, persisted in
+``localStorage["hivemindTelemetryAutoRefresh"]`` behind try/catch helpers
+(private-mode safe).  The page loads once and stays on screen until the
+operator asks for a refresh — the 10s always-on poll is gone.
 """
 
-PAGE_HTML = """<!doctype html>
+from __future__ import annotations
+
+import hashlib
+from importlib import resources
+
+#: Package the assets ship in (resolved via importlib.resources so a wheel
+#: works the same as a checkout).
+_PACKAGE = "hivemind.telemetry"
+_STATIC_DIR = "static"
+
+#: Filename whitelist -> content type.  Doubles as the directory listing: a
+#: name that is not a key here is a 404, whatever the filesystem holds.
+STATIC_ASSETS: dict[str, str] = {
+    "dashboard.css": "text/css; charset=utf-8",
+    "charts.js": "text/javascript; charset=utf-8",
+    "dashboard.js": "text/javascript; charset=utf-8",
+}
+
+# Read-once cache: assets are immutable for the life of the process, and a
+# download of the page should never touch the filesystem twice for the same
+# file.
+_STATIC_CACHE: dict[str, tuple[bytes, str]] = {}
+
+
+def read_static(filename: str) -> tuple[bytes, str] | None:
+    """``(bytes, content_type)`` for a whitelisted asset, else None.
+
+    ``importlib.resources.files`` is what makes this wheel-safe; the whitelist
+    is what makes it safe at all (a traversal or a stray name can never name a
+    file, because only three names are keys).
+    """
+    content_type = STATIC_ASSETS.get(filename)
+    if content_type is None:
+        return None
+    cached = _STATIC_CACHE.get(filename)
+    if cached is not None:
+        return cached
+    try:
+        data = resources.files(_PACKAGE).joinpath(_STATIC_DIR, filename).read_bytes()
+    except (FileNotFoundError, OSError, ModuleNotFoundError):
+        # A broken install must render the page's error state, not a 500.
+        return None
+    entry = (data, content_type)
+    _STATIC_CACHE[filename] = entry
+    return entry
+
+
+def _compute_static_version() -> str:
+    """Content hash of every asset, in whitelist order, truncated to 8 chars.
+
+    Content-addressed on purpose: the shell is served with a long-lived
+    ``immutable`` cache header, so the version has to change exactly when a
+    byte of CSS or JS changes — and only then.
+    """
+    digest = hashlib.sha256()
+    for name in STATIC_ASSETS:
+        entry = read_static(name)
+        digest.update(entry[0] if entry is not None else b"")
+    return digest.hexdigest()[:8]
+
+
+#: Cache-buster appended to every asset URL in the shell (``?v=…``).
+STATIC_VERSION = _compute_static_version()
+
+
+def render_page() -> str:
+    """The dashboard shell: document head, header, empty controls, main, tooltip.
+
+    Deliberately empty of behavior — ``static/dashboard.js`` owns the views,
+    the hash state and the header controls (which is why the controls div
+    ships empty), and it is the only thing that ever writes into ``#main``.
+    """
+    version = STATIC_VERSION
+    return f"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Hivemind — token ledger</title>
-<style>
-  :root { color-scheme: dark; }
-  * { box-sizing: border-box; }
-  html, body { margin: 0; padding: 0; }
-  body {
-    background: #111;
-    color: #e8e8e8;
-    font: 14px/1.45 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-  }
-  header {
-    display: flex; flex-wrap: wrap; gap: 8px 20px; align-items: baseline;
-    justify-content: space-between;
-    padding: 18px 24px;
-    border-bottom: 1px solid #2a2a2a;
-  }
-  header h1 { margin: 0; font-size: 18px; font-weight: 650; letter-spacing: .2px; }
-  .controls { display: flex; align-items: center; gap: 8px; color: #b8b8b8; }
-  .controls select {
-    background: #1c1c1c; color: #e8e8e8;
-    border: 1px solid #3a3a3a; border-radius: 6px;
-    padding: 4px 8px; font-size: 13px;
-  }
-  main { max-width: 1060px; margin: 0 auto; padding: 22px 24px 80px; }
-  main.loading { opacity: .45; transition: opacity .15s ease; }
-  #updated { color: #8f8f8f; font-size: 12px; }
-
-  .tiles {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-    gap: 10px; margin: 20px 0 26px;
-  }
-  .tile {
-    background: #181818; border: 1px solid #2a2a2a; border-radius: 8px;
-    padding: 11px 14px;
-  }
-  .tile .label { color: #9d9d9d; font-size: 12px; }
-  .tile .value { font-size: 21px; font-weight: 650; margin-top: 3px; }
-
-  .card {
-    background: #161616; border: 1px solid #2a2a2a; border-radius: 10px;
-    padding: 18px 20px; margin-bottom: 22px;
-  }
-  .card h2 { margin: 0 0 3px; font-size: 16px; font-weight: 650; }
-  .card .sub { margin: 0 0 14px; color: #9d9d9d; font-size: 12.5px; }
-  .subchart { margin: 8px 0 20px; }
-  .subchart h3 { margin: 0 0 2px; font-size: 13.5px; font-weight: 600; }
-
-  .legend {
-    display: flex; flex-wrap: wrap; gap: 5px 16px;
-    margin: 2px 0 8px; color: #cfcfcf; font-size: 12.5px;
-  }
-  .legend .sw {
-    width: 10px; height: 10px; border-radius: 2px;
-    display: inline-block; margin-right: 5px; vertical-align: -1px;
-  }
-
-  svg { display: block; width: 100%; height: auto; overflow: visible; }
-  svg .grid { stroke: #333; stroke-width: 1; }
-  svg .tick-label { fill: #9d9d9d; font-size: 11px; }
-  svg .bar-label { fill: #dcdcdc; font-size: 11px; }
-  svg .row-label { fill: #cfcfcf; font-size: 11.5px; }
-  svg .bar-label-in { fill: #171717; font-size: 11px; font-weight: 600; }
-
-  table.datatable {
-    width: 100%; border-collapse: collapse; margin-top: 12px;
-    font-size: 12.5px; font-variant-numeric: tabular-nums;
-  }
-  .datatable caption {
-    text-align: left; color: #8f8f8f; font-size: 11.5px;
-    padding-bottom: 6px;
-  }
-  .datatable th {
-    color: #9d9d9d; font-weight: 550; text-align: right;
-    border-bottom: 1px solid #3a3a3a; padding: 4px 10px; white-space: nowrap;
-  }
-  .datatable td {
-    padding: 4px 10px; text-align: right;
-    border-bottom: 1px solid #232323; white-space: nowrap;
-  }
-  .datatable th:first-child, .datatable td:first-child { text-align: left; }
-  .datatable tr:last-child td { border-bottom: none; }
-  td.agent-hash { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11.5px; }
-
-  #tooltip {
-    position: fixed; pointer-events: none; z-index: 30;
-    background: #242424; border: 1px solid #4a4a4a; border-radius: 6px;
-    box-shadow: 0 4px 16px rgba(0,0,0,.5);
-    padding: 8px 11px; font-size: 12.5px; display: none; max-width: 360px;
-  }
-  #tooltip .tt-title { color: #f2f2f2; font-weight: 650; margin-bottom: 3px; }
-  #tooltip .tt-row { display: flex; align-items: center; gap: 7px; padding: 1px 0; }
-  #tooltip .tt-k { color: #c9c9c9; }
-  #tooltip .tt-v { font-weight: 600; color: #f2f2f2; margin-left: auto; padding-left: 14px; }
-  #tooltip .tt-swatch { width: 9px; height: 9px; border-radius: 2px; flex: none; }
-
-  .empty { color: #9d9d9d; padding: 10px 2px; font-size: 13px; }
-  .error {
-    background: #1d1613; border: 1px solid #4a2f24; border-radius: 8px;
-    padding: 22px; margin: 22px 0; color: #f0e2da;
-  }
-  .error h2 { margin: 0 0 6px; font-size: 16px; }
-  .error p { margin: 0; color: #c9a99a; }
-  footer {
-    max-width: 1060px; margin: 0 auto; padding: 0 24px 44px;
-    color: #8f8f8f; font-size: 12px; line-height: 1.7;
-  }
-  footer code { color: #b8b8b8; }
-</style>
+<title>Hivemind — telemetry</title>
+<link rel="stylesheet" href="/_telemetry/static/dashboard.css?v={version}">
 </head>
 <body>
 <header>
   <h1>Hivemind token ledger</h1>
-  <div class="controls">
-    <label for="days">Window</label>
-    <select id="days">
-      <option value="7">7 days</option>
-      <option value="14" selected>14 days</option>
-      <option value="30">30 days</option>
-      <option value="90">90 days</option>
-    </select>
-    <span id="updated"></span>
-  </div>
+  <div class="controls" id="controls"></div>
 </header>
 
 <main id="main"><p class="empty">Loading telemetry&hellip;</p></main>
 
-<footer>
-  Live dashboard — refreshes every 10s while the tab is visible (window selector applies on change).
-  Ledger writes are fail-open: if Postgres is unreachable telemetry is dropped and the proxy keeps
-  serving. No prompt content is ever stored — only hashed agent buckets and numbers.
-</footer>
+<noscript>
+  <p class="empty">The telemetry dashboard needs JavaScript. The raw data is at
+  <code>/_telemetry/data</code> (JSON) and <code>/_telemetry/export.jsonl</code>.</p>
+</noscript>
 
 <div id="tooltip" role="tooltip"></div>
 
-<script>
-"use strict";
-/* ============ palette & tokens ============ */
-// ColorBrewer Set2, fixed order. Entities beyond the fifth fold into "Other".
-const PALETTE = ["#66c2a5", "#fc8d62", "#8da0cb", "#e78ac3", "#a6d854"];
-const OTHER_COLOR = "#8f8f8f";
-const SVG_NS = "http://www.w3.org/2000/svg";
-
-const state = { days: 14 };
-// Live dashboard: poll the data endpoint.  Skipped while the tab is hidden
-// (no wasted queries); an in-flight fetch never overlaps the next tick.
-const REFRESH_MS = 10000;
-let inflight = false;
-const shortHash = (h) => (h && h.length > 12 ? h.slice(0, 12) + "…" : h);
-// Cache hit rate: read tokens over total input (read + fresh in).  NULL-safe.
-const hitRate = (r) => {
-  const total = (r.cache_read || 0) + (r.tokens_in || 0);
-  return total > 0 ? (r.cache_read || 0) / total : null;
-};
-
-/* ============ tiny DOM helpers (data only ever via textContent) ============ */
-function el(tag, cls, text) {
-  const node = document.createElement(tag);
-  if (cls) node.className = cls;
-  if (text !== undefined && text !== null) node.textContent = text;
-  return node;
-}
-function svgEl(tag, attrs) {
-  const node = document.createElementNS(SVG_NS, tag);
-  for (const k in attrs) node.setAttribute(k, attrs[k]);
-  return node;
-}
-function textEl(tag, text, attrs) {
-  const node = svgEl(tag, attrs || {});
-  node.textContent = text;
-  return node;
-}
-
-/* ============ formatting ============ */
-function fmtInt(v) { return Math.round(v).toLocaleString("en-US"); }
-function fmtTokens(v) {
-  if (v == null || !isFinite(v)) return "—";
-  if (v >= 1e9) return (v / 1e9).toFixed(1) + "B";
-  if (v >= 1e6) return (v / 1e6).toFixed(1) + "M";
-  if (v >= 1e3) return (v / 1e3).toFixed(1) + "K";
-  return String(Math.round(v));
-}
-function fmtMs(v) {
-  if (v == null || !isFinite(v)) return "—";
-  if (v >= 1000) return (v / 1000).toFixed(1) + " s";
-  return Math.round(v) + " ms";
-}
-function fmtPct(v) { return (v * 100).toFixed(1) + "%"; }
-function dayLabel(iso) {
-  // UTC-safe "M/D" label — parse the ISO date as text so timezones never shift the day.
-  const parts = String(iso).split("-");
-  return Number(parts[1]) + "/" + Number(parts[2]);
-}
-function niceMax(v) {
-  if (!(v > 0)) return 1;
-  const pow = Math.pow(10, Math.floor(Math.log10(v)));
-  const frac = v / pow;
-  const step = frac <= 1 ? 1 : frac <= 2 ? 2 : frac <= 5 ? 5 : 10;
-  return step * pow;
-}
-
-/* ============ fixed categorical color per entity (never cycled) ============
- * One page-wide alpha order is computed from every provider that appears in
- * the payload; the hue index is stable across all charts, and providers
- * ranked 6th+ fold into "Other" everywhere. */
-function providerColor(provider, order) {
-  const i = order.indexOf(provider);
-  return i >= 0 && i < PALETTE.length ? PALETTE[i] : OTHER_COLOR;
-}
-function foldedName(provider, order) {
-  return order.indexOf(provider) >= PALETTE.length ? "Other" : provider;
-}
-// The series actually drawn in one chart, in page order ("Other" last).
-function chartSeries(rows, order) {
-  const present = [];
-  for (const name of order) {
-    for (const r of rows) if (r.series === name) { present.push(name); break; }
-  }
-  if (!present.includes("Other")) {
-    for (const r of rows) if (r.series === "Other") { present.push("Other"); break; }
-  }
-  return present;
-}
-
-/* ============ tooltip ============ */
-const tip = document.getElementById("tooltip");
-function tipShow(title, rows) {
-  while (tip.firstChild) tip.removeChild(tip.firstChild);
-  if (title) tip.appendChild(el("div", "tt-title", title));
-  for (const r of rows) {
-    const row = el("div", "tt-row");
-    if (r.swatch) row.appendChild(el("span", "tt-swatch", "")).style.background = r.swatch;
-    row.appendChild(el("span", "tt-k", r.label));
-    row.appendChild(el("span", "tt-v", r.value));
-    tip.appendChild(row);
-  }
-  tip.style.display = "block";
-}
-function tipMove(ev) {
-  const pad = 14;
-  const rect = tip.getBoundingClientRect();
-  let x = ev.clientX + pad;
-  let y = ev.clientY + pad;
-  if (x + rect.width > window.innerWidth - 8) x = ev.clientX - rect.width - pad;
-  if (y + rect.height > window.innerHeight - 8) y = ev.clientY - rect.height - pad;
-  tip.style.left = x + "px";
-  tip.style.top = y + "px";
-}
-function tipHide() { tip.style.display = "none"; }
-function bindHover(node, title, rows) {
-  node.addEventListener("pointermove", (ev) => { tipShow(title, rows); tipMove(ev); });
-  node.addEventListener("pointerleave", tipHide);
-}
-
-/* ============ legend (present iff >= 2 series) ============ */
-function legendEl(items) {
-  const legend = el("div", "legend");
-  for (const it of items) {
-    const span = el("span");
-    const sw = el("span", "sw", "");
-    sw.style.background = it.color;
-    span.appendChild(sw);
-    span.appendChild(document.createTextNode(it.name));
-    legend.appendChild(span);
-  }
-  return legend;
-}
-
-/* =====================================================================
- * Stacked daily columns — one column per day, segments per provider.
- * =================================================================== */
-function stackedDaily(holder, title, rows, pick, fmt, tipFor, order) {
-  const days = [];
-  const per = new Map(); // day -> Map(series -> {value, tokensIn, tokensOut, requests, errors})
-  for (const r of rows) {
-    if (!days.includes(r.day)) days.push(r.day);
-    let m = per.get(r.day);
-    if (!m) { m = new Map(); per.set(r.day, m); }
-    let acc = m.get(r.series);
-    if (!acc) { acc = { value: 0, tokensIn: 0, tokensOut: 0, requests: 0, errors: 0 }; m.set(r.series, acc); }
-    acc.value += pick(r);
-    acc.tokensIn += r.tokens_in;
-    acc.tokensOut += r.tokens_out;
-    acc.requests += r.requests;
-    acc.errors += r.errors || 0;
-  }
-  days.sort();
-  const series = chartSeries(rows, order); // stack order == page order
-
-  const W = 960, H = 300;
-  const mL = 84, mR = 12, mT = 12, mB = 40;
-  const plotW = W - mL - mR, plotH = H - mT - mB;
-  const slot = plotW / days.length;
-  const barW = Math.min(34, Math.max(5, slot * 0.62));
-  let maxTotal = 0;
-  for (const d of days) {
-    let t = 0;
-    for (const s of series) t += (per.get(d).get(s) || { value: 0 }).value;
-    if (t > maxTotal) maxTotal = t;
-  }
-  const max = niceMax(maxTotal * 1.08);
-  const y = (v) => mT + plotH - (v / max) * plotH;
-
-  const box = el("div", "subchart");
-  box.appendChild(el("h3", null, title));
-
-  if (series.length >= 2) {
-    // Legend labels are shortened hashes for agent series; tooltips keep the
-    // full hash. "Other" is already short and passes through unchanged.
-    box.appendChild(legendEl(series.map((s) => ({ name: shortHash(s), color: providerColor(s, order) }))));
-  }
-
-  const svg = svgEl("svg", { viewBox: "0 0 " + W + " " + H });
-  svg.setAttribute("aria-label", title + " — stacked by provider");
-  for (let i = 1; i <= 4; i++) {
-    const t = (max / 4) * i;
-    svg.appendChild(svgEl("line", { x1: mL, x2: W - mR, y1: y(t), y2: y(t), class: "grid" }));
-    svg.appendChild(textEl("text", fmt(t), { x: mL - 8, y: y(t) + 3.5, "text-anchor": "end", class: "tick-label" }));
-  }
-  const labelEvery = Math.max(1, Math.ceil(days.length / 10));
-  days.forEach((d, i) => {
-    if (i % labelEvery === 0) {
-      svg.appendChild(textEl("text", dayLabel(d), {
-        x: mL + slot * i + slot / 2, y: H - 14, "text-anchor": "middle", class: "tick-label",
-      }));
-    }
-  });
-
-  days.forEach((d, i) => {
-    const x0 = mL + slot * i;
-    const byDay = per.get(d);
-    let acc = 0;
-    for (const s of series) {
-      const entry = byDay.get(s);
-      const v = entry ? entry.value : 0;
-      if (v <= 0) continue;
-      const yTop = y(acc + v), yBot = y(acc);
-      const rect = svgEl("rect", {
-        x: x0 + (slot - barW) / 2, y: yTop + 1, width: barW,
-        height: Math.max(0, yBot - yTop - 2), rx: Math.min(4, barW / 2),
-      });
-      rect.style.fill = providerColor(s, order);
-      svg.appendChild(rect);
-      // Hit target spans the whole column slot and the segment height — larger
-      // than the painted mark. Drawn after the mark so it wins pointer events.
-      const hit = svgEl("rect", {
-        x: x0, y: yTop, width: slot, height: Math.max(1, yBot - yTop), fill: "transparent",
-      });
-      bindHover(hit, dayLabel(d) + " · " + s, tipFor(entry, d, s));
-      svg.appendChild(hit);
-      acc += v;
-    }
-    // Direct label: the total of the last column only (sparing — never per segment).
-    if (i === days.length - 1 && acc > 0) {
-      svg.appendChild(textEl("text", fmt(acc), {
-        x: x0 + slot / 2, y: y(acc) - 6, "text-anchor": "middle", class: "bar-label",
-      }));
-    }
-  });
-  box.appendChild(svg);
-  holder.appendChild(box);
-}
-
-/* =====================================================================
- * Top models — horizontal bars, colored by provider (same fixed map).
- * =================================================================== */
-function topModelBars(holder, title, models, order) {
-  const box = el("div", "subchart");
-  box.appendChild(el("h3", null, title));
-  const rows = models.slice();
-  const W = 960;
-  const labelW = 310, mR = 150, mT = 14, rowH = 28;
-  const H = mT + rowH * rows.length + 26;
-  const x0 = labelW + 4;
-  const plotW = W - x0 - mR;
-  const max = niceMax(Math.max.apply(null, rows.map((m) => m.tokens_in + m.tokens_out)));
-  const x = (v) => x0 + (v / max) * plotW;
-
-  const present = [];
-  for (const m of rows) if (!present.includes(m.provider)) present.push(m.provider);
-  if (present.length >= 2) {
-    box.appendChild(legendEl(present.map((p) => ({ name: p, color: providerColor(p, order) }))));
-  }
-
-  const svg = svgEl("svg", { viewBox: "0 0 " + W + " " + H });
-  svg.setAttribute("aria-label", title + " — horizontal bars");
-  for (let i = 1; i <= 4; i++) {
-    const t = (max / 4) * i;
-    svg.appendChild(svgEl("line", { x1: x(t), x2: x(t), y1: mT - 4, y2: H - 20, class: "grid" }));
-    svg.appendChild(textEl("text", fmtTokens(t), { x: x(t), y: H - 6, "text-anchor": "middle", class: "tick-label" }));
-  }
-  rows.forEach((m, i) => {
-    const cy = mT + i * rowH + rowH / 2;
-    const tokens = m.tokens_in + m.tokens_out;
-    svg.appendChild(textEl("text", m.model, { x: labelW - 8, y: cy, "text-anchor": "end", class: "row-label" }));
-    svg.appendChild(textEl("text", m.provider, { x: labelW - 8, y: cy + 13, "text-anchor": "end", class: "tick-label" }));
-    const color = providerColor(m.provider, order);
-    const bw = Math.max(2, x(tokens) - x0);
-    const rect = svgEl("rect", { x: x0, y: cy - 7, width: bw, height: 14, rx: Math.min(4, 7) });
-    rect.style.fill = color;
-    svg.appendChild(rect);
-    // Hit target: the whole row band right of the labels.
-    const hit = svgEl("rect", { x: x0, y: cy - 12, width: plotW + mR, height: 24, fill: "transparent" });
-    const tipRows = [
-      { swatch: color, label: "provider", value: m.provider },
-      { label: "requests", value: fmtInt(m.requests) },
-      { label: "tokens in/out", value: fmtInt(m.tokens_in) + " / " + fmtInt(m.tokens_out) },
-      { label: "cache reads", value: fmtInt(m.cache_read || 0) },
-    ];
-    bindHover(hit, m.model, tipRows);
-    svg.appendChild(hit);
-    // Value at the tip (ranked bars — every bar is an endpoint).
-    svg.appendChild(textEl("text", fmtTokens(tokens), { x: x(tokens) + 6, y: cy + 3.5, class: "bar-label" }));
-  });
-  box.appendChild(svg);
-  holder.appendChild(box);
-}
-
-/* =====================================================================
- * Latency — grouped horizontal bars, two series (p50/p95), one scale.
- * =================================================================== */
-function latencyChart(holder, rows) {
-  const box = el("div", "subchart");
-  box.appendChild(el("h3", null, "p50 vs p95 response time"));
-  const W = 960;
-  const labelW = 240, mR = 150, mT = 14, rowH = 36;
-  const H = mT + rowH * rows.length + 26;
-  const x0 = labelW + 4;
-  const plotW = W - x0 - mR;
-  const max = niceMax(Math.max.apply(null, rows.map((r) => Math.max(r.p50_ms || 0, r.p95_ms || 0))));
-  const x = (v) => x0 + (v / max) * plotW;
-  const P50 = "#8da0cb", P95 = "#fc8d62";
-
-  box.appendChild(legendEl([{ name: "p95", color: P95 }, { name: "p50", color: P50 }]));
-  const svg = svgEl("svg", { viewBox: "0 0 " + W + " " + H });
-  svg.setAttribute("aria-label", "Latency p50/p95 by provider — grouped bars");
-  for (let i = 1; i <= 4; i++) {
-    const t = (max / 4) * i;
-    svg.appendChild(svgEl("line", { x1: x(t), x2: x(t), y1: mT - 4, y2: H - 20, class: "grid" }));
-    svg.appendChild(textEl("text", fmtMs(t), { x: x(t), y: H - 6, "text-anchor": "middle", class: "tick-label" }));
-  }
-  rows.forEach((r, i) => {
-    const top = mT + i * rowH;
-    svg.appendChild(textEl("text", r.provider, { x: labelW - 8, y: top + 20, "text-anchor": "end", class: "row-label" }));
-    // p50 and p95 share one baseline; 2px surface gap between the pair.
-    const bar = (v, color, yOff, h, series) => {
-      const bw = Math.max(2, x(v) - x0);
-      const rect = svgEl("rect", { x: x0, y: top + yOff, width: bw, height: h, rx: Math.min(4, h / 2) });
-      rect.style.fill = color;
-      svg.appendChild(rect);
-      const hit = svgEl("rect", { x: x0, y: top + yOff - 4, width: plotW + mR, height: h + 8, fill: "transparent" });
-      bindHover(hit, r.provider + " · " + series, [
-        { label: "requests", value: fmtInt(r.requests) },
-        { swatch: color, label: series, value: fmtMs(v) },
-      ]);
-      svg.appendChild(hit);
-      return { bw };
-    };
-    const p95 = bar(r.p95_ms || 0, P95, 4, 13, "p95");
-    const p50 = bar(r.p50_ms || 0, P50, 19, 13, "p50");
-    // p50 label sits inside its bar; p95 at the tip when it fits, else inside.
-    if (p50.bw > 40) {
-      svg.appendChild(textEl("text", fmtMs(r.p50_ms), { x: x0 + 6, y: top + 29, class: "bar-label-in" }));
-    }
-    if (p95.bw > 40) {
-      svg.appendChild(textEl("text", fmtMs(r.p95_ms), { x: x0 + p95.bw + 6, y: top + 14, class: "bar-label" }));
-    } else {
-      svg.appendChild(textEl("text", fmtMs(r.p95_ms), { x: x0 + 6, y: top + 14, class: "bar-label-in" }));
-    }
-  });
-  box.appendChild(svg);
-  holder.appendChild(box);
-}
-
-/* =====================================================================
- * Plain HTML tables — same data as each chart.
- * =================================================================== */
-function dataTable(holder, caption, headers, rows) {
-  const table = el("table", "datatable");
-  table.appendChild(el("caption", null, caption));
-  const thead = el("thead");
-  const hr = el("tr");
-  for (const h of headers) hr.appendChild(el("th", null, h));
-  thead.appendChild(hr);
-  table.appendChild(thead);
-  const tbody = el("tbody");
-  for (const row of rows) {
-    const tr = el("tr");
-    for (const cell of row) {
-      const td = el("td", cell.cls || null, cell.text);
-      if (cell.title) td.title = cell.title;
-      tr.appendChild(td);
-    }
-    tbody.appendChild(tr);
-  }
-  table.appendChild(tbody);
-  holder.appendChild(table);
-}
-
-/* =====================================================================
- * Section renderers
- * =================================================================== */
-function renderTiles(main, t) {
-  const tiles = el("div", "tiles");
-  const defs = [
-    { label: "Requests", value: fmtInt(t.requests) },
-    { label: "Tokens in", value: fmtInt(t.tokens_in) },
-    { label: "Tokens out", value: fmtInt(t.tokens_out) },
-    { label: "Cache reads", value: fmtTokens(t.cache_read) },
-    { label: "Error rate", value: fmtPct(t.error_rate) },
-  ];
-  for (const d of defs) {
-    const tile = el("div", "tile");
-    tile.appendChild(el("div", "label", d.label));
-    tile.appendChild(el("div", "value", d.value));
-    tiles.appendChild(tile);
-  }
-  main.appendChild(tiles);
-}
-
-function renderDailyAgents(main, data, order) {
-  const card = el("section", "card");
-  card.appendChild(el("h2", null, "Daily usage per agent"));
-  card.appendChild(el("p", "sub",
-    "Tokens per day, stacked by agent (top 5 by window tokens; the rest fold into “Other”). " +
-    "The provider dimension is not charted — mid-pipeline upstreams all detect as one profile."));
-
-  if (!data.daily_agents.length) {
-    card.appendChild(el("p", "empty", "No telemetry in this window yet."));
-    main.appendChild(card);
-    return;
-  }
-  const rows = data.daily_agents.map((r) => ({
-    day: r.day, agent_hash: r.agent_hash, series: foldedName(r.agent_hash, order),
-    tokens_in: r.tokens_in, tokens_out: r.tokens_out, requests: r.requests, errors: r.errors,
-  }));
-
-  const tokenBox = el("div", "subchart");
-  stackedDaily(tokenBox, "Tokens per day", rows, (r) => r.tokens_in + r.tokens_out, fmtTokens,
-    (e, d, s) => [
-      { label: "day", value: d },
-      { label: "agent", value: s },
-      { label: "requests", value: fmtInt(e.requests) },
-      { label: "tokens in/out", value: fmtInt(e.tokensIn) + " / " + fmtInt(e.tokensOut) },
-      { label: "errors", value: fmtInt(e.errors) },
-    ], order);
-  card.appendChild(tokenBox);
-  const tableRows = data.daily_agents.slice()
-    .sort((a, b) => (b.day < a.day ? -1 : b.day > a.day ? 1 : 0));
-  dataTable(card, "Same data as the chart above.", ["Day", "Agent (hash)", "Requests", "Tokens in", "Tokens out", "Errors"],
-    tableRows.map((r) => [
-      { text: r.day }, { text: r.agent_hash, cls: "agent-hash", title: "rate-limit bucket hash (agent identity)" },
-      { text: fmtInt(r.requests) }, { text: fmtInt(r.tokens_in) }, { text: fmtInt(r.tokens_out) },
-      { text: fmtInt(r.errors) },
-    ]));
-  main.appendChild(card);
-}
-
-function renderModels(main, data, order) {
-  const card = el("section", "card");
-  card.appendChild(el("h2", null, "Top models by tokens"));
-  card.appendChild(el("p", "sub",
-    "Ranked by tokens consumed.  Cache reads are the actionable signal for multi-agent runs " +
-    "(low hit rate = repeated full-context sends)."));
-  if (data.top_models.length) {
-    topModelBars(card, "Tokens by model", data.top_models, order);
-    dataTable(card, "Same data as the chart above.", ["Model", "Provider", "Requests", "Tokens in", "Tokens out", "Cache reads"],
-      data.top_models.map((m) => [
-        { text: m.model }, { text: m.provider }, { text: fmtInt(m.requests) },
-        { text: fmtInt(m.tokens_in) }, { text: fmtInt(m.tokens_out) }, { text: fmtInt(m.cache_read || 0) },
-      ]));
-  } else {
-    card.appendChild(el("p", "empty", "No requests in this window."));
-  }
-  main.appendChild(card);
-}
-
-function renderLatency(main, data) {
-  const card = el("section", "card");
-  card.appendChild(el("h2", null, "Latency by provider"));
-  card.appendChild(el("p", "sub", "Response latency p50/p95 — two series, one scale."));
-  if (data.latency.length) {
-    const box = el("div", "subchart");
-    latencyChart(box, data.latency);
-    card.appendChild(box);
-    dataTable(card, "Same data as the chart above.", ["Provider", "Requests", "p50", "p95"],
-      data.latency.map((l) => [
-        { text: l.provider }, { text: fmtInt(l.requests) },
-        { text: fmtMs(l.p50_ms) }, { text: fmtMs(l.p95_ms) },
-      ]));
-  } else {
-    card.appendChild(el("p", "empty", "No latency rows in this window."));
-  }
-  main.appendChild(card);
-}
-
-function renderAgents(main, data) {
-  const card = el("section", "card");
-  card.appendChild(el("h2", null, "Per-agent totals"));
-  card.appendChild(el("p", "sub", "Agent hashes are rate-limit bucket labels only — identities are never stored."));
-  if (!data.agents.length) {
-    card.appendChild(el("p", "empty", "No requests in this window."));
-    main.appendChild(card);
-    return;
-  }
-  const table = el("table", "datatable");
-  table.appendChild(el("caption", null, "One row per agent hash. Cache hit = tokens served from cache over total input."));
-  const thead = el("thead");
-  const hr = el("tr");
-  for (const h of ["Agent (hash)", "Requests", "Tokens in", "Tokens out", "Cache reads", "Cache hit", "Error rate"]) {
-    hr.appendChild(el("th", null, h));
-  }
-  thead.appendChild(hr);
-  table.appendChild(thead);
-  const tbody = el("tbody");
-  data.agents.forEach((a) => {
-    const tr = el("tr");
-    const rate = hitRate(a);
-    const cells = [
-      { text: a.agent_hash, cls: "agent-hash", title: "rate-limit bucket hash (agent identity)" },
-      { text: fmtInt(a.requests) },
-      { text: fmtInt(a.tokens_in) },
-      { text: fmtInt(a.tokens_out) },
-      { text: fmtInt(a.cache_read || 0) },
-      { text: rate == null ? "—" : fmtPct(rate) },
-      { text: fmtPct(a.error_rate), title: a.errors + " of " + a.requests + " requests returned status >= 400" },
-    ];
-    for (const cell of cells) {
-      const td = el("td", cell.cls || null, cell.text);
-      if (cell.title) td.title = cell.title;
-      tr.appendChild(td);
-    }
-    tbody.appendChild(tr);
-  });
-  table.appendChild(tbody);
-  card.appendChild(table);
-  main.appendChild(card);
-}
-
-function renderError(detail) {
-  const main = document.getElementById("main");
-  while (main.firstChild) main.removeChild(main.firstChild);
-  const box = el("div", "error");
-  box.appendChild(el("h2", null, "Telemetry unavailable"));
-  box.appendChild(el("p", null,
-    (detail || "The ledger is unreachable or disabled (no --telemetry-dsn).") +
-    " The proxy keeps serving — only telemetry is affected (fail-open)."));
-  main.appendChild(box);
-}
-
-function render(payload) {
-  const main = document.getElementById("main");
-  while (main.firstChild) main.removeChild(main.firstChild);
-  if (!payload || payload.error) {
-    renderError(payload && payload.error !== "telemetry unavailable" ? payload.error : null);
-    return;
-  }
-  // Stable hue identity: one alpha-ordered palette per dimension — agent
-  // hashes for the daily chart, provider names for model/latency charts.
-  const agentOrder = [];
-  for (const r of payload.daily_agents || []) {
-    if (!agentOrder.includes(r.agent_hash)) agentOrder.push(r.agent_hash);
-  }
-  agentOrder.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
-  const providerOrder = [];
-  for (const list of [payload.top_models, payload.latency]) {
-    for (const r of list) {
-      if (r.provider && !providerOrder.includes(r.provider)) providerOrder.push(r.provider);
-    }
-  }
-  providerOrder.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
-
-  renderTiles(main, payload.totals);
-  renderDailyAgents(main, payload, agentOrder);
-  renderModels(main, payload, providerOrder);
-  renderLatency(main, payload);
-  renderAgents(main, payload);
-  const stamp = String(payload.generated_at || "").replace("T", " ").replace("+00:00", " UTC");
-  if (stamp) document.getElementById("updated").textContent = "updated " + stamp;
-}
-
-async function load() {
-  if (inflight) return; // never overlap a slow poll with the next tick
-  inflight = true;
-  const main = document.getElementById("main");
-  main.classList.add("loading"); // keep the previous frame visible at reduced opacity
-  let payload;
-  try {
-    const resp = await fetch("/_telemetry/data?days=" + state.days, { headers: { accept: "application/json" } });
-    payload = await resp.json();
-  } catch (err) {
-    payload = { error: "Dashboard request failed: " + String(err) };
-  }
-  main.classList.remove("loading");
-  inflight = false;
-  render(payload);
-}
-
-document.getElementById("days").addEventListener("change", (ev) => {
-  state.days = parseInt(ev.target.value, 10) || 14;
-  load();
-});
-
-// Initial load + live refresh.  Hidden tabs skip ticks (no wasted queries);
-// the first visible tick after returning to the tab refreshes immediately.
-load();
-setInterval(() => { if (!document.hidden) load(); }, REFRESH_MS);
-document.addEventListener("visibilitychange", () => { if (!document.hidden) load(); });
-</script>
+<script defer src="/_telemetry/static/charts.js?v={version}"></script>
+<script defer src="/_telemetry/static/dashboard.js?v={version}"></script>
 </body>
 </html>
 """

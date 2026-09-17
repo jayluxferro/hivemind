@@ -100,6 +100,12 @@ def register_serve_cli_arguments(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="Max seconds a rate-limited request holds before a 429 (default: 240)",
     )
+    parser.add_argument(
+        "--telemetry-retention-days",
+        type=int,
+        default=None,
+        help="Days of token-ledger history to keep (pruned 24h; default 90, HIVEMIND_TELEMETRY_RETENTION_DAYS env)",
+    )
 
 
 def apply_serve_cli_args_to_config(config: HiveMindConfig, args: argparse.Namespace) -> None:
@@ -131,6 +137,9 @@ def apply_serve_cli_args_to_config(config: HiveMindConfig, args: argparse.Namesp
         config.normalize_runtime_limits()  # re-validate the merged registry loudly
     if getattr(args, "max_rate_wait", None) is not None:
         config.max_rate_wait_s = args.max_rate_wait
+        config.normalize_runtime_limits()  # fail loudly on a bad value
+    if getattr(args, "telemetry_retention_days", None) is not None:
+        config.telemetry_retention_days = args.telemetry_retention_days
         config.normalize_runtime_limits()  # fail loudly on a bad value
 
 
@@ -168,6 +177,12 @@ def register_proxy_cli_arguments(
         help="Postgres DSN for the token ledger + cost dashboard (MESH_TELEMETRY_DSN env "
         "fallback; unset defaults to the request-log database — the ledger is "
         "metadata-only and fail-open)",
+    )
+    parser.add_argument(
+        "--telemetry-retention-days",
+        type=int,
+        default=None,
+        help="Days of token-ledger history to keep (pruned 24h; default 90, HIVEMIND_TELEMETRY_RETENTION_DAYS env)",
     )
     parser.add_argument("--max-retries", type=int, default=3, help="Max transparent retries on 429/502")
     parser.add_argument("--retry-base-delay", type=float, default=1.0, help="Base retry delay in seconds")
@@ -274,6 +289,9 @@ def hivemind_config_from_proxy_cli_args(args: argparse.Namespace) -> HiveMindCon
         config.normalize_runtime_limits()  # re-validate the merged registry loudly
     if getattr(args, "max_rate_wait", None) is not None:
         config.max_rate_wait_s = args.max_rate_wait
+        config.normalize_runtime_limits()  # fail loudly on a bad value
+    if getattr(args, "telemetry_retention_days", None) is not None:
+        config.telemetry_retention_days = args.telemetry_retention_days
         config.normalize_runtime_limits()  # fail loudly on a bad value
 
     # Token ledger: explicit flag wins; MESH_TELEMETRY_DSN env is the fallback;

@@ -2,8 +2,12 @@
 
 TelemetryLedger must be fail-open: every public entry point swallows its own
 errors (D4), writes are fire-and-forget through an internal queue drained by
-one background task, and dashboard reads shape dict_row output into JSON-safe
-payloads.
+one background task, and reads shape dict_row output into JSON-safe payloads
+while letting failures propagate to the HTTP handler.
+
+The read tests key canned rows on the *exact* SQL constants: the SQL strings
+are part of this module's contract (the fakes are the only thing standing in
+for a database in CI), so a query that changes shape must change here too.
 """
 
 from __future__ import annotations
@@ -12,18 +16,33 @@ import asyncio
 import json
 import logging
 import os
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
 from hivemind.telemetry.ledger import (
     _COLUMN_ORDER,
     _insert_params,
+    _PRUNE_INTERVAL_S,
     _QUEUE_MAX,
+    _RANGE,
+    _REQUEST_COLUMNS,
     _SQL_AGENTS,
     _SQL_DAILY_AGENTS,
+    _SQL_FACET_AGENTS,
+    _SQL_FACET_MODELS,
+    _SQL_FACET_PROVIDERS,
     _SQL_LATENCY,
+    _SQL_LATENCY_MODELS,
+    _SQL_PRUNE,
+    _SQL_REQUESTS,
+    _SQL_REQUESTS_COUNT,
+    _SQL_REQUESTS_EXPORT,
+    _SQL_SERIES_DAY,
+    _SQL_SERIES_HOUR,
+    _SQL_STATUS,
     _SQL_TOP_MODELS,
+    _SQL_TOTALS,
     NullLedger,
     TelemetryLedger,
     get_ledger,
@@ -32,6 +51,14 @@ from hivemind.telemetry.ledger import (
 
 _INSERT_MARK = "INSERT INTO mesh_telemetry.token_usage"
 
+# A fixed display range + the half-open window the ledger must derive from it
+# (inclusive `to` -> `to + 1 day`).
+FROM_TS = datetime(2026, 9, 1, tzinfo=timezone.utc)
+TO_TS = datetime(2026, 9, 14, tzinfo=timezone.utc)
+WINDOW = (FROM_TS, TO_TS + timedelta(days=1))
+
+_UNAVAILABLE = {"error": "telemetry unavailable"}
+
 
 class FakeCursor:
     def __init__(self, conn, sql: str) -> None:
@@ -39,10 +66,48 @@ class FakeCursor:
         self._sql = sql
 
     async def fetchall(self):
-        return list(self._conn.fetchall_rows.get(self._sql) or [])
+        rows = self._conn.fetchall_rows.get(self._sql)
+        if rows is None:
+            rows = self._conn.fetchall_default
+        return list(rows)
 
     async def fetchone(self):
-        return self._conn.fetchone_row
+        row = self._conn.fetchone_rows.get(self._sql)
+        if row is None:
+            row = self._conn.fetchone_row
+        return row
+
+
+class FakeServerCursor:
+    """Named (server-side) cursor stand-in.
+
+    Real named cursors are created by a *sync* ``conn.cursor(name=…)`` and
+    then driven with awaits — psycopg3's AsyncConnection.cursor() is a plain
+    method, so the fake mirrors that (an awaitable here would let a broken
+    implementation pass).
+    """
+
+    def __init__(self, conn, name: str, kwargs: dict) -> None:
+        self._conn = conn
+        self.name = name
+        self.kwargs = kwargs
+        self.executed: list[tuple[str, tuple | None]] = []
+        self.sizes: list[int] = []
+        self.closed = False
+        self._batches: list[list[dict]] = []
+
+    async def execute(self, sql: str, params=None):
+        self.executed.append((sql, params))
+        self._batches = list(self._conn.export_batches)
+
+    async def fetchmany(self, size: int):
+        self.sizes.append(size)
+        if self._conn.export_error is not None:
+            raise self._conn.export_error
+        return self._batches.pop(0) if self._batches else []
+
+    async def close(self) -> None:
+        self.closed = True
 
 
 class FakeConn:
@@ -52,8 +117,15 @@ class FakeConn:
         self.executed: list[tuple[str, tuple | None]] = []
         self.autocommit = False
         self.closed = False
+        # fetchall: exact-SQL rows, else `fetchall_default` (the dynamic
+        # requests SELECT is built at call time, so it has no constant key).
         self.fetchall_rows: dict[str, list[dict]] = {}
+        self.fetchall_default: list[dict] = []
+        self.fetchone_rows: dict[str, dict] = {}
         self.fetchone_row: dict | None = None
+        self.export_batches: list[list[dict]] = []
+        self.export_error: Exception | None = None
+        self.cursors: list[FakeServerCursor] = []
 
     async def set_autocommit(self, value) -> None:
         self.autocommit = value
@@ -61,6 +133,11 @@ class FakeConn:
     async def execute(self, sql: str, params=None):
         self.executed.append((sql, params))
         return FakeCursor(self, sql)
+
+    def cursor(self, name: str = "", **kwargs) -> FakeServerCursor:
+        cursor = FakeServerCursor(self, name, kwargs)
+        self.cursors.append(cursor)
+        return cursor
 
     async def close(self) -> None:
         self.closed = True
@@ -73,8 +150,51 @@ def _fake_factory(conn: FakeConn):
     return factory
 
 
+class FakePool:
+    """Factory that mints a fresh FakeConn per call and records it.
+
+    The real ledger's pruner opens its own connection, so tests that count
+    statements on the reader connection need the pruner's work to land
+    somewhere else.
+    """
+
+    def __init__(self) -> None:
+        self.created: list[FakeConn] = []
+
+    async def __call__(self, dsn: str) -> FakeConn:
+        conn = FakeConn()
+        self.created.append(conn)
+        return conn
+
+    def prunes(self) -> int:
+        return sum(1 for conn in self.created for sql, _ in conn.executed if sql == _SQL_PRUNE)
+
+
 def _inserts(conn: FakeConn) -> list[tuple[str, tuple | None]]:
     return [(sql, params) for sql, params in conn.executed if _INSERT_MARK in sql]
+
+
+def _reads(conn: FakeConn) -> list[tuple[str, tuple | None]]:
+    """Parameterized statements, i.e. everything except the schema DDL."""
+    return [(sql, params) for sql, params in conn.executed if params is not None]
+
+
+def _row(**overrides) -> dict:
+    row = {
+        "id": 7,
+        "ts": datetime(2026, 9, 2, 3, 4, 5, tzinfo=timezone.utc),
+        "agent_hash": "bucket-1",
+        "provider": "Anthropic",
+        "model": "deepseek-chat",
+        "tokens_in": 100,
+        "tokens_out": 50,
+        "cache_read": 40,
+        "cache_write": 5,
+        "latency_ms": 123.4,
+        "status": 200,
+    }
+    row.update(overrides)
+    return row
 
 
 # --- NullLedger / module singleton -------------------------------------------
@@ -85,8 +205,18 @@ async def test_null_ledger_noops():
     await ledger.record({"anything": 1})
     await ledger.connect()
     await ledger.shutdown()
+    await ledger.prune()
     assert (await ledger.fetch_dashboard()) == {"error": "telemetry unavailable"}
     assert (await ledger.fetch_dashboard(days=30)) == {"error": "telemetry unavailable"}
+    # Every Phase 2 reader answers the same marker so an unconfigured
+    # deployment renders "telemetry unavailable" instead of a 500.
+    assert (await ledger.fetch_overview(FROM_TS, TO_TS)) == _UNAVAILABLE
+    assert (await ledger.fetch_requests(FROM_TS, TO_TS, limit=10)) == _UNAVAILABLE
+    assert (await ledger.fetch_facets(FROM_TS, TO_TS)) == _UNAVAILABLE
+    assert (await ledger.fetch_series(FROM_TS, TO_TS, "hour")) == _UNAVAILABLE
+    # The export path keeps its types: it is iterated, not rendered.
+    assert (await ledger.count_requests(FROM_TS, TO_TS)) == 0
+    assert [batch async for batch in ledger.export_rows(FROM_TS, TO_TS)] == []
 
 
 async def test_get_ledger_defaults_to_null(monkeypatch):
@@ -154,6 +284,7 @@ async def test_connect_runs_schema_ddl():
     assert "usage_cost" in statements[-1]
     assert conn.autocommit is True
     assert not conn.closed  # writer connection stays open for the next row
+    await ledger.shutdown()  # stops the pruner connect() just started
 
 
 async def test_connect_failure_is_swallowed():
@@ -162,6 +293,7 @@ async def test_connect_failure_is_swallowed():
 
     ledger = TelemetryLedger("postgresql://fake", conn_factory=boom)
     await ledger.connect()  # must not raise (D4)
+    assert ledger._pruner is None  # nothing to prune without a connection
 
 
 # --- write path --------------------------------------------------------------
@@ -274,16 +406,14 @@ async def test_shutdown_is_idempotent_and_drains():
     assert len(_inserts(conn)) == 5
 
 
-# --- read path (dashboard) ---------------------------------------------------
+# --- read path: overview -----------------------------------------------------
 
 
-async def test_fetch_dashboard_shapes_payload_and_parameterizes_days():
-    holder = FakeConn()
-    day = date(2026, 9, 1)
+def _overview_fixtures(holder: FakeConn) -> None:
     holder.fetchall_rows = {
         _SQL_DAILY_AGENTS: [
             {
-                "day": day,
+                "day": date(2026, 9, 1),
                 "agent_hash": "fp-abc123",
                 "requests": 10,
                 "tokens_in": 1000,
@@ -291,7 +421,7 @@ async def test_fetch_dashboard_shapes_payload_and_parameterizes_days():
                 "errors": 1,
             },
             {
-                "day": day,
+                "day": date(2026, 9, 1),
                 "agent_hash": "Other",
                 "requests": 4,
                 "tokens_in": 400,
@@ -345,21 +475,44 @@ async def test_fetch_dashboard_shapes_payload_and_parameterizes_days():
                 "p95_ms": None,
             },
         ],
+        _SQL_STATUS: [
+            {"status": 200, "requests": 11},
+            {"status": 500, "requests": 3},
+        ],
+        _SQL_LATENCY_MODELS: [
+            {
+                "provider": "Anthropic",
+                "model": "deepseek-chat",
+                "requests": 9,
+                "p50_ms": 1200.0,
+                "p95_ms": 8100.0,
+            }
+        ],
     }
-    holder.fetchone_row = {
-        "requests": 14,
-        "errors": 3,
-        "tokens_in": 1400,
-        "tokens_out": 800,
-        "cache_read": 600,
-        "cache_write": 25,
-        "cost_usd": 0.0123,
+    holder.fetchone_rows = {
+        _SQL_TOTALS: {
+            "requests": 14,
+            "errors": 3,
+            "tokens_in": 1400,
+            "tokens_out": 800,
+            "cache_read": 600,
+            "cache_write": 25,
+            "cost_usd": 0.0123,
+        }
     }
 
+
+async def test_fetch_overview_shapes_payload_and_windows_the_reads():
+    holder = FakeConn()
+    _overview_fixtures(holder)
     ledger = TelemetryLedger("postgresql://fake", conn_factory=_fake_factory(holder))
-    payload = await ledger.fetch_dashboard(days=7)
 
-    assert payload["days"] == 7
+    payload = await ledger.fetch_overview(FROM_TS, TO_TS)
+
+    # The display range replaces the old `days` counter in the payload.
+    assert "days" not in payload
+    assert payload["from"] == "2026-09-01T00:00:00Z"
+    assert payload["to"] == "2026-09-14T00:00:00Z"
     assert payload["generated_at"].endswith("+00:00")
     totals = payload["totals"]
     assert totals == {
@@ -398,16 +551,27 @@ async def test_fetch_dashboard_shapes_payload_and_parameterizes_days():
     ]
     assert payload["latency"][0]["p50_ms"] == 1234.5
     assert payload["latency"][1]["p50_ms"] is None
+    assert payload["status_codes"] == [
+        {"status": 200, "requests": 11},
+        {"status": 500, "requests": 3},
+    ]
+    assert payload["latency_models"] == [
+        {
+            "provider": "Anthropic",
+            "model": "deepseek-chat",
+            "requests": 9,
+            "p50_ms": 1200.0,
+            "p95_ms": 8100.0,
+        }
+    ]
     # Everything must be JSON-serializable (no Decimal/date leakage).
     json.dumps(payload)
 
-    # Every read query is parameterized on the day window.  The daily-agents
-    # query carries the window twice (ranking CTE + outer query) and so takes
-    # the parameter twice.
-    read_params = [params for sql, params in holder.executed if params is not None]
-    assert len(read_params) == 5
-    assert read_params.count((7, 7)) == 1  # _SQL_DAILY_AGENTS
-    assert read_params.count((7,)) == 4
+    # Seven queries, every one on the same half-open window: the display `to`
+    # is a date the user sees, the SQL bound is exclusive (D7).
+    reads = _reads(holder)
+    assert len(reads) == 7
+    assert all(params == WINDOW for _, params in reads)
     # Schema DDL also ran on the reader connection (self-healing view).  The
     # multi-line statements begin with a newline, so match on content.
     ddl = [sql for sql, _ in holder.executed if "CREATE" in sql]
@@ -415,7 +579,7 @@ async def test_fetch_dashboard_shapes_payload_and_parameterizes_days():
     assert holder.closed is True, "short-lived reader connection must be closed"
 
 
-async def test_fetch_dashboard_with_no_rows():
+async def test_fetch_overview_with_no_rows():
     holder = FakeConn()
     holder.fetchone_row = {
         "requests": 0,
@@ -425,7 +589,7 @@ async def test_fetch_dashboard_with_no_rows():
         "cost_usd": 0.0,
     }
     ledger = TelemetryLedger("postgresql://fake", conn_factory=_fake_factory(holder))
-    payload = await ledger.fetch_dashboard(days=14)
+    payload = await ledger.fetch_overview(FROM_TS, TO_TS)
     assert payload["totals"] == {
         "requests": 0,
         "errors": 0,
@@ -440,10 +604,12 @@ async def test_fetch_dashboard_with_no_rows():
     assert payload["top_models"] == []
     assert payload["agents"] == []
     assert payload["latency"] == []
+    assert payload["status_codes"] == []
+    assert payload["latency_models"] == []
     json.dumps(payload)
 
 
-async def test_fetch_dashboard_reader_failure_raises_for_handler():
+async def test_fetch_overview_reader_failure_raises_for_handler():
     """The reader may raise; the HTTP handler owns mapping it to the
     'telemetry unavailable' payload (a real DB failure raises; only
     NullLedger returns the error payload directly)."""
@@ -453,7 +619,349 @@ async def test_fetch_dashboard_reader_failure_raises_for_handler():
 
     ledger = TelemetryLedger("postgresql://fake", conn_factory=boom)
     with pytest.raises(ConnectionError):
-        await ledger.fetch_dashboard(days=7)
+        await ledger.fetch_overview(FROM_TS, TO_TS)
+
+
+async def test_fetch_dashboard_alias_maps_days_onto_a_range():
+    """Phase 1's `days=N` still works, as `[now - N days, now]`."""
+    holder = FakeConn()
+    _overview_fixtures(holder)
+    ledger = TelemetryLedger("postgresql://fake", conn_factory=_fake_factory(holder))
+
+    payload = await ledger.fetch_dashboard(days=7)
+
+    reads = _reads(holder)
+    assert len(reads) == 7
+    window_from, window_to = reads[0][1]
+    # days=7 covers today plus the six before it, so the half-open window is
+    # eight days wide (the +1 day on the exclusive bound).
+    assert window_to - window_from == timedelta(days=8)
+    assert abs((datetime.now(timezone.utc) - window_from) - timedelta(days=7)) < timedelta(minutes=1)
+    assert payload["to"].endswith("Z")
+
+
+# --- read path: requests -----------------------------------------------------
+
+
+async def test_fetch_requests_placeholder_order_contract():
+    holder = FakeConn()
+    holder.fetchone_rows = {
+        _SQL_REQUESTS_COUNT.format(where=_RANGE + " AND agent_hash = %s AND status = %s"): {"total": 42}
+    }
+    holder.fetchall_default = [_row()]
+    ledger = TelemetryLedger("postgresql://fake", conn_factory=_fake_factory(holder))
+
+    payload = await ledger.fetch_requests(
+        FROM_TS,
+        TO_TS,
+        agent_hash="bucket-1",
+        status=200,
+        sort="tokens",
+        order="asc",
+        limit=50,
+        offset=100,
+    )
+
+    reads = _reads(holder)
+    count_sql, count_params = reads[0]
+    rows_sql, rows_params = reads[1]
+    where = _RANGE + " AND agent_hash = %s AND status = %s"
+    assert count_sql == _SQL_REQUESTS_COUNT.format(where=where)
+    # (from, to), filters in _REQUEST_FILTERS order, then limit, offset.
+    assert count_params == (FROM_TS, TO_TS + timedelta(days=1), "bucket-1", 200)
+    assert rows_sql == _SQL_REQUESTS.format(
+        columns=", ".join(_REQUEST_COLUMNS),
+        where=where,
+        order_by="(coalesce(tokens_in, 0) + coalesce(tokens_out, 0)) ASC NULLS LAST, id ASC",
+    )
+    assert rows_params == (FROM_TS, TO_TS + timedelta(days=1), "bucket-1", 200, 50, 100)
+    assert "LIMIT %s OFFSET %s" in rows_sql
+
+    assert payload["total"] == 42
+    assert payload["limit"] == 50
+    assert payload["offset"] == 100
+    assert payload["from"] == "2026-09-01T00:00:00Z"
+    assert payload["to"] == "2026-09-14T00:00:00Z"
+    assert payload["rows"] == [_row(id=7, ts="2026-09-02T03:04:05Z")]
+    json.dumps(payload)
+    assert holder.closed is True
+
+
+async def test_fetch_requests_defaults_and_nullable_columns():
+    holder = FakeConn()
+    holder.fetchone_rows = {_SQL_REQUESTS_COUNT.format(where=_RANGE): {"total": 1}}
+    holder.fetchall_default = [_row(tokens_in=None, cache_read=None, cache_write=None, latency_ms=None)]
+    ledger = TelemetryLedger("postgresql://fake", conn_factory=_fake_factory(holder))
+
+    payload = await ledger.fetch_requests(FROM_TS, TO_TS)
+
+    count_sql, count_params = _reads(holder)[0]
+    rows_sql, rows_params = _reads(holder)[1]
+    assert count_sql == _SQL_REQUESTS_COUNT.format(where=_RANGE)
+    assert count_params == WINDOW
+    assert "ORDER BY ts DESC NULLS LAST, id DESC" in rows_sql
+    assert rows_params == WINDOW + (100, 0)  # default page size, first page
+    # "Not reported" must stay distinguishable from zero.
+    assert payload["rows"][0]["tokens_in"] is None
+    assert payload["rows"][0]["latency_ms"] is None
+
+
+async def test_fetch_requests_unwhitelisted_sort_and_order_fall_back():
+    holder = FakeConn()
+    holder.fetchone_row = {"total": 0}
+    ledger = TelemetryLedger("postgresql://fake", conn_factory=_fake_factory(holder))
+
+    await ledger.fetch_requests(FROM_TS, TO_TS, sort="ts; DROP TABLE token_usage", order="desc; --")
+
+    sql = _reads(holder)[1][0]
+    assert "DROP" not in sql
+    assert "--" not in sql
+    assert "ORDER BY ts DESC NULLS LAST, id DESC" in sql
+
+
+async def test_fetch_requests_refuses_negative_paging():
+    """The upper clamps are the handler's job, but a negative LIMIT is a SQL
+    error rather than a clamp, so the ledger floors it before it gets there."""
+    holder = FakeConn()
+    holder.fetchone_row = {"total": 0}
+    ledger = TelemetryLedger("postgresql://fake", conn_factory=_fake_factory(holder))
+
+    payload = await ledger.fetch_requests(FROM_TS, TO_TS, limit=-5, offset=-100)
+
+    assert _reads(holder)[1][1][-2:] == (1, 0)
+    assert payload["limit"] == 1
+    assert payload["offset"] == 0
+
+
+# --- read path: facets -------------------------------------------------------
+
+
+async def test_fetch_facets_shapes_all_three_lists():
+    holder = FakeConn()
+    holder.fetchall_rows = {
+        _SQL_FACET_AGENTS: [{"agent_hash": "bucket-1", "requests": 9}],
+        _SQL_FACET_MODELS: [{"provider": "Anthropic", "model": "deepseek-chat", "requests": 8}],
+        _SQL_FACET_PROVIDERS: [
+            {"provider": "Anthropic", "requests": 8},
+            {"provider": "Ollama (local)", "requests": 1},
+        ],
+    }
+    ledger = TelemetryLedger("postgresql://fake", conn_factory=_fake_factory(holder))
+
+    payload = await ledger.fetch_facets(FROM_TS, TO_TS)
+
+    assert payload == {
+        "agents": [{"agent_hash": "bucket-1", "requests": 9}],
+        "models": [{"provider": "Anthropic", "model": "deepseek-chat", "requests": 8}],
+        "providers": [
+            {"provider": "Anthropic", "requests": 8},
+            {"provider": "Ollama (local)", "requests": 1},
+        ],
+    }
+    assert [_reads(holder)[i][1] for i in range(3)] == [WINDOW, WINDOW, WINDOW]
+
+
+# --- read path: series -------------------------------------------------------
+
+
+async def test_fetch_series_uses_the_whitelisted_bucket_queries():
+    holder = FakeConn()
+    holder.fetchall_rows = {
+        _SQL_SERIES_HOUR.format(where=_RANGE): [
+            {
+                "bucket_start": datetime(2026, 9, 2, 3),  # naive: UTC by contract
+                "requests": 5,
+                "tokens_in": 500,
+                "tokens_out": 250,
+                "cache_read": 100,
+                "errors": 1,
+            }
+        ],
+        _SQL_SERIES_DAY.format(where=_RANGE): [],
+    }
+    ledger = TelemetryLedger("postgresql://fake", conn_factory=_fake_factory(holder))
+
+    hourly = await ledger.fetch_series(FROM_TS, TO_TS, "hour")
+    daily = await ledger.fetch_series(FROM_TS, TO_TS, "day")
+
+    assert hourly == {
+        "bucket": "hour",
+        "rows": [
+            {
+                "bucket_start": "2026-09-02T03:00:00Z",
+                "requests": 5,
+                "tokens_in": 500,
+                "tokens_out": 250,
+                "cache_read": 100,
+                "errors": 1,
+            }
+        ],
+    }
+    assert daily == {"bucket": "day", "rows": []}
+    assert _reads(holder)[0][0] == _SQL_SERIES_HOUR.format(where=_RANGE)
+    assert _reads(holder)[1][0] == _SQL_SERIES_DAY.format(where=_RANGE)
+
+
+async def test_fetch_series_rejects_unknown_bucket():
+    holder = FakeConn()
+    ledger = TelemetryLedger("postgresql://fake", conn_factory=_fake_factory(holder))
+
+    with pytest.raises(ValueError):
+        await ledger.fetch_series(FROM_TS, TO_TS, "minute; DROP TABLE token_usage")
+
+    assert holder.executed == []  # rejected before any connection was opened
+
+
+async def test_fetch_series_appends_filters_in_whitelist_order():
+    holder = FakeConn()
+    holder.fetchall_rows = {_SQL_SERIES_HOUR.format(where=_RANGE + " AND agent_hash = %s AND provider = %s"): []}
+    ledger = TelemetryLedger("postgresql://fake", conn_factory=_fake_factory(holder))
+
+    await ledger.fetch_series(FROM_TS, TO_TS, "hour", agent_hash="bucket-1", provider="Anthropic")
+
+    sql, params = _reads(holder)[0]
+    assert sql == _SQL_SERIES_HOUR.format(where=_RANGE + " AND agent_hash = %s AND provider = %s")
+    assert params == WINDOW + ("bucket-1", "Anthropic")
+
+
+# --- read path: count + export ----------------------------------------------
+
+
+async def test_count_requests_returns_the_count():
+    holder = FakeConn()
+    holder.fetchone_rows = {_SQL_REQUESTS_COUNT.format(where=_RANGE + " AND model = %s"): {"total": 1234}}
+    ledger = TelemetryLedger("postgresql://fake", conn_factory=_fake_factory(holder))
+
+    total = await ledger.count_requests(FROM_TS, TO_TS, filters={"model": "deepseek-chat", "limit": 10})
+
+    assert total == 1234
+    assert _reads(holder) == [
+        (_SQL_REQUESTS_COUNT.format(where=_RANGE + " AND model = %s"), WINDOW + ("deepseek-chat",))
+    ]
+    assert holder.closed is True
+
+
+async def test_export_rows_streams_named_cursor_batches():
+    holder = FakeConn()
+    holder.export_batches = [[_row(id=3), _row(id=2)], [_row(id=1)]]
+    ledger = TelemetryLedger("postgresql://fake", conn_factory=_fake_factory(holder))
+
+    batches = [batch async for batch in ledger.export_rows(FROM_TS, TO_TS, batch_size=2)]
+
+    assert [len(batch) for batch in batches] == [2, 1]
+    assert batches[0][0]["ts"] == "2026-09-02T03:04:05Z"  # shaped, JSON-safe
+    assert json.dumps(batches[0][0])
+    assert len(holder.cursors) == 1
+    cursor = holder.cursors[0]
+    assert cursor.name == "telemetry_export"
+    assert cursor.kwargs == {"withhold": True}  # autocommit needs WITH HOLD
+    assert cursor.sizes == [2, 2, 2]  # fetched until the empty batch ended it
+    sql, params = cursor.executed[0]
+    assert sql == _SQL_REQUESTS_EXPORT.format(
+        columns=", ".join(_REQUEST_COLUMNS),
+        where=_RANGE,
+        order_by="ts DESC NULLS LAST, id DESC",
+    )
+    assert params == WINDOW
+    assert cursor.closed is True
+    assert holder.closed is True
+
+
+async def test_export_rows_with_filters_and_empty_result():
+    holder = FakeConn()
+    ledger = TelemetryLedger("postgresql://fake", conn_factory=_fake_factory(holder))
+
+    batches = [
+        batch
+        async for batch in ledger.export_rows(
+            FROM_TS, TO_TS, filters={"agent_hash": "bucket-1", "status": 500, "sort": "ts"}
+        )
+    ]
+
+    assert batches == []
+    cursor = holder.cursors[0]
+    sql, params = cursor.executed[0]
+    assert sql.endswith(_RANGE + " AND agent_hash = %s AND status = %s\nORDER BY ts DESC NULLS LAST, id DESC\n")
+    assert params == WINDOW + ("bucket-1", 500)
+    assert cursor.closed is True
+
+
+async def test_export_rows_closes_cursor_and_connection_on_failure():
+    holder = FakeConn()
+    holder.export_batches = [[_row()]]
+    holder.export_error = RuntimeError("pg vanished mid-stream")
+    ledger = TelemetryLedger("postgresql://fake", conn_factory=_fake_factory(holder))
+
+    with pytest.raises(RuntimeError):
+        async for _ in ledger.export_rows(FROM_TS, TO_TS):
+            pass
+
+    assert holder.cursors[0].closed is True
+    assert holder.closed is True
+
+
+# --- retention (prune) -------------------------------------------------------
+
+
+async def test_prune_deletes_with_the_retention_window():
+    conn = FakeConn()
+    ledger = TelemetryLedger("postgresql://fake", retention_days=30, conn_factory=_fake_factory(conn))
+
+    await ledger.prune()
+
+    assert conn.executed == [(_SQL_PRUNE, (30,))]
+    assert conn.autocommit is True
+    assert conn.closed is True  # short-lived: never the writer's connection
+    assert ledger.retention_days == 30
+
+
+def test_retention_defaults_and_floor():
+    assert TelemetryLedger("postgresql://fake").retention_days == 90
+    # A zero/negative retention would delete everything; the ledger floors it.
+    assert TelemetryLedger("postgresql://fake", retention_days=0).retention_days == 1
+
+
+async def test_prune_swallows_failures(caplog):
+    async def boom(dsn):
+        raise ConnectionError("pg down")
+
+    ledger = TelemetryLedger("postgresql://fake", conn_factory=boom)
+    with caplog.at_level(logging.DEBUG, logger="hivemind.telemetry.ledger"):
+        await ledger.prune()  # must not raise (D10)
+
+    assert any("prune failed" in r.getMessage() for r in caplog.records)
+
+
+async def test_pruner_runs_on_connect_then_stops_on_shutdown(monkeypatch):
+    monkeypatch.setattr("hivemind.telemetry.ledger._PRUNE_INTERVAL_S", 0.01)
+    pool = FakePool()
+    ledger = TelemetryLedger("postgresql://fake", conn_factory=pool)
+
+    await ledger.connect()
+    for _ in range(200):  # the first pass is immediate; the loop then repeats
+        if pool.prunes() >= 2:
+            break
+        await asyncio.sleep(0.01)
+    assert pool.prunes() >= 2
+    assert ledger._pruner is not None
+
+    await ledger.shutdown()
+
+    assert ledger._pruner is None
+    assert ledger._closed is True
+    prunes_at_shutdown = pool.prunes()
+    for _ in range(5):
+        await asyncio.sleep(0.01)
+    assert pool.prunes() == prunes_at_shutdown  # cancelled: no further deletes
+
+
+async def test_prune_interval_is_a_day_by_default():
+    assert _PRUNE_INTERVAL_S == 24 * 60 * 60
+
+
+# --- real Postgres (MESH_TEST_DSN) -------------------------------------------
+
+_PG_TAG = "ledger-pgtest"
 
 
 @pytest.mark.asyncio
@@ -465,24 +973,83 @@ async def test_schema_ddl_executes_against_real_postgres():
     """Regression: the view DDL used round(double precision, integer) which
     does not exist in Postgres — every connect failed at ensure_schema and
     the fail-open swallow silently dropped all telemetry (2026-09-03).
-    With MESH_TEST_DSN set this proves the full DDL (tables + view) parses
-    and a row round-trips."""
-    import os
+    With MESH_TEST_DSN set this proves the full DDL (tables + view) parses,
+    that a row round-trips through the Phase 2 readers (requests page +
+    streamed export over a real named cursor), and that pruning deletes by
+    age only."""
+    import psycopg
 
-    ledger = TelemetryLedger(os.environ["MESH_TEST_DSN"])
+    dsn = os.environ["MESH_TEST_DSN"]
+    fresh_tag, old_tag = f"{_PG_TAG}-fresh", f"{_PG_TAG}-old"
+    now = datetime.now(timezone.utc)
+
+    async def _cleanup() -> None:
+        conn = await psycopg.AsyncConnection.connect(dsn)
+        try:
+            await conn.set_autocommit(True)
+            for tag in (fresh_tag, old_tag):
+                await conn.execute("DELETE FROM mesh_telemetry.token_usage WHERE agent_hash = %s", (tag,))
+        finally:
+            await conn.close()
+
+    await _cleanup()  # a previous failed run must not pollute the assertions
+    ledger = TelemetryLedger(dsn)
     await ledger.connect()
-    await ledger.record(
-        {
-            "agent_hash": "ddl-test",
-            "provider": "Anthropic",
-            "model": "ddl-model",
-            "tokens_in": 100,
-            "tokens_out": 50,
-            "latency_ms": 2.0,
-            "status": 200,
-        }
-    )
-    await asyncio.sleep(1.5)
-    rows = await ledger.fetch_dashboard(days=1)
-    assert isinstance(rows, dict) and "error" not in rows  # live view queried
-    await ledger.shutdown()
+    try:
+        await ledger.record(
+            {
+                "agent_hash": fresh_tag,
+                "provider": "Anthropic",
+                "model": "ddl-model",
+                "tokens_in": 100,
+                "tokens_out": 50,
+                "latency_ms": 2.0,
+                "status": 200,
+            }
+        )
+        await ledger.record(
+            {
+                "agent_hash": old_tag,
+                "provider": "Anthropic",
+                "model": "ddl-model",
+                "tokens_in": 10,
+                "tokens_out": 5,
+                "status": 200,
+            }
+        )
+        await asyncio.sleep(1.5)  # let the write queue drain
+
+        payload = await ledger.fetch_overview(now - timedelta(days=1), now)
+        assert isinstance(payload, dict) and "error" not in payload  # live view queried
+
+        page = await ledger.fetch_requests(now - timedelta(days=1), now, agent_hash=fresh_tag)
+        assert page["total"] == 1
+        assert page["rows"][0]["agent_hash"] == fresh_tag
+        assert page["rows"][0]["ts"].endswith("Z")
+
+        # Streamed export over a real WITH HOLD cursor: one shaped row, then
+        # an empty batch (the cursor loop must terminate on it).
+        batches = [
+            batch async for batch in ledger.export_rows(now - timedelta(days=1), now, filters={"agent_hash": fresh_tag})
+        ]
+        assert [row["agent_hash"] for batch in batches for row in batch] == [fresh_tag]
+
+        # Prune by age: backdate the old row past the retention, then the
+        # data that is too old goes and the fresh row stays.
+        conn = await psycopg.AsyncConnection.connect(dsn)
+        try:
+            await conn.set_autocommit(True)
+            await conn.execute(
+                "UPDATE mesh_telemetry.token_usage SET ts = now() - interval '120 days' WHERE agent_hash = %s",
+                (old_tag,),
+            )
+        finally:
+            await conn.close()
+
+        await TelemetryLedger(dsn, retention_days=90).prune()
+
+        assert await ledger.count_requests(now - timedelta(days=200), now, filters={"agent_hash": old_tag}) == 0
+        assert await ledger.count_requests(now - timedelta(days=200), now, filters={"agent_hash": fresh_tag}) == 1
+    finally:
+        await ledger.shutdown()
+        await _cleanup()
