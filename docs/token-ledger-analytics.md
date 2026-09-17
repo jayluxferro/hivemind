@@ -292,3 +292,95 @@ Numbering continues; entries 1–12 are the backend's and are unchanged.
     tooltips; a hover-only layer is unreachable without a mouse, so every target that
     paints a tooltip or performs a drill-down is focusable. Sortable `th`s keep the
     `th` role and use `tabindex` + `aria-sort` rather than becoming buttons.
+
+Appended by the "no-flicker" pass (`static/charts.js`, `static/dashboard.js`,
+`static/dashboard.css`).  The requirement was that an auto-refresh animate the page
+rather than blank it.  Numbering continues.
+
+27. **A refresh morphs; only a first load or a view switch rebuilds.** `render()` now
+    dims `#main` only when it is empty, and cards are reused by key. Cards created by
+    a switch get a `.card-in` fade-slide; a same-view refresh touches no card
+    structure at all. The old whole-main opacity dim was a first-load affordance
+    that had been doing duty as a refresh affordance too, which is the flicker the
+    requirement is about.
+28. **Builders emit a pure-data `plan`; one `renderScene` decides build or morph.**
+    The plan is the shared truth between both paths. Two independent layout paths
+    (one drawing, one updating) drift the moment either is edited, and the drift is
+    invisible until a chart is subtly wrong mid-animation. Cost: every builder now
+    has a plan-shape contract to keep.
+29. **The structural key is "everything that changes mark *count*", and nothing
+    else.** Values, labels, hues, tooltip rows and drill targets may all differ under
+    a stable key; a changed series list, bucket count or row count may not.
+    Getting this wrong is silent in both directions — too coarse and marks land on
+    the wrong rows, too fine and every tick rebuilds. `renderScene` therefore also
+    refuses to morph when `plan.length` disagrees with the node count and rebuilds
+    instead of mis-aligning.
+30. **Mark count is a function of the key, which forced two visual non-changes.**
+    The first draft skipped zero-value stacked segments and omitted axis labels it
+    had nothing to say for — both make the DOM shape depend on the *data*, so every
+    refresh with a new value was structurally different and had to rebuild. Zero
+    segments are now emitted at height 0 and conditional labels are emitted blank.
+    Pixel output is unchanged; the count is now stable. This was the single largest
+    source of "flicker" and it was invisible until the key was written down.
+31. **Interaction payloads live on the node and are read at event time.**
+    `node._tip` / `_activate` / `_move` / `_leave` are re-pointed by the morph, and
+    the listener reads the slot when it fires. A closure captured per render would
+    leave a hover target describing last refresh's row — a tooltip that is wrong
+    rather than missing — and re-binding per render would stack listeners.
+32. **Geometry glides in CSS; `x1/x2/y1/y2` snap.** `x`, `y`, `width` and `height`
+    are CSS properties on `<rect>`/`<text>` in SVG 2 and interpolate, so bars,
+    columns and stacked segments grow and shrink smoothly. On `<line>` the
+    `x1/x2/y1/y2` pair is an attribute in several engines and jumps. Accepted:
+    gridlines and the crosshair move instantly while the marks the eye tracks
+    glide. Driving them in JS would mean a rAF timeline per mark, which is the
+    machinery this file deliberately does not carry.
+33. **`tweenText(el, fromNum, toNum, fmt)` takes raw numbers plus a formatter.** The
+    brief offered "pass raw+formatted or parse back"; parsing `"1,234"` into a number
+    in order to animate it is inventing data out of presentation, so the raw value
+    travels alongside its formatter and the formatter is the only thing that ever
+    makes text. `node._num` holds the live mid-tween value, so a tween interrupted by
+    a newer one resumes from the digits actually on screen; `fromNum` is only the
+    fallback for an element that has never tweened.
+34. **The rAF id is kept in a `WeakMap` and cancelled before a new tween starts.** A
+    leaked frame from the previous render would otherwise land last render's number
+    after this one, and it would be the *final* write. Tweening is skipped entirely
+    for a null value, under reduced motion, for a hidden element, or with no rAF
+    available — those write the final text and stop. `_num` and the WeakMap key are
+    the same element, so both die with it.
+35. **Tables update per cell and flash only the cells that changed**, compared
+    before writing. Rows added to fill a longer page do not flash: every cell in
+    them is new, so a flash carries no information. A header change rebuilds with a
+    fade-in, because column identity is what the table *is*.
+36. **Enter animations are classes removed on a timer, not on `animationend`.** An
+    element that never fires `animationend` — because it left the document first —
+    would otherwise keep `.card-in` forever and re-animate the next time it was
+    shown. The timer is the only exit that always runs.
+37. **Reduced motion is honoured twice, in the two places motion lives.** JS:
+    `prefersReducedMotion()` makes tweens snap, skips enter animations and skips the
+    cell flash. CSS: a `@media (prefers-reduced-motion: reduce)` block turns off
+    every transition and animation with `!important`. The CSS override alone would
+    leave the rAF loops running invisibly; the JS gate alone would leave the CSS
+    transitions live, and the geometry morph is entirely CSS.
+38. **Flicker is not only visual: a picker rebuilds only when what it *shows*
+    changes** (`optionsSig`), so an open `<select>` stays open and a focused button
+    stays focused across a 15 s tick. Re-creating the control closes the dropdown
+    under the operator's hand mid-choice — worse than the repaint this whole path
+    exists to avoid.
+39. **Card order is re-asserted with `appendChild`, never by rebuilding.** Appending
+    an attached node moves it, so order costs nothing and destroys nothing. The DOM
+    stand-in used for verification had to model that move semantics faithfully: one
+    that pushed a duplicate would have reported a bug that does not exist while
+    hiding the ones that do, and it is now also asserted that a node's `parentNode`
+    chain still reaches `#main` after a refresh (a wipe-and-repaint would leave
+    *some* node there, just not that one).
+40. **Axis tick text and legend labels update instantly — a deliberate exception.**
+    Tweening a tick label would pass it through intermediate numbers that read as
+    data (`5,000` on its way from `4,213`), which is a worse lie than a number that
+    appears. Only tile values, whose interpolation is unambiguous, animate as text.
+41. **Not everything could be verified in a browser.** The verification harness is a
+    small DOM stand-in plus `vm`, run over the four views, a hostile model name and a
+    simulated refresh; it proves the code paths and the mark identities, not the
+    paint. The CSS transition claims (`x/y/width/height` interpolating on SVG) rest
+    on the SVG 2 spec and are asserted at the byte level in
+    `test_telemetry_dashboard.py` (`transition:`, `prefers-reduced-motion`), not
+    observed. Flagged rather than papered over.

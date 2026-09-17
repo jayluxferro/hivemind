@@ -458,40 +458,203 @@
     }
   }
 
-  /* ============ small view helpers ============ */
+  /* =====================================================================
+   * in-place view mounting
+   *
+   * A refresh must not tear the page down. Cards are reused by key across
+   * renders of the same view, and the content inside a card lives in named
+   * "slots" that also survive a render. A slot is the stable holder that
+   * charts.js and dataTable() hang their own registries on, which is how a
+   * refresh finds the previous marks and morphs them instead of rebuilding.
+   *
+   * Only a real structural change rebuilds: a different view (all new cards),
+   * or a slot this frame no longer wants. Both are worth a fade.
+   * =================================================================== */
   function clear(node) {
     while (node.firstChild) node.removeChild(node.firstChild);
   }
 
   function viewCard(title, sub) {
     const card = el("section", "card");
-    card.appendChild(el("h2", null, title));
-    if (sub) card.appendChild(el("p", "sub", sub));
+    const heading = el("h2", null, title);
+    // The sub-line is always in the DOM and hidden when blank, so re-using a
+    // card never has to add or remove a node to change its wording.
+    const blurb = el("p", "sub", sub || "");
+    blurb.hidden = !sub;
+    card.appendChild(heading);
+    card.appendChild(blurb);
+    // Kept by reference rather than by walking firstChild/nextSibling: a
+    // card's own two nodes are not a structural assumption worth making.
+    card._heading = heading;
+    card._blurb = blurb;
     return card;
   }
 
-  function tilesInto(holder, defs) {
-    const tiles = el("div", "tiles");
-    for (const d of defs) {
-      const tile = el("div", "tile");
-      tile.appendChild(el("div", "label", d.label));
-      tile.appendChild(el("div", "value", d.value));
-      if (d.title) tile.title = d.title;
-      tiles.appendChild(tile);
+  // A stable child of #main that is not a card: the overview's summary tiles.
+  // Created once and never rebuilt, so the tiles keep their nodes — and the
+  // numbers being tweened inside them — across refreshes.
+  function headSlot(main) {
+    if (!main._head) {
+      main._head = el("div");
+      main.insertBefore(main._head, main.firstChild);
     }
-    holder.appendChild(tiles);
-    return tiles;
+    return main._head;
+  }
+
+  function slot(card, key, cls) {
+    const slots = card._slots || (card._slots = new Map());
+    let node = slots.get(key);
+    if (!node) {
+      node = el("div", cls || null);
+      slots.set(key, node);
+      card.appendChild(node);
+    }
+    card._used = card._used || new Set();
+    card._used.add(key);
+    return node;
+  }
+
+  // A slot holding a line of text ("nothing in this window", the metadata note).
+  function message(card, key, text, cls) {
+    const holder = slot(card, key || "msg", cls || "empty");
+    if (holder.textContent !== text) holder.textContent = text;
+    return holder;
+  }
+
+  function beginCard(card) {
+    card._used = new Set();
+  }
+
+  function endCard(card) {
+    if (!card._slots) return;
+    for (const [key, node] of Array.from(card._slots)) {
+      if (card._used && card._used.has(key)) continue;
+      clear(node);
+      if (node.parentNode) node.parentNode.removeChild(node);
+      card._slots.delete(key);
+    }
+    card._used = new Set();
+  }
+
+  /* Cards are handed out by key, in the order they are asked for. `end()`
+   * removes the ones this frame did not want and re-asserts the order —
+   * appendChild moves a node rather than cloning it, so ordering costs
+   * nothing and destroys nothing. */
+  function cardSet(main, view) {
+    const prev = main._cards;
+    const reuse = !!(prev && prev.view === view);
+    if (!reuse) {
+      clear(main);
+      main._head = null;
+    }
+    const map = reuse ? prev.map : new Map();
+    const used = [];
+    main._cards = { view: view, map: map };
+
+    return {
+      card(key, title, sub) {
+        let entry = map.get(key);
+        if (entry) {
+          if (entry.heading.textContent !== title) entry.heading.textContent = title;
+          const blurb = sub || "";
+          if (entry.blurb.textContent !== blurb) entry.blurb.textContent = blurb;
+          entry.blurb.hidden = !sub;
+        } else {
+          const card = viewCard(title, sub);
+          entry = { card: card, heading: card._heading, blurb: card._blurb };
+          map.set(key, entry);
+          // A card that was not there a moment ago arrives rather than appears.
+          // Only a view switch or a first load creates one, which is exactly
+          // when the page is allowed to look like it changed.
+          C.fadeIn(card, "card-in");
+        }
+        beginCard(entry.card);
+        used.push(entry.card);
+        return entry.card;
+      },
+      end() {
+        for (const [key, entry] of Array.from(map)) {
+          if (used.indexOf(entry.card) >= 0) continue;
+          clear(entry.card);
+          if (entry.card.parentNode) entry.card.parentNode.removeChild(entry.card);
+          map.delete(key);
+        }
+        for (const card of used) endCard(card);
+        for (const card of used) main.appendChild(card);
+      },
+    };
+  }
+
+  /* A picker row whose <select> is rebuilt only when its option list actually
+   * changes. Re-creating a select on every tick would close it under the
+   * operator's hand mid-choice — a worse flicker than the repaint this whole
+   * path exists to avoid. The build callback owns everything inside the slot,
+   * including any node it caches on the holder (`_drill`), because a rebuild
+   * wipes the slot. */
+  function optionsSig(list, map) {
+    const out = [];
+    for (const item of list || []) out.push(String(map(item)));
+    return out.join("|");
+  }
+
+  function optionsSlot(card, key, sig, cls, build) {
+    const holder = slot(card, key, cls || "picker");
+    if (holder._sig !== sig) {
+      clear(holder);
+      holder._sig = sig;
+      build(holder);
+    }
+    return holder;
+  }
+
+  // A metric that is absent stays absent: null renders as the em dash it
+  // deserves and does not tween, because there is no number to count from.
+  function num(v) {
+    return typeof v === "number" && isFinite(v) ? v : null;
+  }
+
+  /* Tiles update in place, keyed by label, with the number tweened from
+   * whatever is currently on screen. The raw number goes in with its
+   * formatter: parsing a formatted string back into a number in order to
+   * animate it would be inventing data out of presentation. */
+  function renderTiles(holder, defs) {
+    const map = holder._tiles || (holder._tiles = new Map());
+    const used = [];
+    for (const d of defs) {
+      let entry = map.get(d.label);
+      if (!entry) {
+        const tile = el("div", "tile");
+        const label = el("div", "label", d.label);
+        const value = el("div", "value", "");
+        tile.appendChild(label);
+        tile.appendChild(value);
+        entry = { tile: tile, value: value, num: null };
+        map.set(d.label, entry);
+        C.fadeIn(tile);
+      }
+      if (d.title) entry.tile.title = d.title;
+      C.tweenText(entry.value, entry.num, d.value, d.fmt);
+      entry.num = d.value;
+      used.push(entry.tile);
+    }
+    for (const [label, entry] of Array.from(map)) {
+      if (used.indexOf(entry.tile) >= 0) continue;
+      holder.removeChild(entry.tile);
+      map.delete(label);
+    }
+    for (const tile of used) holder.appendChild(tile);
   }
 
   function totalsTiles(holder, t) {
-    tilesInto(holder, [
-      { label: "Requests", value: C.fmtInt(t.requests) },
-      { label: "Tokens in", value: C.fmtInt(t.tokens_in) },
-      { label: "Tokens out", value: C.fmtInt(t.tokens_out) },
-      { label: "Cache reads", value: C.fmtTokens(t.cache_read) },
+    renderTiles(holder, [
+      { label: "Requests", value: num(t.requests), fmt: C.fmtInt },
+      { label: "Tokens in", value: num(t.tokens_in), fmt: C.fmtInt },
+      { label: "Tokens out", value: num(t.tokens_out), fmt: C.fmtInt },
+      { label: "Cache reads", value: num(t.cache_read), fmt: C.fmtTokens },
       {
         label: "Error rate",
-        value: C.fmtPct(t.error_rate),
+        value: num(t.error_rate),
+        fmt: C.fmtPct,
         title: C.fmtInt(t.errors) + " of " + C.fmtInt(t.requests) + " requests returned status >= 400",
       },
     ]);
@@ -512,17 +675,11 @@
     main.appendChild(box);
   }
 
-  function empty(text) {
-    return el("p", "empty", text);
-  }
-
-  // Every drill-down link on the page is a real anchor so it can be copied,
-  // opened in a new tab, or followed with the keyboard.
-  function drillLink(label, target) {
-    const a = el("a", null, label);
-    a.href = buildHash(target);
-    return a;
-  }
+  /* Every drill-down link on the page is a real anchor so it can be copied,
+   * opened in a new tab, or followed with the keyboard. They are built inline
+   * where they are used rather than by a helper, because each one is now
+   * re-pointed on every frame (href and hidden both depend on the current
+   * state) rather than created fresh. */
 
   /* ============ dropdown helpers ============ */
   function selectBox(id, options, current, onChange) {
@@ -645,7 +802,7 @@
     return names.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
   }
 
-  function renderOverview(payload, st, main) {
+  function renderOverview(payload, st, main, cards) {
     const totals = payload.totals || {};
     const daily = payload.daily_agents || [];
     const models = payload.top_models || [];
@@ -657,20 +814,23 @@
     C.setEntityOrder("agent", agentOrder(daily));
     C.setEntityOrder("provider", providerOrder(payload));
 
-    totalsTiles(main, totals);
+    totalsTiles(headSlot(main), totals);
 
     if (!totals.requests && !daily.length && !models.length) {
-      const card = viewCard("No telemetry yet");
-      card.appendChild(empty("No telemetry in this window yet. Widen the range above, or check that the proxy is writing to a ledger (--telemetry-dsn)."));
-      main.appendChild(card);
+      const card = cards.card("empty", "No telemetry yet");
+      message(
+        card,
+        "msg",
+        "No telemetry in this window yet. Widen the range above, or check that the proxy is writing to a ledger (--telemetry-dsn).",
+      );
       return;
     }
 
     // --- status codes: a category, so one muted hue and no legend ---------
     if (statuses.length) {
-      const card = viewCard("Status codes", "Every response status seen in this window. Status is a category, not an entity — it never takes a series hue.");
+      const card = cards.card("status", "Status codes", "Every response status seen in this window. Status is a category, not an entity — it never takes a series hue.");
       const total = statuses.reduce((acc, r) => acc + (r.requests || 0), 0);
-      C.bars(card, "Responses by status", statuses, {
+      C.bars(slot(card, "chart"), "Responses by status", statuses, {
         labelKey: "status",
         valueKey: "requests",
         labelW: 120,
@@ -684,7 +844,7 @@
         onRowClick: (r) => navigate(Object.assign({}, st, { view: "requests", status: r.status, page: 1 })),
       });
       dataTable(
-        card,
+        slot(card, "table"),
         "Same data as the chart above. Click a bar to open that status in the requests view.",
         ["Status", "Requests", "Share"],
         statuses.map((r) => [
@@ -693,23 +853,23 @@
           { text: total > 0 ? C.fmtPct((r.requests || 0) / total) : "—" },
         ]),
       );
-      main.appendChild(card);
     }
 
     // --- daily per-agent stack -------------------------------------------
-    const dailyCard = viewCard(
+    const dailyCard = cards.card(
+      "daily",
       "Daily usage per agent",
       "Tokens per day, stacked by agent (top 5 by window tokens; the rest fold into “Other”). " +
         "The provider dimension is not charted — mid-pipeline upstreams all detect as one profile. " +
         "Click a segment to open that agent's requests.",
     );
     if (daily.length) {
-      C.stackedDaily(dailyCard, "Tokens per day", daily, "day", {
+      C.stackedDaily(slot(dailyCard, "chart"), "Tokens per day", daily, "day", {
         onSegmentClick: (rawHash) => navigate(Object.assign({}, st, { view: "requests", agent: rawHash, page: 1 })),
       });
       const rows = daily.slice().sort((a, b) => (b.day < a.day ? -1 : b.day > a.day ? 1 : 0));
       dataTable(
-        dailyCard,
+        slot(dailyCard, "table"),
         "Same data as the chart above.",
         ["Day", "Agent (hash)", "Requests", "Tokens in", "Tokens out", "Errors"],
         rows.map((r) => [
@@ -722,12 +882,12 @@
         ]),
       );
     } else {
-      dailyCard.appendChild(empty("No telemetry in this window yet."));
+      message(dailyCard, "msg", "No telemetry in this window yet.");
     }
-    main.appendChild(dailyCard);
 
     // --- top models -------------------------------------------------------
-    const modelCard = viewCard(
+    const modelCard = cards.card(
+      "models",
       "Top models by tokens",
       "Ranked by tokens consumed, not cost — cache reads are the actionable signal for multi-agent " +
         "runs (a low hit rate means repeated full-context sends). Click a row to open that model.",
@@ -736,7 +896,7 @@
       const rows = models.map((m) =>
         Object.assign({}, m, { tokens: (m.tokens_in || 0) + (m.tokens_out || 0) }),
       );
-      C.bars(modelCard, "Tokens by model", rows, {
+      C.bars(slot(modelCard, "chart"), "Tokens by model", rows, {
         labelKey: "model",
         valueKey: "tokens",
         colorKey: "provider",
@@ -752,7 +912,7 @@
         onRowClick: (m) => navigate(Object.assign({}, st, { view: "models", model: m.model, page: 1 })),
       });
       dataTable(
-        modelCard,
+        slot(modelCard, "table"),
         "Same data as the chart above.",
         ["Model", "Provider", "Requests", "Tokens in", "Tokens out", "Cache reads", "Cache hit"],
         rows.map((m) => [
@@ -766,33 +926,32 @@
         ]),
       );
     } else {
-      modelCard.appendChild(empty("No requests in this window."));
+      message(modelCard, "msg", "No requests in this window.");
     }
-    main.appendChild(modelCard);
 
     // --- latency ----------------------------------------------------------
-    const latCard = viewCard("Latency by provider", "Response latency p50/p95 — two series, one scale.");
+    const latCard = cards.card("latency", "Latency by provider", "Response latency p50/p95 — two series, one scale.");
     if (latency.length) {
-      C.latencyChart(latCard, latency, { nameKey: "provider" });
+      C.latencyChart(slot(latCard, "chart"), latency, { nameKey: "provider" });
       dataTable(
-        latCard,
+        slot(latCard, "table"),
         "Same data as the chart above.",
         ["Provider", "Requests", "p50", "p95"],
         latency.map((l) => [l.provider, C.fmtInt(l.requests), C.fmtMs(l.p50_ms), C.fmtMs(l.p95_ms)]),
       );
     } else {
-      latCard.appendChild(empty("No latency rows in this window."));
+      message(latCard, "msg", "No latency rows in this window.");
     }
-    main.appendChild(latCard);
 
-    const latModelCard = viewCard(
+    const latModelCard = cards.card(
+      "latency-models",
       "Latency by model",
       "The same two percentiles per model, slowest p95 first (top 15 by p95).",
     );
     if (latencyModels.length) {
-      C.latencyChart(latModelCard, latencyModels, { nameKey: "model" });
+      C.latencyChart(slot(latModelCard, "chart"), latencyModels, { nameKey: "model" });
       dataTable(
-        latModelCard,
+        slot(latModelCard, "table"),
         "Same data as the chart above.",
         ["Model", "Provider", "Requests", "p50", "p95"],
         latencyModels.map((l) => [
@@ -804,12 +963,12 @@
         ]),
       );
     } else {
-      latModelCard.appendChild(empty("No latency rows in this window."));
+      message(latModelCard, "msg", "No latency rows in this window.");
     }
-    main.appendChild(latModelCard);
 
     // --- per-agent totals -------------------------------------------------
-    const agentCard = viewCard(
+    const agentCard = cards.card(
+      "agents",
       "Per-agent totals",
       "Agent hashes are rate-limit bucket labels only — identities are never stored. " +
         "Cache hit = tokens served from cache over total input.",
@@ -832,15 +991,14 @@
         label: "Open requests for agent " + a.agent_hash,
       }));
       dataTable(
-        agentCard,
+        slot(agentCard, "table"),
         "One row per agent hash. Select a row to open its requests.",
         ["Agent (hash)", "Requests", "Tokens in", "Tokens out", "Cache reads", "Cache hit", "Error rate"],
         rows,
       );
     } else {
-      agentCard.appendChild(empty("No requests in this window."));
+      message(agentCard, "msg", "No requests in this window.");
     }
-    main.appendChild(agentCard);
   }
 
   /* =====================================================================
@@ -878,10 +1036,14 @@
     return payload.bucket === "hour" || payload.bucket === "day" ? payload.bucket : requested;
   }
 
-  function seriesSection(card, title, rows, pick, bucket, valueFmt, valueLabel) {
-    C.singleSeries(card, title, rows, pick, { bucket: bucket, valueFmt: valueFmt, valueLabel: valueLabel });
+  function seriesSection(card, key, title, rows, pick, bucket, valueFmt, valueLabel) {
+    C.singleSeries(slot(card, key + "-chart"), title, rows, pick, {
+      bucket: bucket,
+      valueFmt: valueFmt,
+      valueLabel: valueLabel,
+    });
     dataTable(
-      card,
+      slot(card, key + "-table"),
       "Same data as the chart above.",
       ["Bucket (UTC)", "Requests", "Tokens in", "Tokens out", "Cache reads", "Errors"],
       rows.map((r) => [
@@ -895,45 +1057,58 @@
     );
   }
 
-  async function renderAgents(st, main) {
+  async function renderAgents(st, main, cards) {
     const facets = await loadFacets(st);
-    const card = viewCard("Agent activity");
-    const picker = el("div", "picker");
-    const label = el("label", null, "Agent");
-    label.setAttribute("for", "agent-picker");
-    picker.appendChild(label);
-    const options = [{ value: "", label: "— pick an agent —" }];
-    for (const a of facets.agents || []) {
-      options.push({
-        value: a.agent_hash,
-        label: C.shortHash(a.agent_hash) + " — " + C.fmtInt(a.requests) + " requests",
-        title: a.agent_hash,
-      });
-    }
-    picker.appendChild(
-      selectBox("agent-picker", options, st.agent || "", (value) => apply({ agent: value, page: 1 })),
+    const card = cards.card("activity", "Agent activity");
+
+    const picker = optionsSlot(
+      card,
+      "agent-picker",
+      st.agent + "::" + optionsSig(facets.agents, (a) => a.agent_hash + "~" + a.requests),
+      "picker",
+      (host) => {
+        const label = el("label", null, "Agent");
+        label.setAttribute("for", "agent-picker-select");
+        host.appendChild(label);
+        const options = [{ value: "", label: "— pick an agent —" }];
+        for (const a of facets.agents || []) {
+          options.push({
+            value: a.agent_hash,
+            label: C.shortHash(a.agent_hash) + " — " + C.fmtInt(a.requests) + " requests",
+            title: a.agent_hash,
+          });
+        }
+        host.appendChild(
+          selectBox("agent-picker-select", options, st.agent || "", (value) => apply({ agent: value, page: 1 })),
+        );
+        const link = el("a");
+        host.appendChild(link);
+        host._drill = link;
+      },
     );
-    if (st.agent) {
-      picker.appendChild(drillLink("View requests →", Object.assign({}, st, { view: "requests", page: 1 })));
-    }
-    card.appendChild(picker);
-    main.appendChild(card);
+    // Re-pointed every frame: the state the link was built with can be several
+    // refreshes old, and it is the *current* filters the drill-down must carry.
+    picker._drill.textContent = "View requests →";
+    picker._drill.href = buildHash(Object.assign({}, st, { view: "requests", page: 1 }));
+    picker._drill.hidden = !st.agent;
 
     if (!st.agent) {
-      card.appendChild(empty("Pick an agent to see its activity over time. The list is busiest-first for the selected range."));
+      message(card, "msg", "Pick an agent to see its activity over time. The list is busiest-first for the selected range.");
       return;
     }
 
-    const sub = el("p", "sub");
-    sub.appendChild(document.createTextNode("Agent "));
-    const hashEl = el("span", "agent-hash", st.agent);
-    sub.appendChild(hashEl);
-    sub.appendChild(
-      document.createTextNode(
-        " — a rate-limit bucket label, never an identity. Granularity follows the range: hourly up to two weeks, daily beyond it.",
-      ),
-    );
-    card.appendChild(sub);
+    const sub = slot(card, "sub", "sub");
+    if (sub._agent !== st.agent) {
+      clear(sub);
+      sub.appendChild(document.createTextNode("Agent "));
+      sub.appendChild(el("span", "agent-hash", st.agent));
+      sub.appendChild(
+        document.createTextNode(
+          " — a rate-limit bucket label, never an identity. Granularity follows the range: hourly up to two weeks, daily beyond it.",
+        ),
+      );
+      sub._agent = st.agent;
+    }
 
     const requested = autoBucket(st);
     const payload = await apiGet("/_telemetry/series", seriesParams(st, { agent_hash: st.agent }, requested));
@@ -941,15 +1116,16 @@
     const bucket = effectiveBucket(payload, requested);
 
     if (!rows.length) {
-      card.appendChild(empty("No telemetry in this window yet."));
+      message(card, "msg", "No telemetry in this window yet.");
       return;
     }
 
     const totals = sumSeries(rows);
-    totalsTiles(card, totals);
-    seriesSection(card, "Requests per " + bucket, rows, (r) => r.requests, bucket, C.fmtInt, "requests");
+    totalsTiles(slot(card, "tiles", "tiles"), totals);
+    seriesSection(card, "requests", "Requests per " + bucket, rows, (r) => r.requests, bucket, C.fmtInt, "requests");
     seriesSection(
       card,
+      "tokens",
       "Tokens per " + bucket,
       rows,
       (r) => (r.tokens_in || 0) + (r.tokens_out || 0),
@@ -962,38 +1138,52 @@
   /* =====================================================================
    * #/models
    * =================================================================== */
-  async function renderModels(st, main) {
+  async function renderModels(st, main, cards) {
     const payload = await apiGet("/_telemetry/data", rangeParams(st));
     const models = payload.top_models || [];
     const latencyModels = payload.latency_models || [];
 
     C.setEntityOrder("provider", providerOrder(payload));
 
-    const card = viewCard("Models", "Tokens, cache reuse and latency per model. Click a model to see its activity over time.");
+    const card = cards.card(
+      "models",
+      "Models",
+      "Tokens, cache reuse and latency per model. Click a model to see its activity over time.",
+    );
     // The picker is always present (not just once something is selected) —
     // otherwise the only way into the per-model series is clicking a bar.
-    const picker = el("div", "picker");
-    const label = el("label", null, "Model");
-    label.setAttribute("for", "model-picker");
-    picker.appendChild(label);
-    const options = [{ value: "", label: "— pick a model —" }];
-    for (const m of models) options.push({ value: m.model, label: m.model, title: m.model });
-    if (st.model && !models.some((m) => m.model === st.model)) {
-      // A link into a model the current window does not rank must still render
-      // — and must still be escapable.
-      options.push({ value: st.model, label: st.model, title: st.model });
-    }
-    picker.appendChild(selectBox("model-picker", options, st.model || "", (value) => apply({ model: value, page: 1 })));
-    if (st.model) {
-      picker.appendChild(drillLink("View requests →", Object.assign({}, st, { view: "requests", page: 1 })));
-    }
-    card.appendChild(picker);
-    main.appendChild(card);
+    const picker = optionsSlot(
+      card,
+      "model-picker",
+      st.model + "::" + optionsSig(models, (m) => m.model),
+      "picker",
+      (host) => {
+        const label = el("label", null, "Model");
+        label.setAttribute("for", "model-picker-select");
+        host.appendChild(label);
+        const options = [{ value: "", label: "— pick a model —" }];
+        for (const m of models) options.push({ value: m.model, label: m.model, title: m.model });
+        if (st.model && !models.some((m) => m.model === st.model)) {
+          // A link into a model the current window does not rank must still
+          // render — and must still be escapable.
+          options.push({ value: st.model, label: st.model, title: st.model });
+        }
+        host.appendChild(
+          selectBox("model-picker-select", options, st.model || "", (value) => apply({ model: value, page: 1 })),
+        );
+        const link = el("a");
+        host.appendChild(link);
+        host._drill = link;
+      },
+    );
+    picker._drill.textContent = "View requests →";
+    picker._drill.href = buildHash(Object.assign({}, st, { view: "requests", page: 1 }));
+    picker._drill.hidden = !st.model;
 
     // --- tokens by model (click = select, click again = clear) ------------
     if (models.length) {
       const rows = models.map((m) => Object.assign({}, m, { tokens: (m.tokens_in || 0) + (m.tokens_out || 0) }));
-      C.bars(card, "Tokens by model", rows, {
+      C.bars(slot(card, "chart"), "Tokens by model", rows, {
         labelKey: "model",
         valueKey: "tokens",
         colorKey: "provider",
@@ -1008,7 +1198,7 @@
         onRowClick: (m) => apply({ model: st.model === m.model ? null : m.model, page: 1 }),
       });
       dataTable(
-        card,
+        slot(card, "table"),
         "Same data as the chart above.",
         ["Model", "Provider", "Requests", "Tokens in", "Tokens out", "Cache reads"],
         rows.map((m) => [
@@ -1021,11 +1211,12 @@
         ]),
       );
     } else {
-      card.appendChild(empty("No requests in this window."));
+      message(card, "msg", "No requests in this window.");
     }
 
     // --- cache-hit distribution ------------------------------------------
-    const hitCard = viewCard(
+    const hitCard = cards.card(
+      "cache",
       "Cache hit rate by model",
       "Cache reads over cache reads plus fresh input tokens. A model with no input tokens " +
         "has no hit rate — it shows as “—” rather than a confident 0%.",
@@ -1036,7 +1227,7 @@
       .map((m) => ({ model: m.model, provider: m.provider, requests: m.requests, rate: C.hitRate(m) }))
       .filter((m) => m.rate !== null);
     if (hitRows.length) {
-      C.bars(hitCard, "Cache hit rate", hitRows, {
+      C.bars(slot(hitCard, "chart"), "Cache hit rate", hitRows, {
         labelKey: "model",
         valueKey: "rate",
         colorKey: "provider",
@@ -1049,22 +1240,21 @@
         ],
       });
     } else {
-      hitCard.appendChild(empty("No cache reads recorded in this window."));
+      message(hitCard, "msg", "No cache reads recorded in this window.");
     }
     dataTable(
-      hitCard,
+      slot(hitCard, "table"),
       "Same data as the chart above, including the models with no hit rate to compute.",
       ["Model", "Provider", "Requests", "Cache hit"],
       models.map((m) => [{ text: m.model, cls: "agent-hash" }, m.provider, C.fmtInt(m.requests), C.fmtPct(C.hitRate(m))]),
     );
-    main.appendChild(hitCard);
 
     // --- latency by model -------------------------------------------------
-    const latCard = viewCard("Latency by model", "p50/p95 per model, slowest p95 first (top 15 by p95).");
+    const latCard = cards.card("latency", "Latency by model", "p50/p95 per model, slowest p95 first (top 15 by p95).");
     if (latencyModels.length) {
-      C.latencyChart(latCard, latencyModels, { nameKey: "model" });
+      C.latencyChart(slot(latCard, "chart"), latencyModels, { nameKey: "model" });
       dataTable(
-        latCard,
+        slot(latCard, "table"),
         "Same data as the chart above.",
         ["Model", "Provider", "Requests", "p50", "p95"],
         latencyModels.map((l) => [
@@ -1076,9 +1266,8 @@
         ]),
       );
     } else {
-      latCard.appendChild(empty("No latency rows in this window."));
+      message(latCard, "msg", "No latency rows in this window.");
     }
-    main.appendChild(latCard);
 
     // --- the selected model's activity ------------------------------------
     if (!st.model) return;
@@ -1086,14 +1275,16 @@
     const series = await apiGet("/_telemetry/series", seriesParams(st, { model: st.model }, requested));
     const rows = series.rows || [];
     const bucket = effectiveBucket(series, requested);
-    const selCard = viewCard(
+    const selCard = cards.card(
+      "activity",
       "Activity — " + st.model,
       "Hourly up to a two-week range, daily beyond it. The range controls above apply.",
     );
     if (rows.length) {
-      seriesSection(selCard, "Requests per " + bucket, rows, (r) => r.requests, bucket, C.fmtInt, "requests");
+      seriesSection(selCard, "requests", "Requests per " + bucket, rows, (r) => r.requests, bucket, C.fmtInt, "requests");
       seriesSection(
         selCard,
+        "tokens",
         "Tokens per " + bucket,
         rows,
         (r) => (r.tokens_in || 0) + (r.tokens_out || 0),
@@ -1102,9 +1293,8 @@
         "tokens",
       );
     } else {
-      selCard.appendChild(empty("No telemetry in this window yet."));
+      message(selCard, "msg", "No telemetry in this window yet.");
     }
-    main.appendChild(selCard);
   }
 
   /* =====================================================================
@@ -1167,7 +1357,7 @@
     };
   }
 
-  function requestTable(card, st, payload) {
+  function requestTable(holder, st, payload) {
     const rows = payload.rows || [];
     // Columns follow _REQUEST_COLUMNS. Only the six whitelisted sort keys get a
     // click handler: offering a sort the API would silently ignore is a lie the
@@ -1185,7 +1375,7 @@
     ];
 
     dataTable(
-      card,
+      holder,
       "One row per request. Every column is a ledger column — there is no message content in the schema. " +
         "Select a row to open its detail panel.",
       headers,
@@ -1214,123 +1404,139 @@
     );
   }
 
+  /* The pager keeps its buttons across refreshes and only re-points them. Its
+   * nodes are cheap to rebuild but expensive to lose: a refresh landing while
+   * the operator is on "Next →" must not take the focus with it. */
   function pager(card, st, payload) {
     const total = payload.total || 0;
     const offset = (st.page - 1) * PAGE_SIZE;
     const shown = (payload.rows || []).length;
-    const bar = el("div", "pager");
-
-    const prev = el("button", "btn", "← Prev");
-    prev.type = "button";
-    prev.disabled = st.page <= 1;
-    prev.addEventListener("click", () => apply({ page: st.page - 1 }));
-    const next = el("button", "btn", "Next →");
-    next.type = "button";
-    next.disabled = shown === 0 || offset + shown >= total;
-    next.addEventListener("click", () => apply({ page: st.page + 1 }));
-    bar.appendChild(prev);
-    bar.appendChild(next);
-
-    const of = el("span", "of");
-    of.textContent =
+    const bar = slot(card, "pager", "pager");
+    let refs = bar._pager;
+    if (!refs) {
+      const prev = el("button", "btn", "← Prev");
+      prev.type = "button";
+      const next = el("button", "btn", "Next →");
+      next.type = "button";
+      const of = el("span", "of");
+      const first = el("a");
+      first.textContent = "First page";
+      for (const node of [prev, next, of, first]) bar.appendChild(node);
+      refs = { prev: prev, next: next, of: of, first: first, onPrev: null, onNext: null };
+      // Bound once, reading the handler off the ref: the state a button was
+      // built with is stale by the next refresh.
+      prev.addEventListener("click", () => refs.onPrev && refs.onPrev());
+      next.addEventListener("click", () => refs.onNext && refs.onNext());
+      bar._pager = refs;
+    }
+    refs.onPrev = () => apply({ page: st.page - 1 });
+    refs.onNext = () => apply({ page: st.page + 1 });
+    refs.prev.disabled = st.page <= 1;
+    refs.next.disabled = shown === 0 || offset + shown >= total;
+    refs.of.textContent =
       total > 0
         ? C.fmtInt(offset + 1) + "–" + C.fmtInt(offset + shown) + " of " + C.fmtInt(total)
         : "0 of 0";
-    bar.appendChild(of);
-
-    if (st.page > 1) {
-      bar.appendChild(drillLink("First page", Object.assign({}, st, { page: 1 })));
-    }
-    card.appendChild(bar);
+    refs.first.href = buildHash(Object.assign({}, st, { page: 1 }));
+    refs.first.hidden = st.page <= 1;
   }
 
-  async function renderRequests(st, main) {
+  async function renderRequests(st, main, cards) {
     const [facets, codes, payload] = await Promise.all([
       loadFacets(st),
       loadStatusCodes(st),
       apiGet("/_telemetry/requests", requestParams(st)),
     ]);
 
-    const card = viewCard(
+    const card = cards.card(
+      "requests",
       "Requests",
       "Raw ledger rows for the selected range. Filters and sort are exact-match and whitelisted server-side.",
     );
 
-    const filters = el("div", "filters");
-    const dropdown = (labelText, id, options, current, key) => {
-      const wrap = el("span");
-      const label = el("label", null, labelText);
-      label.setAttribute("for", id);
-      wrap.appendChild(label);
-      wrap.appendChild(selectBox(id, options, current || "", (value) => apply({ [key]: value, page: 1 })));
-      return wrap;
-    };
-
-    const agentOptions = [{ value: "", label: "All agents" }];
-    for (const a of facets.agents || []) {
-      agentOptions.push({
-        value: a.agent_hash,
-        label: C.shortHash(a.agent_hash) + " (" + C.fmtInt(a.requests) + ")",
-        title: a.agent_hash,
-      });
-    }
-    filters.appendChild(dropdown("Agent", "f-agent", agentOptions, st.agent, "agent"));
-
-    const modelOptions = [{ value: "", label: "All models" }];
-    for (const m of dedupeModels(facets)) modelOptions.push({ value: m.model, label: m.model, title: m.model });
-    filters.appendChild(dropdown("Model", "f-model", modelOptions, st.model, "model"));
-
-    const providerOptions = [{ value: "", label: "All providers" }];
-    for (const p of facets.providers || []) {
-      if (p.provider === null || p.provider === undefined) continue;
-      providerOptions.push({ value: p.provider, label: p.provider + " (" + C.fmtInt(p.requests) + ")" });
-    }
-    filters.appendChild(dropdown("Provider", "f-provider", providerOptions, st.provider, "provider"));
-
-    const statusSel = statusOptions(st, codes);
-    filters.appendChild(dropdown("Status", "f-status", statusSel, st.status === null ? "" : String(st.status), "status"));
-
-    if (st.agent || st.model || st.provider || st.status !== null) {
-      const clearAll = el("button", "btn", "Clear filters");
-      clearAll.type = "button";
-      clearAll.addEventListener("click", () =>
-        apply({ agent: null, model: null, provider: null, status: null, page: 1 }),
-      );
-      filters.appendChild(clearAll);
-    }
-    // The same range + filters the header exports, repeated where the filters
-    // are actually being edited. (Export ignores sort/limit/offset: it streams
-    // the whole filtered range, not the current page.)
+    // The filter row is rebuilt only when something it *shows* changes. A
+    // range change repaints it (the export links carry the range); a plain
+    // refresh leaves it alone, so an open dropdown stays open.
     const exportQuery = filterParams(st).toString();
-    for (const [ext, label] of [["csv", "Export CSV"], ["jsonl", "Export JSONL"]]) {
-      const link = el("a", "btn", label);
-      link.href = "/_telemetry/export." + ext + "?" + exportQuery;
-      filters.appendChild(link);
-    }
-    card.appendChild(filters);
-    main.appendChild(card);
+    const fSig = [
+      exportQuery,
+      optionsSig(facets.agents, (a) => a.agent_hash + "~" + a.requests),
+      optionsSig(dedupeModels(facets), (m) => m.model),
+      optionsSig(facets.providers, (p) => p.provider + "~" + p.requests),
+      codes.join(","),
+    ].join("::");
+
+    optionsSlot(card, "filters", fSig, "filters", (filters) => {
+      const dropdown = (labelText, id, options, current, key) => {
+        const wrap = el("span");
+        const label = el("label", null, labelText);
+        label.setAttribute("for", id);
+        wrap.appendChild(label);
+        wrap.appendChild(selectBox(id, options, current || "", (value) => apply({ [key]: value, page: 1 })));
+        filters.appendChild(wrap);
+      };
+
+      const agentOptions = [{ value: "", label: "All agents" }];
+      for (const a of facets.agents || []) {
+        agentOptions.push({
+          value: a.agent_hash,
+          label: C.shortHash(a.agent_hash) + " (" + C.fmtInt(a.requests) + ")",
+          title: a.agent_hash,
+        });
+      }
+      dropdown("Agent", "f-agent", agentOptions, st.agent, "agent");
+
+      const modelOptions = [{ value: "", label: "All models" }];
+      for (const m of dedupeModels(facets)) modelOptions.push({ value: m.model, label: m.model, title: m.model });
+      dropdown("Model", "f-model", modelOptions, st.model, "model");
+
+      const providerOptions = [{ value: "", label: "All providers" }];
+      for (const p of facets.providers || []) {
+        if (p.provider === null || p.provider === undefined) continue;
+        providerOptions.push({ value: p.provider, label: p.provider + " (" + C.fmtInt(p.requests) + ")" });
+      }
+      dropdown("Provider", "f-provider", providerOptions, st.provider, "provider");
+
+      const statusSel = statusOptions(st, codes);
+      dropdown("Status", "f-status", statusSel, st.status === null ? "" : String(st.status), "status");
+
+      if (st.agent || st.model || st.provider || st.status !== null) {
+        const clearAll = el("button", "btn", "Clear filters");
+        clearAll.type = "button";
+        clearAll.addEventListener("click", () =>
+          apply({ agent: null, model: null, provider: null, status: null, page: 1 }),
+        );
+        filters.appendChild(clearAll);
+      }
+      // The same range + filters the header exports, repeated where the filters
+      // are actually being edited. (Export ignores sort/limit/offset: it streams
+      // the whole filtered range, not the current page.)
+      for (const [ext, label] of [["csv", "Export CSV"], ["jsonl", "Export JSONL"]]) {
+        const link = el("a", "btn", label);
+        link.href = "/_telemetry/export." + ext + "?" + exportQuery;
+        filters.appendChild(link);
+      }
+    });
 
     if (!(payload.rows || []).length) {
-      card.appendChild(
-        empty(
-          payload.total
-            ? "No rows on this page. Use Prev to step back, or clear the filters."
-            : "No requests match these filters in this window.",
-        ),
+      message(
+        card,
+        "msg",
+        payload.total
+          ? "No rows on this page. Use Prev to step back, or clear the filters."
+          : "No requests match these filters in this window.",
       );
       pager(card, st, payload);
       return;
     }
 
-    requestTable(card, st, payload);
+    requestTable(slot(card, "table"), st, payload);
     pager(card, st, payload);
-    card.appendChild(
-      el(
-        "p",
-        "note",
-        "metadata only — no prompt content is ever stored. There is no message column in the ledger schema, so " +
-          "there is no code path that could render one.",
-      ),
+    message(
+      card,
+      "note",
+      "metadata only — no prompt content is ever stored. There is no message column in the ledger schema, so " +
+        "there is no code path that could render one.",
     );
   }
 
@@ -1339,21 +1545,29 @@
   // truth about the data's age), else null — the caller falls back to the local
   // clock, so "updated" never freezes on a view that does not read /data.
   async function dispatch(st, main) {
-    if (st.view === "agents") {
-      await renderAgents(st, main);
-      return null;
+    // The card set is opened per frame and closed in a `finally`, so every exit
+    // path — including a throw on the way to the error card — leaves the DOM in
+    // a consistent state with no orphaned card waiting to be reused.
+    const cards = cardSet(main, st.view);
+    try {
+      if (st.view === "agents") {
+        await renderAgents(st, main, cards);
+        return null;
+      }
+      if (st.view === "models") {
+        await renderModels(st, main, cards);
+        return null;
+      }
+      if (st.view === "requests") {
+        await renderRequests(st, main, cards);
+        return null;
+      }
+      const payload = await apiGet("/_telemetry/data", rangeParams(st));
+      renderOverview(payload, st, main, cards);
+      return payload.generated_at ? formatStamp(payload.generated_at) : null;
+    } finally {
+      cards.end();
     }
-    if (st.view === "models") {
-      await renderModels(st, main);
-      return null;
-    }
-    if (st.view === "requests") {
-      await renderRequests(st, main);
-      return null;
-    }
-    const payload = await apiGet("/_telemetry/data", rangeParams(st));
-    renderOverview(payload, st, main);
-    return payload.generated_at ? formatStamp(payload.generated_at) : null;
   }
 
   // A navigation that arrives while a fetch is open is *remembered*, not
@@ -1373,13 +1587,18 @@
     }
     inflight = true;
     syncChrome(next);
-    main.classList.add("loading"); // keep the previous frame visible, dimmed
-    clear(main);
+    // Dim only a page that has nothing on it yet — the first paint. A refresh
+    // keeps the previous frame at full opacity: dimming it would be the flicker
+    // this whole path exists to remove, and the fetch is fast enough that an
+    // operator reads the old numbers rather than a grey wash.
+    if (!main.firstChild) main.classList.add("loading");
     try {
       const serverStamp = await dispatch(next, main);
       stamp = serverStamp || formatStamp(new Date().toISOString());
     } catch (err) {
       clear(main);
+      main._head = null;
+      main._cards = null; // nothing is reusable after a wipe
       const message = err && err.message ? String(err.message) : "";
       renderUnavailable(main, message && message !== "telemetry unavailable" ? message : null);
     } finally {

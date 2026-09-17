@@ -76,6 +76,18 @@ svg .tick-label { fill: #9d9d9d; font-size: 11px; }
 svg .bar-label { fill: #dcdcdc; font-size: 11px; }
 svg .row-label { fill: #cfcfcf; font-size: 11.5px; }
 svg .bar-label-in { fill: #171717; font-size: 11px; font-weight: 600; }
+/* Marks move instead of being replaced. Geometry changes on a rect (x/y/width/
+   height) are CSS properties in SVG 2 and interpolate; x1/x2/y1/y2 on a line are
+   still attributes in several engines, so moving gridlines and the crosshair
+   snap rather than glide. That trade is deliberate: the things that carry the
+   data (columns, bars, dots, labels) animate, and the recessive furniture does
+   not need to. */
+svg rect, svg line {
+  transition: width .6s ease, height .6s ease, x .6s ease, y .6s ease,
+    x1 .6s ease, x2 .6s ease, y1 .6s ease, y2 .6s ease, fill .3s ease;
+}
+svg text { transition: x .6s ease, y .6s ease; }
+svg g { transition: transform .4s ease, opacity .4s ease; }
 /* Status codes are numbers read as a column — they line up or they are noise. */
 svg .status-label { font-variant-numeric: tabular-nums; fill: #c9c9c9; }
 /* The 2px single-series line and its crosshair (line mode only). */
@@ -249,6 +261,48 @@ a.btn { text-decoration: none; display: inline-block; }
 /* --- small print -------------------------------------------------------- */
 .note { color: #8f8f8f; font-size: 12px; margin: 14px 0 0; }
 .note code { color: #b8b8b8; }
+
+/* ==========================================================================
+ * Motion — the refresh path.
+ *
+ * A refresh morphs the marks it already has (see the scene registry in
+ * charts.js); these rules are what make the change visible as movement rather
+ * than as a repaint. Only structural changes animate in: a card that was not
+ * there a moment ago, a table that had to be rebuilt, a row that just arrived.
+ *
+ * Every one of them is a decoration on top of a correct final state — with the
+ * animations disabled the page is identical, just less legible about what moved.
+ * ========================================================================== */
+
+@keyframes card-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes row-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+/* The flash marks a value that *changed*, so it is a background wash rather
+   than a colour: no Set2 hue is ever spent on "this is new". */
+@keyframes cell-changed {
+  0% { background: #2f3a34; }
+  100% { background: transparent; }
+}
+
+.card-in { animation: card-in .25s ease-out both; }
+.fade-in { animation: fade-in .25s ease-out both; }
+.row-in { animation: row-in .3s ease-out both; }
+.cell-changed { animation: cell-changed .6s ease-out; }
+
+/* Reduced motion: no transitions, no animations, anywhere. The update paths
+   still run — they just land on the new value in one step. */
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; animation: none !important; }
+}
 
 @media (max-width: 760px) {
   header { align-items: flex-start; }

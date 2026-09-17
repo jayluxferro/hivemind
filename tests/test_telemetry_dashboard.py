@@ -48,7 +48,20 @@ PAGE_MARKERS = (
 # a dropped directive is exactly the kind of regression that only shows up as a
 # sloppy global months later.
 CONTENT_MARKERS: dict[str, tuple[bytes, ...]] = {
-    "charts.js": (b'"use strict"', b"window.HiveCharts", b"PALETTE", b"ColorBrewer Set2"),
+    # The motion layer is split by necessity: the numbers tween in JS, the
+    # geometry glides in CSS. Both halves have to be present for a refresh to
+    # animate rather than blink, so both are asserted.  The hyphenated
+    # `prefers-reduced-motion` appears in charts.js as the matchMedia query
+    # string and in the stylesheet as the media query that switches all of it
+    # off, so a regression in either half fails here.
+    "charts.js": (
+        b'"use strict"',
+        b"window.HiveCharts",
+        b"PALETTE",
+        b"ColorBrewer Set2",
+        b"requestAnimationFrame",
+        b"prefers-reduced-motion",
+    ),
     "dashboard.js": (
         b'"use strict"',
         b"localStorage",
@@ -57,8 +70,9 @@ CONTENT_MARKERS: dict[str, tuple[bytes, ...]] = {
         b"fail-open",
     ),
     # The stylesheet carries the Phase 1 surface and the Phase 2 chrome the
-    # frontend spec names out loud (nav tabs, the detail side panel).
-    "dashboard.css": (b"#111", b".tabs", b".panel"),
+    # frontend spec names out loud (nav tabs, the detail side panel), plus the
+    # transition declarations the geometry morph needs to be visible at all.
+    "dashboard.css": (b"#111", b".tabs", b".panel", b"transition:", b"prefers-reduced-motion"),
 }
 
 # Anything here anywhere in a served byte payload means the page is not

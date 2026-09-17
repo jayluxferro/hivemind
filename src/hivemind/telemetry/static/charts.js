@@ -266,26 +266,279 @@
     if (tip) tip.style.display = "none";
   }
 
+  /* The payload is stored on the node and read at pointer time, not captured in
+   * the listener. That is what lets a refresh re-point a mark at the new row
+   * (values change every tick while the node stays) without stacking a second
+   * listener on it. */
+  function setHover(node, title, rows) {
+    node._tip = { title: title, rows: rows };
+  }
+
   function bindHover(node, title, rows) {
+    setHover(node, title, rows);
+    if (node._hoverBound) return;
+    node._hoverBound = true;
     node.addEventListener("pointermove", (ev) => {
-      tipShow(title, rows);
+      if (!node._tip) return;
+      tipShow(node._tip.title, node._tip.rows);
       tipMove(ev);
     });
     node.addEventListener("pointerleave", tipHide);
   }
 
+  function setActivate(node, fn) {
+    node._activate = typeof fn === "function" ? fn : null;
+  }
+
+  // Attach once, re-point forever. Same reason as the tooltip payload: after a
+  // morph the handler has to describe the *new* row, and re-binding would leave
+  // the old listener running too.
+  function bindRetargetable(node, type, slot, fn) {
+    node[slot] = typeof fn === "function" ? fn : null;
+    const flag = slot + "Bound";
+    if (node[flag]) return;
+    node[flag] = true;
+    node.addEventListener(type, (ev) => {
+      const handler = node[slot];
+      if (typeof handler === "function") handler(ev);
+    });
+  }
+
+  function bindMove(node, fn) {
+    bindRetargetable(node, "pointermove", "_move", fn);
+  }
+
+  function bindLeave(node, fn) {
+    bindRetargetable(node, "pointerleave", "_leave", fn);
+  }
+
   // Make a mark navigable: pointer click plus keyboard (Enter/Space), because
   // the alternative is a drill-down only a mouse can reach.
   function bindActivate(node, fn) {
-    if (typeof fn !== "function") return;
+    setActivate(node, fn);
+    if (!node._activate) return;
     node.style.cursor = "pointer";
-    node.addEventListener("click", fn);
+    if (node._activateBound) return;
+    node._activateBound = true;
+    const run = (ev) => {
+      // Re-read at event time: after a morph the target is the *new* row, and
+      // a stale closure here would open last refresh's request.
+      if (typeof node._activate === "function") node._activate(ev);
+    };
+    node.addEventListener("click", run);
     node.addEventListener("keydown", (ev) => {
       if (ev.key === "Enter" || ev.key === " " || ev.key === "Spacebar") {
         ev.preventDefault();
-        fn(ev);
+        run(ev);
       }
     });
+  }
+
+  /* =====================================================================
+   * in-place update machinery
+   *
+   * A refresh must not look like a reload. The rule this implements: a *new*
+   * picture (different series set, different row count, different chart kind)
+   * is allowed to rebuild — and fades in when it does. The *same* picture with
+   * new numbers morphs: the marks keep their identity and only their geometry
+   * changes, so the CSS transitions in dashboard.css have a previous value to
+   * interpolate from.
+   *
+   * "Same" is decided by a structural key that names everything affecting how
+   * many nodes exist. Everything else — values, labels, tooltip payloads,
+   * drill-down targets — is allowed to differ while the key stays equal, and is
+   * written into the existing nodes.
+   *
+   * The plan is built as plain data (an array of mark specs) *before* any DOM
+   * exists, so the build path and the morph path share one geometry
+   * computation. Two paths that each laid out their own marks would drift.
+   * =================================================================== */
+
+  function prefersReducedMotion() {
+    try {
+      return !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+    } catch (err) {
+      return false; // no matchMedia: assume motion is welcome
+    }
+  }
+
+  function clearChildren(node) {
+    while (node.firstChild) node.removeChild(node.firstChild);
+  }
+
+  // A tween on an element nobody can see is a rAF loop for no reason.
+  function isVisible(node) {
+    if (!node || node.hidden) return false;
+    if (typeof node.getClientRects === "function") {
+      try {
+        return node.getClientRects().length > 0;
+      } catch (err) {
+        return true;
+      }
+    }
+    return true;
+  }
+
+  /* Number tween for tiles. The from-value is the number currently on screen,
+   * not the caller's idea of it: a refresh landing mid-tween must continue from
+   * where the digits actually are, or the value jumps backwards first. So the
+   * live value rides on the element (`node._num`, written every frame) and the
+   * `fromNum` argument is only the fallback for the first tween. */
+  const TWEENS = new WeakMap(); // node -> rAF id, so the next tween can cancel it
+
+  function tweenCancel(node) {
+    const id = TWEENS.get(node);
+    if (id !== undefined && id !== null) {
+      if (typeof window.cancelAnimationFrame === "function") window.cancelAnimationFrame(id);
+      TWEENS.delete(node);
+    }
+  }
+
+  function tweenText(node, fromNum, toNum, fmt, opts) {
+    const o = opts || {};
+    const format = fmt || ((v) => String(Math.round(v)));
+    const to = toNum == null || !isFinite(toNum) ? null : Number(toNum);
+    tweenCancel(node);
+    // Nothing to interpolate towards (an em dash is not a number), no motion
+    // wanted, or nobody looking: write the final text and stop.
+    if (to === null || prefersReducedMotion() || !isVisible(node) || typeof window.requestAnimationFrame !== "function") {
+      node.textContent = to === null ? format(null) : format(to);
+      node._num = to;
+      return;
+    }
+    const live = typeof node._num === "number" && isFinite(node._num) ? node._num : null;
+    const raw = live !== null ? live : fromNum;
+    const from = raw == null || !isFinite(raw) ? null : Number(raw);
+    if (from === null || from === to) {
+      node.textContent = format(to);
+      node._num = to;
+      return;
+    }
+    const dur = o.duration || 500;
+    const t0 = typeof performance !== "undefined" && performance.now ? performance.now() : Date.now();
+    const step = (now) => {
+      const t = Math.min(1, (now - t0) / dur);
+      const eased = 1 - Math.pow(1 - t, 3); // ease-out cubic
+      const v = from + (to - from) * eased;
+      node.textContent = format(v);
+      node._num = t >= 1 ? to : v;
+      if (t < 1 && TWEENS.has(node)) {
+        TWEENS.set(node, window.requestAnimationFrame(step));
+      } else {
+        TWEENS.delete(node);
+        node.textContent = format(to);
+        node._num = to;
+      }
+    };
+    TWEENS.set(node, window.requestAnimationFrame(step));
+  }
+
+  // A one-shot class for the enter animation, removed on a timer rather than on
+  // animationend: the class must not survive an interrupted animation, and a
+  // timer is the one signal that always fires.
+  function fadeIn(node, cls) {
+    if (!node || prefersReducedMotion()) return;
+    const name = cls || "fade-in";
+    node.classList.add(name);
+    window.setTimeout(() => node.classList.remove(name), 600);
+  }
+
+  /* ---- marks -----------------------------------------------------------------
+   * spec: {tag, attrs, cls, fill, text, tip:{title,rows}, activate}
+   * `text` always lands through textContent. This is the only path by which a
+   * model name or an agent hash reaches the DOM in this file. */
+  function buildMark(spec) {
+    const node = spec.tag === "text" ? textEl(spec.tag, spec.text, spec.attrs) : svgEl(spec.tag, spec.attrs);
+    if (spec.cls !== undefined) node.setAttribute("class", spec.cls);
+    if (spec.fill) node.style.fill = spec.fill;
+    if (spec.text !== undefined && spec.tag !== "text") node.textContent = spec.text;
+    if (spec.tip) bindHover(node, spec.tip.title, spec.tip.rows);
+    if (spec.activate) bindActivate(node, spec.activate);
+    if (spec.move !== undefined) bindMove(node, spec.move);
+    if (spec.leave !== undefined) bindLeave(node, spec.leave);
+    return node;
+  }
+
+  function applyMark(node, spec) {
+    const attrs = spec.attrs || {};
+    for (const k in attrs) {
+      if (!Object.prototype.hasOwnProperty.call(attrs, k)) continue;
+      // Setting an attribute to the value it already holds is a no-op for
+      // transitions (the computed value does not change), so there is nothing
+      // to diff here.
+      if (node.getAttribute(k) !== String(attrs[k])) node.setAttribute(k, attrs[k]);
+    }
+    if (spec.cls !== undefined && node.getAttribute("class") !== spec.cls) node.setAttribute("class", spec.cls);
+    if (spec.fill && node.style.fill !== spec.fill) node.style.fill = spec.fill;
+    if (spec.text !== undefined && node.textContent !== spec.text) node.textContent = spec.text;
+    if (spec.tip) setHover(node, spec.tip.title, spec.tip.rows);
+    if (spec.activate !== undefined) setActivate(node, spec.activate);
+    if (spec.move !== undefined) bindMove(node, spec.move);
+    if (spec.leave !== undefined) bindLeave(node, spec.leave);
+  }
+
+  // The chart frame: a .subchart box with its heading, optional legend and the
+  // svg. Rebuilt only when the structural key says the picture changed shape.
+  function sceneFrame(holder, key, title, legendItems, ariaLabel, viewBox) {
+    const prev = holder._scene;
+    if (prev && prev.key === key) {
+      if (prev.svg.getAttribute("aria-label") !== ariaLabel) prev.svg.setAttribute("aria-label", ariaLabel);
+      return prev;
+    }
+    clearChildren(holder);
+    const root = el("div", "subchart");
+    root.appendChild(el("h3", null, title));
+    if (legendItems && legendItems.length >= 2) root.appendChild(legendEl(legendItems));
+    const svg = svgEl("svg", { viewBox: viewBox });
+    svg.setAttribute("aria-label", ariaLabel);
+    root.appendChild(svg);
+    holder.appendChild(root);
+    fadeIn(root);
+    holder._scene = { key: key, root: root, svg: svg, nodes: [] };
+    return holder._scene;
+  }
+
+  // Draw (or morph) the marks of a scene. `key` must change whenever
+  // plan.length would; everything else may change freely.
+  function renderScene(holder, key, title, legendItems, ariaLabel, viewBox, plan) {
+    const scene = sceneFrame(holder, key, title, legendItems, ariaLabel, viewBox);
+    if (scene.nodes.length === plan.length) {
+      for (let i = 0; i < plan.length; i++) applyMark(scene.nodes[i], plan[i]);
+      return scene;
+    }
+    // Shape changed under the same key (a builder bug, or a legend-less
+    // single-series chart whose mark count moved): rebuild rather than
+    // mis-align marks onto the wrong rows.
+    clearChildren(scene.svg);
+    scene.nodes = plan.map((spec) => {
+      const node = buildMark(spec);
+      scene.svg.appendChild(node);
+      return node;
+    });
+    fadeIn(scene.root);
+    return scene;
+  }
+
+  // The "nothing to draw here" state, itself a scene so a view that stays empty
+  // across refreshes does not rebuild the paragraph every tick.
+  function emptyScene(holder, title, text) {
+    const key = "empty|" + title + "|" + text;
+    const prev = holder._scene;
+    if (prev && prev.key === key) return;
+    clearChildren(holder);
+    const root = el("div", "subchart");
+    root.appendChild(el("h3", null, title));
+    root.appendChild(el("p", "empty", text));
+    holder.appendChild(root);
+    fadeIn(root);
+    holder._scene = { key: key, root: root, svg: null, nodes: [] };
+  }
+
+  // The legend is part of a chart's structure: if the named set changes, the
+  // picture changed shape and the scene has to rebuild — which is also the only
+  // way a legend can appear or disappear (sceneFrame draws one iff >= 2 series).
+  function seenLegend(items) {
+    return items && items.length >= 2 ? items.map((it) => it.name).join(">") : "";
   }
 
   /* ============ legend (present iff >= 2 series) ============ */
@@ -311,62 +564,161 @@
    * cell:    string | {text, cls, title}
    * Returns the <table> so a caller can wire up anything else it needs.
    */
-  function makeCell(spec) {
-    if (spec !== null && typeof spec === "object" && !Array.isArray(spec)) {
-      const td = el("td", spec.cls || null, spec.text);
-      if (spec.title) td.title = spec.title;
-      return td;
+  /* Cells are written by applyRow() rather than constructed by a makeCell()
+   * helper: a first build and a morph have to agree on exactly what a cell is,
+   * and the only way to guarantee that is to have one function do both. A bare
+   * string/number is the shorthand; presentation that matters (the monospace
+   * hash column) is asked for explicitly, never guessed from the value's shape.
+   */
+  function headerKey(caption, headers) {
+    let key = String(caption == null ? "" : caption);
+    for (const h of headers || []) {
+      key +=
+        "|" +
+        (h !== null && typeof h === "object"
+          ? [h.text, h.cls, h.title, h.ariaSort].join("~")
+          : String(h));
     }
-    // A bare string/number is the shorthand; presentation that matters (the
-    // monospace hash column) is asked for explicitly, never guessed from the
-    // value's shape.
-    return el("td", null, spec == null ? "" : String(spec));
+    return key;
   }
 
-  function dataTable(holder, caption, headers, rows) {
-    const table = el("table", "datatable");
-    if (caption) table.appendChild(el("caption", null, caption));
+  // A changed cell gets a brief highlight. The flash marks *new information*,
+  // so it is driven by the text differing — not by the fact that a render
+  // happened. A refresh that changed nothing flashes nothing.
+  function flash(node, cls) {
+    const name = cls || "cell-changed";
+    if (!node || prefersReducedMotion()) return;
+    node.classList.remove(name);
+    // Reading offsetWidth forces a style flush, without which removing and
+    // re-adding the class in one frame does not restart the animation. Guarded
+    // because a non-layout environment has no offsetWidth to read.
+    if (typeof node.offsetWidth === "number") void node.offsetWidth;
+    node.classList.add(name);
+    window.setTimeout(() => node.classList.remove(name), 600);
+  }
 
-    const thead = el("thead");
-    const headRow = el("tr");
-    for (const h of headers || []) {
-      if (h !== null && typeof h === "object") {
-        const th = el("th", h.cls || null, h.text);
-        if (h.title) th.title = h.title;
-        if (h.onClick) {
-          // Focusable so the sort is reachable without a mouse. Not
-          // role="button": the th has to stay a table header, which is what
-          // aria-sort is for.
-          th.setAttribute("tabindex", "0");
-          bindActivate(th, h.onClick);
-        }
-        if (h.ariaSort) th.setAttribute("aria-sort", h.ariaSort);
-        headRow.appendChild(th);
+  function applyHeader(th, h) {
+    const obj = h !== null && typeof h === "object";
+    const text = obj ? h.text : h;
+    const s = text == null ? "" : String(text);
+    if (th.textContent !== s) th.textContent = s;
+    th.setAttribute("class", obj ? h.cls || "" : "");
+    th.title = obj && h.title ? h.title : "";
+    const ariaSort = obj ? h.ariaSort || null : null;
+    if (ariaSort) th.setAttribute("aria-sort", ariaSort);
+    else th.removeAttribute("aria-sort");
+    if (obj && h.onClick) {
+      if (!th._activateBound) {
+        // Focusable so the sort is reachable without a mouse. Not
+        // role="button": the th has to stay a table header, which is what
+        // aria-sort is for.
+        th.setAttribute("tabindex", "0");
+        bindActivate(th, h.onClick);
       } else {
-        headRow.appendChild(el("th", null, h));
+        // Morph: the handler closes over the state it was built with, and the
+        // range can have moved since. Re-point it at the current one.
+        setActivate(th, h.onClick);
       }
     }
-    thead.appendChild(headRow);
-    table.appendChild(thead);
+  }
 
-    const tbody = el("tbody");
-    for (const row of rows || []) {
-      const spec = row !== null && typeof row === "object" && !Array.isArray(row) && row.cells ? row : { cells: row };
-      const tr = el("tr", spec.cls || null);
-      for (const cell of spec.cells || []) tr.appendChild(makeCell(cell));
-      if (spec.onClick) {
+  function applyRow(slot, spec, cols, fresh) {
+    const obj = spec !== null && typeof spec === "object" && !Array.isArray(spec);
+    const cells = obj ? spec.cells || [] : spec || [];
+    const tr = slot.tr;
+    const cls = obj && spec.cls ? spec.cls : "";
+    if (tr.getAttribute("class") !== (cls || null)) tr.setAttribute("class", cls);
+    const label = obj && spec.label ? spec.label : null;
+    if (label) tr.setAttribute("aria-label", label);
+    else tr.removeAttribute("aria-label");
+    if (obj && spec.onClick) {
+      if (!tr._activateBound) {
         // Clickable *and* focusable: a drill-down that only a mouse can reach
         // is a drill-down half the operators do not have.
         tr.classList.add("clickable");
         tr.setAttribute("tabindex", "0");
-        if (spec.label) tr.setAttribute("aria-label", spec.label);
         bindActivate(tr, spec.onClick);
+      } else {
+        setActivate(tr, spec.onClick);
       }
-      tbody.appendChild(tr);
+    } else if (tr._activateBound) {
+      setActivate(tr, null);
+      tr.classList.remove("clickable");
+      tr.removeAttribute("tabindex");
     }
-    table.appendChild(tbody);
-    holder.appendChild(table);
-    return table;
+    for (let c = 0; c < cols; c++) {
+      const cell = cells[c];
+      const td = slot.cells[c];
+      const cobj = cell !== null && typeof cell === "object";
+      const value = cobj ? cell.text : cell;
+      const s = value == null ? "" : String(value);
+      if (td.textContent !== s) {
+        td.textContent = s;
+        if (!fresh) flash(td);
+      }
+      td.setAttribute("class", cobj ? cell.cls || "" : "");
+      const cellTitle = cobj && cell.title ? cell.title : "";
+      if (td.title !== cellTitle) td.title = cellTitle;
+    }
+  }
+
+  /* The table gets the same holder-keyed treatment as a chart: the grid keeps
+   * its nodes whenever the caption and headers are unchanged, and only the
+   * cells whose text actually moved are rewritten. Rows are reconciled by
+   * count, so a table that gained a row does not rebuild — and does not flash
+   * every cell either. */
+  function dataTable(holder, caption, headers, rows) {
+    const list = headers || [];
+    const key = headerKey(caption, list);
+    let entry = holder._table;
+    if (!entry || entry.key !== key || entry.cols !== list.length) {
+      clearChildren(holder);
+      const table = el("table", "datatable");
+      if (caption) table.appendChild(el("caption", null, caption));
+      const headRow = el("tr");
+      const cells = [];
+      for (let c = 0; c < list.length; c++) {
+        const th = el("th");
+        headRow.appendChild(th);
+        cells.push(th);
+      }
+      const thead = el("thead");
+      thead.appendChild(headRow);
+      table.appendChild(thead);
+      const tbody = el("tbody");
+      table.appendChild(tbody);
+      holder.appendChild(table);
+      fadeIn(table);
+      entry = { key: key, cols: list.length, table: table, cells: cells, tbody: tbody, rows: [] };
+      holder._table = entry;
+    }
+    for (let c = 0; c < list.length; c++) applyHeader(entry.cells[c], list[c]);
+
+    const body = rows || [];
+    while (entry.rows.length > body.length) {
+      const gone = entry.rows.pop();
+      entry.tbody.removeChild(gone.tr);
+    }
+    while (entry.rows.length < body.length) {
+      const tr = el("tr");
+      const cells = [];
+      for (let c = 0; c < entry.cols; c++) {
+        const td = el("td");
+        tr.appendChild(td);
+        cells.push(td);
+      }
+      entry.tbody.appendChild(tr);
+      // `fresh` suppresses the per-cell flash for a row that did not exist a
+      // moment ago: the whole row is new information, and sixteen flashes on
+      // one arrival is noise, not signal.
+      entry.rows.push({ tr: tr, cells: cells, fresh: true });
+    }
+    for (let i = 0; i < body.length; i++) {
+      const slot = entry.rows[i];
+      applyRow(slot, body[i], entry.cols, slot.fresh);
+      slot.fresh = false;
+    }
+    return entry.table;
   }
 
   /* =====================================================================
@@ -417,12 +769,8 @@
     }
     stamps.sort();
 
-    const box = el("div", "subchart");
-    box.appendChild(el("h3", null, title));
-
     if (!stamps.length) {
-      box.appendChild(el("p", "empty", "No telemetry in this window yet."));
-      holder.appendChild(box);
+      emptyScene(holder, title, "No telemetry in this window yet.");
       return;
     }
 
@@ -437,9 +785,8 @@
     }
     const series = chartSeries(foldedRows, order);
 
-    if (series.length >= 2) {
-      box.appendChild(legendEl(series.map((s) => ({ name: legendLabel(s), color: providerColor(s, order) }))));
-    }
+    const legendItems =
+      series.length >= 2 ? series.map((s) => ({ name: legendLabel(s), color: providerColor(s, order) })) : null;
 
     const W = 960;
     const H = 300;
@@ -465,25 +812,30 @@
     }
     const max = niceMax(maxTotal * 1.08);
     const y = (v) => mT + plotH - (v / max) * plotH;
+    const labelEvery = Math.max(1, Math.ceil(stamps.length / 10));
 
-    const svg = svgEl("svg", { viewBox: "0 0 " + W + " " + H });
-    svg.setAttribute("aria-label", title + " — stacked columns");
+    // Structural key: everything that decides how many marks the scene has.
+    // Values, labels, hues and drill-down targets may all change under it —
+    // those are written into the existing marks.
+    const key = ["stacked", title, bucket, series.join(">"), stamps.length].join("|");
+
+    const plan = [];
     for (let i = 1; i <= 4; i++) {
       const t = (max / 4) * i;
-      svg.appendChild(svgEl("line", { x1: mL, x2: W - mR, y1: y(t), y2: y(t), class: "grid" }));
-      svg.appendChild(textEl("text", valueFmt(t), { x: mL - 8, y: y(t) + 3.5, "text-anchor": "end", class: "tick-label" }));
+      plan.push({ tag: "line", attrs: { x1: mL, x2: W - mR, y1: y(t), y2: y(t), class: "grid" } });
+      plan.push({
+        tag: "text",
+        text: valueFmt(t),
+        attrs: { x: mL - 8, y: y(t) + 3.5, "text-anchor": "end", class: "tick-label" },
+      });
     }
-    const labelEvery = Math.max(1, Math.ceil(stamps.length / 10));
     stamps.forEach((stamp, i) => {
       if (i % labelEvery === 0) {
-        svg.appendChild(
-          textEl("text", bucketLabel(stamp, bucket), {
-            x: mL + slot * i + slot / 2,
-            y: H - 14,
-            "text-anchor": "middle",
-            class: "tick-label",
-          }),
-        );
+        plan.push({
+          tag: "text",
+          text: bucketLabel(stamp, bucket),
+          attrs: { x: mL + slot * i + slot / 2, y: H - 14, "text-anchor": "middle", class: "tick-label" },
+        });
       }
     });
 
@@ -494,63 +846,71 @@
       for (const s of series) {
         const entry = byStamp.get(s);
         const v = entry ? entry.value : 0;
-        if (v <= 0) continue;
         const yTop = y(acc + v);
         const yBot = y(acc);
         const color = providerColor(s, order);
-        const rect = svgEl("rect", {
-          x: x0 + (slot - barW) / 2,
-          y: yTop + 1,
-          width: barW,
-          height: Math.max(0, yBot - yTop - 2), // 2px surface gap between segments
-          rx: Math.min(4, barW / 2),
+        const label = s === "Other" ? "Other (folded)" : s;
+        // A zero-value segment is still emitted, at zero height. Skipping it
+        // would make the mark count a function of the *values*, and a refresh
+        // that pushed one agent to zero would then rebuild the chart instead of
+        // letting its column shrink — exactly the flash this avoids. Height 0
+        // paints nothing, and its hit target is 0-tall so it stays unhoverable.
+        plan.push({
+          tag: "rect",
+          attrs: {
+            x: x0 + (slot - barW) / 2,
+            y: yTop + 1,
+            width: barW,
+            height: Math.max(0, yBot - yTop - 2), // 2px surface gap between segments
+            rx: Math.min(4, barW / 2),
+          },
+          fill: color,
         });
-        rect.style.fill = color;
-        svg.appendChild(rect);
 
         // Hit target spans the whole column slot and the segment height —
         // always larger than the painted mark. Drawn after the mark so it wins
         // the pointer events.
-        const hit = svgEl("rect", {
-          x: x0,
-          y: yTop,
-          width: Math.max(1, slot),
-          height: Math.max(1, yBot - yTop),
-          fill: "transparent",
-        });
-        const label = s === "Other" ? "Other (folded)" : s;
-        bindHover(hit, stampLabel(stamp, bucket) + " · " + label, [
-          { swatch: color, label: "agent", value: label },
-          { label: "requests", value: fmtInt(entry ? entry.requests : 0) },
-          {
-            label: "tokens in/out",
-            value: fmtInt(entry ? entry.tokensIn : 0) + " / " + fmtInt(entry ? entry.tokensOut : 0),
+        plan.push({
+          tag: "rect",
+          attrs: {
+            x: x0,
+            y: yTop,
+            width: Math.max(1, slot),
+            height: v > 0 ? Math.max(1, yBot - yTop) : 0,
+            fill: "transparent",
           },
-          { label: "errors", value: fmtInt(entry ? entry.errors : 0) },
-        ]);
-        if (onSegmentClick && entry && entry.raw) {
-          const raw = entry.raw;
-          bindActivate(hit, () => onSegmentClick(raw, stamp, entry));
-        }
-        svg.appendChild(hit);
+          tip: {
+            title: stampLabel(stamp, bucket) + " · " + label,
+            rows: [
+              { swatch: color, label: "agent", value: label },
+              { label: "requests", value: fmtInt(entry ? entry.requests : 0) },
+              {
+                label: "tokens in/out",
+                value: fmtInt(entry ? entry.tokensIn : 0) + " / " + fmtInt(entry ? entry.tokensOut : 0),
+              },
+              { label: "errors", value: fmtInt(entry ? entry.errors : 0) },
+            ],
+          },
+          // Only an unfolded series may be drilled into: "Other" is an
+          // aggregate, and navigating from it would silently pick one of its
+          // members.
+          activate: onSegmentClick && entry && entry.raw ? () => onSegmentClick(entry.raw, stamp, entry) : null,
+        });
         acc += v;
       }
       // One direct label per chart: the endpoint column's total, never an
-      // interior segment (SPEC: selective direct labels).
-      if (i === stamps.length - 1 && acc > 0) {
-        svg.appendChild(
-          textEl("text", valueFmt(acc), {
-            x: x0 + slot / 2,
-            y: y(acc) - 6,
-            "text-anchor": "middle",
-            class: "bar-label",
-          }),
-        );
+      // interior segment (SPEC: selective direct labels). Emitted always at
+      // zero height so the count stays fixed; blank when there is no total.
+      if (i === stamps.length - 1) {
+        plan.push({
+          tag: "text",
+          text: acc > 0 ? valueFmt(acc) : "",
+          attrs: { x: x0 + slot / 2, y: y(acc) - 6, "text-anchor": "middle", class: "bar-label" },
+        });
       }
     });
 
-    box.appendChild(svg);
-    holder.appendChild(box);
+    renderScene(holder, key, title, legendItems, title + " — stacked columns", "0 0 " + W + " " + H, plan);
   }
 
   /* =====================================================================
@@ -580,12 +940,8 @@
     const subLabelKey = o.subLabelKey !== undefined ? o.subLabelKey : colorKey && colorKey !== labelKey ? colorKey : null;
     const list = (rows || []).slice();
 
-    const box = el("div", "subchart");
-    box.appendChild(el("h3", null, title));
-
     if (!list.length) {
-      box.appendChild(el("p", "empty", "No rows in this window."));
-      holder.appendChild(box);
+      emptyScene(holder, title, "No rows in this window.");
       return;
     }
 
@@ -601,6 +957,7 @@
     const max = niceMax(Math.max.apply(null, values));
     const x = (v) => x0 + (v / max) * plotW;
 
+    let legendItems = null;
     if (colorKey) {
       const seen = [];
       for (const r of list) {
@@ -609,58 +966,66 @@
         const name = legendName ? legendName(raw) : raw;
         if (!seen.some((entry) => entry.name === name)) seen.push({ name: name, color: colorFn(raw, r) });
       }
-      if (seen.length >= 2) box.appendChild(legendEl(seen));
+      legendItems = seen;
     }
 
-    const svg = svgEl("svg", { viewBox: "0 0 " + W + " " + H });
-    svg.setAttribute("aria-label", title + " — horizontal bars");
+    const key = ["bars", title, valueKey, colorKey || "", subLabelKey || "", list.length, seenLegend(legendItems)].join("|");
+
+    const plan = [];
     for (let i = 1; i <= 4; i++) {
       const t = (max / 4) * i;
-      svg.appendChild(svgEl("line", { x1: x(t), x2: x(t), y1: mT - 4, y2: H - 20, class: "grid" }));
-      svg.appendChild(textEl("text", valueFmt(t), { x: x(t), y: H - 6, "text-anchor": "middle", class: "tick-label" }));
+      plan.push({ tag: "line", attrs: { x1: x(t), x2: x(t), y1: mT - 4, y2: H - 20, class: "grid" } });
+      plan.push({
+        tag: "text",
+        text: valueFmt(t),
+        attrs: { x: x(t), y: H - 6, "text-anchor": "middle", class: "tick-label" },
+      });
     }
 
     list.forEach((r, i) => {
       const cy = mT + i * rowH + rowH / 2;
       const value = Number(r[valueKey]) || 0;
       const color = colorFn(colorKey ? r[colorKey] : r[labelKey], r);
-      svg.appendChild(
-        textEl("text", labelFmt(r[labelKey]), {
-          x: labelW - 8,
-          y: subLabelKey ? cy : cy + 3.5,
-          "text-anchor": "end",
-          class: rowLabelClass,
-        }),
-      );
+      plan.push({
+        tag: "text",
+        text: labelFmt(r[labelKey]),
+        attrs: { x: labelW - 8, y: subLabelKey ? cy : cy + 3.5, "text-anchor": "end", class: rowLabelClass },
+      });
       if (subLabelKey) {
-        svg.appendChild(
-          textEl("text", labelFmt(r[subLabelKey]), {
-            x: labelW - 8,
-            y: cy + 13,
-            "text-anchor": "end",
-            class: "tick-label",
-          }),
-        );
+        plan.push({
+          tag: "text",
+          text: labelFmt(r[subLabelKey]),
+          attrs: { x: labelW - 8, y: cy + 13, "text-anchor": "end", class: "tick-label" },
+        });
       }
-      const bw = Math.max(2, x(value) - x0);
-      const rect = svgEl("rect", { x: x0, y: cy - 7, width: bw, height: 14, rx: Math.min(4, 7) });
-      rect.style.fill = color;
-      svg.appendChild(rect);
+      plan.push({
+        tag: "rect",
+        attrs: { x: x0, y: cy - 7, width: Math.max(2, x(value) - x0), height: 14, rx: Math.min(4, 7) },
+        fill: color,
+      });
 
       // Hit target: the whole row band right of the labels — taller and wider
       // than the 14px painted bar.
-      const hit = svgEl("rect", { x: x0, y: cy - 12, width: Math.max(1, plotW + mR), height: 24, fill: "transparent" });
-      bindHover(hit, labelFmt(r[labelKey]), o.tipRows ? o.tipRows(r, value) : [{ label: valueKey, value: valueFmt(value) }]);
-      if (onRowClick) bindActivate(hit, () => onRowClick(r));
-      svg.appendChild(hit);
+      plan.push({
+        tag: "rect",
+        attrs: { x: x0, y: cy - 12, width: Math.max(1, plotW + mR), height: 24, fill: "transparent" },
+        tip: {
+          title: labelFmt(r[labelKey]),
+          rows: o.tipRows ? o.tipRows(r, value) : [{ label: valueKey, value: valueFmt(value) }],
+        },
+        activate: onRowClick ? () => onRowClick(r) : null,
+      });
 
       // Value at the tip: every ranked bar is an endpoint, so every bar is
       // directly labeled.
-      svg.appendChild(textEl("text", valueFmt(value), { x: x(value) + 6, y: cy + 3.5, class: "bar-label" }));
+      plan.push({
+        tag: "text",
+        text: valueFmt(value),
+        attrs: { x: x(value) + 6, y: cy + 3.5, class: "bar-label" },
+      });
     });
 
-    box.appendChild(svg);
-    holder.appendChild(box);
+    renderScene(holder, key, title, legendItems, title + " — horizontal bars", "0 0 " + W + " " + H, plan);
   }
 
   /* =====================================================================
@@ -677,12 +1042,8 @@
     const title = o.title || "p50 vs p95 response time";
     const list = (rows || []).slice();
 
-    const box = el("div", "subchart");
-    box.appendChild(el("h3", null, title));
-
     if (!list.length) {
-      box.appendChild(el("p", "empty", "No latency rows in this window."));
-      holder.appendChild(box);
+      emptyScene(holder, title, "No latency rows in this window.");
       return;
     }
 
@@ -704,69 +1065,84 @@
     );
     const x = (v) => x0 + (v / max) * plotW;
 
-    box.appendChild(
-      legendEl([
-        { name: "p95", color: P95_COLOR },
-        { name: "p50", color: P50_COLOR },
-      ]),
-    );
+    const legendItems = [
+      { name: "p95", color: P95_COLOR },
+      { name: "p50", color: P50_COLOR },
+    ];
+    const key = ["latency", title, nameKey, subLabelKey || "", list.length].join("|");
 
-    const svg = svgEl("svg", { viewBox: "0 0 " + W + " " + H });
-    svg.setAttribute("aria-label", title + " — grouped bars by " + nameKey);
+    const plan = [];
     for (let i = 1; i <= 4; i++) {
       const t = (max / 4) * i;
-      svg.appendChild(svgEl("line", { x1: x(t), x2: x(t), y1: mT - 4, y2: H - 20, class: "grid" }));
-      svg.appendChild(textEl("text", fmtMs(t), { x: x(t), y: H - 6, "text-anchor": "middle", class: "tick-label" }));
+      plan.push({ tag: "line", attrs: { x1: x(t), x2: x(t), y1: mT - 4, y2: H - 20, class: "grid" } });
+      plan.push({
+        tag: "text",
+        text: fmtMs(t),
+        attrs: { x: x(t), y: H - 6, "text-anchor": "middle", class: "tick-label" },
+      });
     }
 
     list.forEach((r, i) => {
       const top = mT + i * rowH;
       const name = r[nameKey];
-      svg.appendChild(
-        textEl("text", name == null ? "—" : String(name), {
-          x: labelW - 8,
-          y: subLabelKey ? top + 20 : top + 23,
-          "text-anchor": "end",
-          class: "row-label",
-        }),
-      );
+      const nameText = name == null ? "—" : String(name);
+      plan.push({
+        tag: "text",
+        text: nameText,
+        attrs: { x: labelW - 8, y: subLabelKey ? top + 20 : top + 23, "text-anchor": "end", class: "row-label" },
+      });
       if (subLabelKey && r[subLabelKey] != null) {
-        svg.appendChild(
-          textEl("text", String(r[subLabelKey]), { x: labelW - 8, y: top + 33, "text-anchor": "end", class: "tick-label" }),
-        );
+        plan.push({
+          tag: "text",
+          text: String(r[subLabelKey]),
+          attrs: { x: labelW - 8, y: top + 33, "text-anchor": "end", class: "tick-label" },
+        });
       }
 
       // p50 and p95 share one baseline; 2px surface gap between the pair.
       const bar = (value, color, series, yOff) => {
         const v = Number(value) || 0;
         const bw = Math.max(2, x(v) - x0);
-        const rect = svgEl("rect", { x: x0, y: top + yOff, width: bw, height: 13, rx: Math.min(4, 6.5) });
-        rect.style.fill = color;
-        svg.appendChild(rect);
-        const hit = svgEl("rect", { x: x0, y: top + yOff - 4, width: Math.max(1, plotW + mR), height: 21, fill: "transparent" });
-        bindHover(hit, (name == null ? "—" : String(name)) + " · " + series, [
-          { label: "requests", value: fmtInt(r.requests) },
-          { swatch: color, label: series, value: fmtMs(value) },
-        ]);
-        svg.appendChild(hit);
+        plan.push({
+          tag: "rect",
+          attrs: { x: x0, y: top + yOff, width: bw, height: 13, rx: Math.min(4, 6.5) },
+          fill: color,
+        });
+        plan.push({
+          tag: "rect",
+          attrs: { x: x0, y: top + yOff - 4, width: Math.max(1, plotW + mR), height: 21, fill: "transparent" },
+          tip: {
+            title: nameText + " · " + series,
+            rows: [
+              { label: "requests", value: fmtInt(r.requests) },
+              { swatch: color, label: series, value: fmtMs(value) },
+            ],
+          },
+        });
         return bw;
       };
       const p95Width = bar(r.p95_ms, P95_COLOR, "p95", 4);
       const p50Width = bar(r.p50_ms, P50_COLOR, "p50", 19);
 
       // p50 sits inside its bar, p95 at the tip when it fits, else inside.
-      if (p50Width > 40) {
-        svg.appendChild(textEl("text", fmtMs(r.p50_ms), { x: x0 + 6, y: top + 29, class: "bar-label-in" }));
-      }
-      if (p95Width > 40) {
-        svg.appendChild(textEl("text", fmtMs(r.p95_ms), { x: x0 + p95Width + 6, y: top + 14, class: "bar-label" }));
-      } else {
-        svg.appendChild(textEl("text", fmtMs(r.p95_ms), { x: x0 + 6, y: top + 14, class: "bar-label-in" }));
-      }
+      // Both label marks are always emitted — the p50 one goes blank rather
+      // than absent when the bar is too short to hold it, so the mark count
+      // does not depend on the numbers and a refresh never has to rebuild.
+      plan.push({
+        tag: "text",
+        text: p50Width > 40 ? fmtMs(r.p50_ms) : "",
+        attrs: { x: x0 + 6, y: top + 29, class: "bar-label-in" },
+      });
+      plan.push({
+        tag: "text",
+        text: fmtMs(r.p95_ms),
+        attrs: p95Width > 40
+          ? { x: x0 + p95Width + 6, y: top + 14, class: "bar-label" }
+          : { x: x0 + 6, y: top + 14, class: "bar-label-in" },
+      });
     });
 
-    box.appendChild(svg);
-    holder.appendChild(box);
+    renderScene(holder, key, title, legendItems, title + " — grouped bars by " + nameKey, "0 0 " + W + " " + H, plan);
   }
 
   /* =====================================================================
@@ -788,12 +1164,8 @@
     const valueLabel = o.valueLabel || "value";
     const list = (rows || []).slice();
 
-    const box = el("div", "subchart");
-    box.appendChild(el("h3", null, title));
-
     if (!list.length) {
-      box.appendChild(el("p", "empty", "No telemetry in this window yet."));
-      holder.appendChild(box);
+      emptyScene(holder, title, "No telemetry in this window yet.");
       return;
     }
 
@@ -822,64 +1194,66 @@
             { label: "errors", value: fmtInt(r.errors || 0) },
           ];
 
-    const svg = svgEl("svg", { viewBox: "0 0 " + W + " " + H });
-    svg.setAttribute("aria-label", title + " — activity over time");
-    for (let i = 1; i <= 4; i++) {
-      const t = (max / 4) * i;
-      svg.appendChild(svgEl("line", { x1: mL, x2: W - mR, y1: y(t), y2: y(t), class: "grid" }));
-      svg.appendChild(textEl("text", valueFmt(t), { x: mL - 8, y: y(t) + 3.5, "text-anchor": "end", class: "tick-label" }));
-    }
-
     const slot = plotW / list.length;
     const labelEvery = Math.max(1, Math.ceil(list.length / 10));
-    list.forEach((r, i) => {
-      if (i % labelEvery === 0) {
-        svg.appendChild(
-          textEl("text", bucketLabel(r.bucket_start, bucket), {
-            x: mL + slot * i + slot / 2,
-            y: H - 14,
-            "text-anchor": "middle",
-            class: "tick-label",
-          }),
-        );
-      }
-    });
+    const barsMode = list.length <= MAX_BAR_BUCKETS;
 
     let peak = 0;
     values.forEach((v, i) => {
       if (v > values[peak]) peak = i;
     });
 
-    if (list.length <= MAX_BAR_BUCKETS) {
+    const key = ["series", title, bucket, valueLabel, barsMode ? "bars" : "line", list.length].join("|");
+    const plan = [];
+    // Index of the shared crosshair mark in the plan, so the per-bucket hover
+    // handlers can move it. Its position is fixed by construction, which keeps
+    // it correct across a morph (the node at that index is the same node).
+    let crossIdx = -1;
+    for (let i = 1; i <= 4; i++) {
+      const t = (max / 4) * i;
+      plan.push({ tag: "line", attrs: { x1: mL, x2: W - mR, y1: y(t), y2: y(t), class: "grid" } });
+      plan.push({
+        tag: "text",
+        text: valueFmt(t),
+        attrs: { x: mL - 8, y: y(t) + 3.5, "text-anchor": "end", class: "tick-label" },
+      });
+    }
+    list.forEach((r, i) => {
+      if (i % labelEvery === 0) {
+        plan.push({
+          tag: "text",
+          text: bucketLabel(r.bucket_start, bucket),
+          attrs: { x: mL + slot * i + slot / 2, y: H - 14, "text-anchor": "middle", class: "tick-label" },
+        });
+      }
+    });
+
+    if (barsMode) {
       const barW = Math.min(24, Math.max(4, slot * 0.62));
       list.forEach((r, i) => {
         const v = values[i];
-        if (v <= 0) return;
         const x0 = mL + slot * i;
-        const rect = svgEl("rect", {
-          x: x0 + (slot - barW) / 2,
-          y: y(v),
-          width: barW,
-          height: Math.max(0, mT + plotH - y(v)),
-          rx: Math.min(4, barW / 2),
+        // Zero buckets keep their mark at zero height: the count stays a
+        // function of the bucket count alone, so a refresh that zeroes one
+        // bucket shrinks it instead of rebuilding the chart.
+        plan.push({
+          tag: "rect",
+          attrs: {
+            x: x0 + (slot - barW) / 2,
+            y: y(v),
+            width: barW,
+            height: Math.max(0, mT + plotH - y(v)),
+            rx: Math.min(4, barW / 2),
+          },
+          fill: PALETTE[0],
         });
-        rect.style.fill = PALETTE[0];
-        svg.appendChild(rect);
         // Full-height, full-slot target: a 4px column is not a hover target.
-        const hit = svgEl("rect", { x: x0, y: mT, width: Math.max(1, slot), height: plotH, fill: "transparent" });
-        bindHover(hit, stampLabel(r.bucket_start, bucket), tipFor(r, v));
-        svg.appendChild(hit);
+        plan.push({
+          tag: "rect",
+          attrs: { x: x0, y: mT, width: Math.max(1, slot), height: plotH, fill: "transparent" },
+          tip: { title: stampLabel(r.bucket_start, bucket), rows: tipFor(r, v) },
+        });
       });
-      if (values[peak] > 0) {
-        svg.appendChild(
-          textEl("text", valueFmt(values[peak]), {
-            x: mL + slot * peak + slot / 2,
-            y: y(values[peak]) - 6,
-            "text-anchor": "middle",
-            class: "bar-label",
-          }),
-        );
-      }
     } else {
       // Thin line, no markers (hundreds of them would be a texture, not data),
       // plus a crosshair so a bucket is still individually addressable.
@@ -888,44 +1262,51 @@
         const cx = mL + slot * i + slot / 2;
         d += (i === 0 ? "M" : "L") + cx.toFixed(1) + " " + y(v).toFixed(1) + " ";
       });
-      const path = svgEl("path", { d: d.trim(), fill: "none" });
-      path.setAttribute("class", "series-line");
-      svg.appendChild(path);
-
-      const cross = svgEl("line", { x1: 0, x2: 0, y1: mT, y2: mT + plotH, class: "crosshair" });
-      cross.style.display = "none";
-      svg.appendChild(cross);
-
-      list.forEach((r, i) => {
-        const hit = svgEl("rect", { x: mL + slot * i, y: mT, width: Math.max(1, slot), height: plotH, fill: "transparent" });
-        hit.addEventListener("pointermove", (ev) => {
-          const cx = mL + slot * i + slot / 2;
-          cross.setAttribute("x1", cx);
-          cross.setAttribute("x2", cx);
-          cross.style.display = "block";
-          tipShow(stampLabel(r.bucket_start, bucket), tipFor(r, values[i]));
-          tipMove(ev);
-        });
-        hit.addEventListener("pointerleave", () => {
-          cross.style.display = "none";
-          tipHide();
-        });
-        svg.appendChild(hit);
+      plan.push({ tag: "path", attrs: { d: d.trim(), fill: "none", class: "series-line" } });
+      crossIdx = plan.length;
+      plan.push({
+        tag: "line",
+        attrs: { x1: 0, x2: 0, y1: mT, y2: mT + plotH, class: "crosshair", style: "display: none" },
       });
-      if (values[peak] > 0) {
-        svg.appendChild(
-          textEl("text", valueFmt(values[peak]), {
-            x: Math.min(W - mR - 4, mL + slot * peak + slot / 2),
-            y: Math.max(mT + 10, y(values[peak]) - 8),
-            "text-anchor": "middle",
-            class: "bar-label",
-          }),
-        );
-      }
+      list.forEach((r, i) => {
+        plan.push({
+          tag: "rect",
+          attrs: { x: mL + slot * i, y: mT, width: Math.max(1, slot), height: plotH, fill: "transparent" },
+          tip: { title: stampLabel(r.bucket_start, bucket), rows: tipFor(r, values[i]) },
+          // The crosshair is shared by every bucket, so its position is
+          // re-pointed per hover — and survives a morph, because the handler
+          // reads the scene rather than closing over this render's row.
+          move: (ev) => {
+            const cross = holder._scene && holder._scene.nodes[crossIdx];
+            if (cross) {
+              const cx = mL + slot * i + slot / 2;
+              cross.setAttribute("x1", cx);
+              cross.setAttribute("x2", cx);
+              cross.style.display = "block";
+            }
+            tipMove(ev);
+          },
+          leave: () => {
+            const cross = holder._scene && holder._scene.nodes[crossIdx];
+            if (cross) cross.style.display = "none";
+          },
+        });
+      });
     }
+    // One direct label per chart: the peak bucket. Emitted in both modes and
+    // blanked when there is nothing to say, so the count never moves.
+    plan.push({
+      tag: "text",
+      text: values[peak] > 0 ? valueFmt(values[peak]) : "",
+      attrs: {
+        x: Math.min(W - mR - 4, mL + slot * peak + slot / 2),
+        y: Math.max(mT + 10, y(values[peak]) - (barsMode ? 6 : 8)),
+        "text-anchor": "middle",
+        class: "bar-label",
+      },
+    });
 
-    box.appendChild(svg);
-    holder.appendChild(box);
+    renderScene(holder, key, title, null, title + " — activity over time", "0 0 " + W + " " + H, plan);
   }
 
   window.HiveCharts = {
@@ -959,6 +1340,12 @@
     hourLabel: hourLabel,
     bucketLabel: bucketLabel,
     stampLabel: stampLabel,
+    // in-place update
+    tweenText: tweenText,
+    tweenCancel: tweenCancel,
+    fadeIn: fadeIn,
+    flash: flash,
+    prefersReducedMotion: prefersReducedMotion,
     // interaction
     tipShow: tipShow,
     tipMove: tipMove,
