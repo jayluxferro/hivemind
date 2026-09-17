@@ -22,6 +22,7 @@ import pytest
 
 from hivemind.telemetry.ledger import (
     _COLUMN_ORDER,
+    _SCHEMA_DDL,
     _insert_params,
     _PRUNE_INTERVAL_S,
     _QUEUE_MAX,
@@ -278,7 +279,7 @@ async def test_connect_runs_schema_ddl():
     ledger = TelemetryLedger("postgresql://fake", conn_factory=_fake_factory(conn))
     await ledger.connect()
     statements = [sql for sql, _ in conn.executed]
-    assert len(statements) == 6
+    assert len(statements) == 7
     assert statements[0] == "CREATE SCHEMA IF NOT EXISTS mesh_telemetry"
     assert "CREATE TABLE IF NOT EXISTS mesh_telemetry.token_usage" in statements[1]
     assert "usage_cost" in statements[-1]
@@ -1057,3 +1058,38 @@ async def test_schema_ddl_executes_against_real_postgres():
     finally:
         await ledger.shutdown()
         await _cleanup()
+
+
+# --- DDL parse smoke test (regression: the trailing-comma incident) ---------
+
+
+def test_schema_ddl_parses_against_real_postgres():
+    """Every _SCHEMA_DDL statement must PARSE on real PostgreSQL.
+
+    The fake-connection tests above only record statement strings — a SQL
+    syntax error ships invisible to them (the 2026-09-17 outage: one
+    trailing comma zeroed all telemetry).  This smoke test runs each
+    statement inside a rolled-back transaction against the local Postgres
+    and skips (not fails) when that database is unavailable, so CI
+    without PG still passes.
+    """
+    pytest.importorskip("psycopg")
+    import psycopg
+
+    try:
+        conn = psycopg.connect("postgresql://hivemind@localhost:5432/hivemind", connect_timeout=3)
+    except Exception:
+        pytest.skip("local Postgres unavailable")
+    try:
+        conn.autocommit = True
+        cur = conn.cursor()
+        cur.execute("BEGIN")
+        try:
+            for statement in _SCHEMA_DDL:
+                cur.execute(statement)
+        except Exception as exc:
+            pytest.fail(f"schema DDL does not parse: {exc}\nstatement: {statement!r}")
+        finally:
+            cur.execute("ROLLBACK")
+    finally:
+        conn.close()

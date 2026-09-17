@@ -106,7 +106,7 @@ _SCHEMA_DDL = (
         reasoning    BIGINT,
         latency_ms   DOUBLE PRECISION,
         status       INTEGER NOT NULL,
-        conversation_hash TEXT,              -- sha256[:16] of the client session header
+        conversation_hash TEXT               -- sha256[:16] of the client session header
                                              -- (x-claude-code-session-id et al); NULL = none sent
     )
     """,
@@ -124,6 +124,24 @@ _SCHEMA_DDL = (
         price_out         DOUBLE PRECISION,
         PRIMARY KEY (provider, model)
     )
+    """,
+    # Migration guard: the view is SELECT u.*, so it freezes the table's
+    # column list at creation time.  When the ALTER above adds a column,
+    # CREATE OR REPLACE cannot reconcile the old shape — PG refuses to
+    # rename a view column (measured: "cannot change name of view column
+    # cost_usd to conversation_hash").  Drop the view exactly when the
+    # shapes mismatch (cheap catalog count, no-op afterwards); the
+    # REPLACE below then recreates it with the new shape.
+    """
+    DO $$ BEGIN
+      IF (SELECT count(*) FROM information_schema.columns
+           WHERE table_schema = 'mesh_telemetry' AND table_name = 'usage_cost')
+         <> (SELECT count(*) FROM information_schema.columns
+              WHERE table_schema = 'mesh_telemetry' AND table_name = 'token_usage') + 1
+      THEN
+        EXECUTE 'DROP VIEW mesh_telemetry.usage_cost';
+      END IF;
+    END $$;
     """,
     # SPEC §3 DDL, with the syntax error fixed: round(SUM / 1e6 AS numeric), 6) — the
     # prices are per 1M tokens, so the dollar figure is the products divided
