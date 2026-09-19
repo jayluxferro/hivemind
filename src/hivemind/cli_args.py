@@ -143,9 +143,13 @@ def apply_serve_cli_args_to_config(config: HiveMindConfig, args: argparse.Namesp
         config.normalize_runtime_limits()  # re-validate the merged registry loudly
     if getattr(args, "max_rate_wait", None) is not None:
         config.max_rate_wait_s = args.max_rate_wait
+        # Post-construction attribute sets bypass dataclass validation —
+        # normalize here so a bad --max-rate-wait fails at apply time.
+        # (Was accidentally nested under the no-rate-limiting branch,
+        # where the only assignment is a bool and nothing validates.)
+        config.normalize_runtime_limits()
     if getattr(args, "no_rate_limiting", False):
         config.rate_limiting_enabled = False
-        config.normalize_runtime_limits()  # fail loudly on a bad value
     if getattr(args, "telemetry_retention_days", None) is not None:
         config.telemetry_retention_days = args.telemetry_retention_days
         config.normalize_runtime_limits()  # fail loudly on a bad value

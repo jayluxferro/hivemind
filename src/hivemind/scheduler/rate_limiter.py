@@ -380,8 +380,6 @@ class RateLimiter:
         return self._windows.get(provider)
 
     async def update_from_headers(self, headers: dict[str, str], provider: str = "default") -> None:
-        if not self._enabled:
-            return  # kill-switch: headers cannot pause a disabled limiter
         """Parse rate limit headers from an API response.
 
         Supports both Anthropic and OpenAI header formats:
@@ -394,6 +392,8 @@ class RateLimiter:
         Header state is global: it describes the shared upstream API key,
         so it pauses every agent regardless of scope.
         """
+        if not self._enabled:
+            return  # kill-switch: headers cannot pause a disabled limiter
         async with self._lock:
             window = self._windows.get(provider, RateLimitWindow())
 

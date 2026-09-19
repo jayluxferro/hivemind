@@ -1076,8 +1076,11 @@ def test_schema_ddl_parses_against_real_postgres():
     pytest.importorskip("psycopg")
     import psycopg
 
+    dsn = os.environ.get(
+        "HIVEMIND_TEST_DB_URL", "postgresql://hivemind@localhost:5432/hivemind_test"
+    )
     try:
-        conn = psycopg.connect("postgresql://hivemind@localhost:5432/hivemind", connect_timeout=3)
+        conn = psycopg.connect(dsn, connect_timeout=3)
     except Exception:
         pytest.skip("local Postgres unavailable")
     try:
@@ -1127,8 +1130,11 @@ def test_every_read_sql_constant_parses_on_real_postgres():
     from hivemind.telemetry import ledger as L
     from hivemind.telemetry.ledger import _SQL_TOTALS
 
+    dsn = os.environ.get(
+        "HIVEMIND_TEST_DB_URL", "postgresql://hivemind@localhost:5432/hivemind_test"
+    )
     try:
-        conn = psycopg.connect("postgresql://hivemind@localhost:5432/hivemind", connect_timeout=3)
+        conn = psycopg.connect(dsn, connect_timeout=3)
     except Exception:
         pytest.skip("local Postgres unavailable")
     window = ("2026-01-01", "2026-01-02")
@@ -1142,7 +1148,17 @@ def test_every_read_sql_constant_parses_on_real_postgres():
         ("LATENCY_MODELS", L._SQL_LATENCY_MODELS),
         ("SERIES_HOUR", L._SQL_SERIES_HOUR.format(where=L._RANGE)),
         ("SERIES_DAY", L._SQL_SERIES_DAY.format(where=L._RANGE)),
+        ("FACET_AGENTS", L._SQL_FACET_AGENTS),
+        ("FACET_MODELS", L._SQL_FACET_MODELS),
+        ("FACET_PROVIDERS", L._SQL_FACET_PROVIDERS),
     ]
+    # The one statement that runs WITH params from the write path — a bare
+    # percent here passes every other guard while breaking every real write
+    # (proven by the hostile verifier's plant).  Parse check inside the
+    # same rolled-back transaction: INSERT ... ROLLBACK writes nothing.
+    # Column types per _COLUMN_ORDER: text, text, text, bigint x5,
+    # double, int, text — properly typed so the parse check is real.
+    insert_params = ("bucket", "prov", "model", 1, 1, 1, 1, None, 1.0, 200, None)
     try:
         conn.autocommit = True
         cur = conn.cursor()
@@ -1151,6 +1167,7 @@ def test_every_read_sql_constant_parses_on_real_postgres():
             for name, sql in cases:
                 cur.execute(sql, window)
                 cur.fetchall()
+            cur.execute(L._INSERT_SQL, insert_params)  # no records to fetch
         except Exception as exc:
             pytest.fail(f"read SQL does not parse ({name}): {exc}")
         finally:
