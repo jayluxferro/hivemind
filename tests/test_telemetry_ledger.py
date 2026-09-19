@@ -1164,6 +1164,12 @@ def test_every_read_sql_constant_parses_on_real_postgres():
         cur = conn.cursor()
         cur.execute("BEGIN")
         try:
+            # CI's hivemind_test is a FRESH database: the read constants
+            # reference mesh_telemetry tables that must exist before the
+            # parse check.  DDL inside the same rolled-back transaction —
+            # schema appears, every statement parses, nothing persists.
+            for statement in L._SCHEMA_DDL:
+                cur.execute(statement)
             for name, sql in cases:
                 cur.execute(sql, window)
                 cur.fetchall()
