@@ -227,6 +227,12 @@ class HiveMindConfig:
     # Rate limits (None = use provider profile defaults)
     rpm_limit: int | None = None
     tpm_limit: int | None = None
+    # Master kill-switch for ALL rate limiting (operator escape hatch —
+    # benchmarking, or an incident where throttling itself is the problem):
+    # when False the limiter never waits, never records, and ignores
+    # rate-limit response headers.  Admission control and budgets are NOT
+    # affected.  CLI: --no-rate-limiting.
+    rate_limiting_enabled: bool = True
     # Sliding-window scope: "per_agent" buckets RPM/TPM by agent identity so
     # one session can't stall another; "global" shares one window (original
     # behavior). Header-driven throttling stays global either way.
@@ -338,6 +344,7 @@ class HiveMindConfig:
             "retry_max_delay": self.retry_max_delay,
             "rpm_limit": self.rpm_limit,
             "tpm_limit": self.tpm_limit,
+            "rate_limiting_enabled": self.rate_limiting_enabled,
             "rate_limit_scope": self.rate_limit_scope,
             "max_rate_wait_s": self.max_rate_wait_s,
             "agent_limit_overrides": {agent: dict(limits) for agent, limits in self.agent_limit_overrides.items()},

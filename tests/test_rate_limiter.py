@@ -1,5 +1,7 @@
 """Tests for the rate limit tracker."""
 
+import time
+
 import pytest
 
 from hivemind.scheduler.rate_limiter import RateLimiter
@@ -483,3 +485,50 @@ async def test_invalid_agent_limits_rejected():
     rl = RateLimiter()
     with pytest.raises(ValueError):
         rl.set_agent_limits({"a": {"rpm": -3}})
+
+
+# --- kill-switch: one flag provably disables every throttle path -------------
+
+
+async def test_disabled_limiter_never_waits_even_when_saturated():
+    """Seed limits, force-fill the windows, install a header pause — a
+    disabled limiter must still return immediately from wait_if_throttled
+    and report not-throttled: the guard lives in _wait_seconds, so no
+    call site can bypass it."""
+    limiter = RateLimiter(enabled=False)
+    limiter._rpm_limit = 1
+    limiter._tpm_limit = 10
+    # Force-fill the shared windows past their limits (bypassing the
+    # disabled record_* guards on purpose — the wait guard must hold
+    # regardless of window state).
+    now = time.monotonic()
+    limiter._request_timestamps.extend([now, now, now, now, now])
+    limiter._token_usage.extend([(now, 10_000)] * 5)
+    limiter._pause_until = time.time() + 60.0  # header pause active
+
+    assert await limiter.wait_if_throttled() == 0.0
+    assert limiter.is_throttled is False
+    assert limiter.agent_is_throttled("any-agent") is False
+    assert limiter.throttle_remaining_seconds == 0.0
+
+
+async def test_disabled_limiter_ignores_headers_and_records_nothing():
+    limiter = RateLimiter(enabled=False)
+    await limiter.update_from_headers(
+        {
+            "x-ratelimit-remaining-requests": "0",
+            "retry-after": "30",
+        }
+    )
+    assert limiter._pause_until == 0.0  # headers could not pause
+
+    limiter.record_request("a")
+    limiter.record_tokens(500, agent_id="a")
+    assert not limiter._request_timestamps
+    assert not limiter._token_usage
+
+
+def test_disabled_limiter_stats_reports_the_switch():
+    limiter = RateLimiter(enabled=False)
+    assert limiter.stats["enabled"] is False
+    assert RateLimiter().stats["enabled"] is True

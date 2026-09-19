@@ -63,6 +63,12 @@ def register_serve_cli_arguments(parser: argparse.ArgumentParser) -> None:
         help="Default per-agent token budget (default: unlimited)",
     )
     parser.add_argument("--max-retries", type=int, default=3, help="Max transparent retries on 429/502")
+    parser.add_argument(
+        "--no-rate-limiting",
+        action="store_true",
+        help="Disable ALL rate limiting (never wait, never record, ignore rate-limit headers). "
+        "Admission control and budgets still apply.",
+    )
     parser.add_argument("--min-concurrency", type=int, default=1, help="Floor for AIMD backpressure")
     parser.add_argument(
         "--insecure",
@@ -137,6 +143,8 @@ def apply_serve_cli_args_to_config(config: HiveMindConfig, args: argparse.Namesp
         config.normalize_runtime_limits()  # re-validate the merged registry loudly
     if getattr(args, "max_rate_wait", None) is not None:
         config.max_rate_wait_s = args.max_rate_wait
+    if getattr(args, "no_rate_limiting", False):
+        config.rate_limiting_enabled = False
         config.normalize_runtime_limits()  # fail loudly on a bad value
     if getattr(args, "telemetry_retention_days", None) is not None:
         config.telemetry_retention_days = args.telemetry_retention_days
@@ -185,6 +193,12 @@ def register_proxy_cli_arguments(
         help="Days of token-ledger history to keep (pruned 24h; default 90, HIVEMIND_TELEMETRY_RETENTION_DAYS env)",
     )
     parser.add_argument("--max-retries", type=int, default=3, help="Max transparent retries on 429/502")
+    parser.add_argument(
+        "--no-rate-limiting",
+        action="store_true",
+        help="Disable ALL rate limiting (never wait, never record, ignore rate-limit headers). "
+        "Admission control and budgets still apply. Escape hatch for benchmarks/incidents.",
+    )
     parser.add_argument("--retry-base-delay", type=float, default=1.0, help="Base retry delay in seconds")
     parser.add_argument("--retry-max-delay", type=float, default=30.0, help="Max retry delay in seconds")
     parser.add_argument(
@@ -267,6 +281,7 @@ def hivemind_config_from_proxy_cli_args(args: argparse.Namespace) -> HiveMindCon
         retry_base_delay=args.retry_base_delay,
         retry_max_delay=args.retry_max_delay,
         http_tls_verify=not getattr(args, "insecure", False),
+        rate_limiting_enabled=not getattr(args, "no_rate_limiting", False),
     )
     if args.total_budget is not None:
         config.total_token_budget = args.total_budget
@@ -289,6 +304,8 @@ def hivemind_config_from_proxy_cli_args(args: argparse.Namespace) -> HiveMindCon
         config.normalize_runtime_limits()  # re-validate the merged registry loudly
     if getattr(args, "max_rate_wait", None) is not None:
         config.max_rate_wait_s = args.max_rate_wait
+    if getattr(args, "no_rate_limiting", False):
+        config.rate_limiting_enabled = False
         config.normalize_runtime_limits()  # fail loudly on a bad value
     if getattr(args, "telemetry_retention_days", None) is not None:
         config.telemetry_retention_days = args.telemetry_retention_days

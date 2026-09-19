@@ -148,11 +148,16 @@ class RateLimiter:
         scope: str = "per_agent",
         agent_limits: dict | None = None,
         max_wait_s: float = MAX_WAIT_S,
+        enabled: bool = True,
     ) -> None:
         if scope not in SCOPES:
             raise ValueError(f"Invalid rate limiter scope {scope!r}; expected one of {SCOPES}")
         if not isinstance(max_wait_s, (int, float)) or isinstance(max_wait_s, bool) or max_wait_s <= 0:
             raise ValueError(f"max_wait_s must be a positive number of seconds, got {max_wait_s!r}")
+        # Kill-switch (config.rate_limiting_enabled): guarded inside the
+        # limiter itself — not at the call sites — so no caller can bypass
+        # it and one flag provably disables every throttle path.
+        self._enabled = bool(enabled)
         self._max_wait_s = float(max_wait_s)
         self._scope = scope
         self._windows: dict[str, RateLimitWindow] = {}
@@ -252,12 +257,15 @@ class RateLimiter:
 
     def record_request(self, agent_id: str | None = None) -> None:
         """Record that a request was sent (for RPM counting)."""
+        if not self._enabled:
+            return
         self._requests_window(agent_id).append(time.monotonic())
 
     def record_tokens(self, count: int, agent_id: str | None = None) -> None:
         """Record token usage (for TPM counting)."""
-        if count > 0:
-            self._tokens_window(agent_id).append((time.monotonic(), count))
+        if not self._enabled or count <= 0:
+            return
+        self._tokens_window(agent_id).append((time.monotonic(), count))
 
     # -- wait computation ----------------------------------------------------
 
@@ -349,6 +357,8 @@ class RateLimiter:
 
     def _wait_seconds(self, agent_id: str | None) -> float:
         """Combined wait: global header pause + this agent's window wait."""
+        if not self._enabled:
+            return 0.0  # kill-switch: no throttle path may produce a wait
         header_wait = max(0.0, self._pause_until - time.time())  # always global
         return max(header_wait, self._rpm_wait_seconds(agent_id), self._tpm_wait_seconds(agent_id))
 
@@ -370,6 +380,8 @@ class RateLimiter:
         return self._windows.get(provider)
 
     async def update_from_headers(self, headers: dict[str, str], provider: str = "default") -> None:
+        if not self._enabled:
+            return  # kill-switch: headers cannot pause a disabled limiter
         """Parse rate limit headers from an API response.
 
         Supports both Anthropic and OpenAI header formats:
@@ -507,6 +519,7 @@ class RateLimiter:
         aggregate_requests, aggregate_tokens = self._aggregate_counts()
 
         result: dict = {
+            "enabled": self._enabled,
             "is_throttled": self.is_throttled,
             "throttle_remaining_seconds": round(self.throttle_remaining_seconds, 2),
             "provider": self._provider_name,

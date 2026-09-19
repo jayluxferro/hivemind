@@ -209,3 +209,31 @@ def test_telemetry_retention_days_flag_revalidates(monkeypatch):
         _proxy_config(["--telemetry-retention-days", "0"])
     with pytest.raises(SystemExit):
         _proxy_config(["--telemetry-retention-days", "not-a-number"])
+
+
+# --- rate-limiting kill-switch ----------------------------------------------
+
+
+def test_proxy_cli_no_rate_limiting_flag():
+    parser = argparse.ArgumentParser()
+    register_proxy_cli_arguments(parser)
+    args = parser.parse_args(["--no-rate-limiting"])
+    c = hivemind_config_from_proxy_cli_args(args)
+    assert c.rate_limiting_enabled is False
+    assert c.to_dict()["rate_limiting_enabled"] is False
+
+
+def test_proxy_cli_rate_limiting_default_on():
+    parser = argparse.ArgumentParser()
+    register_proxy_cli_arguments(parser)
+    c = hivemind_config_from_proxy_cli_args(parser.parse_args([]))
+    assert c.rate_limiting_enabled is True
+
+
+def test_serve_cli_no_rate_limiting_flag():
+    parser = argparse.ArgumentParser()
+    register_serve_cli_arguments(parser)
+    args = parser.parse_args(["--no-rate-limiting"])
+    c = HiveMindConfig()
+    apply_serve_cli_args_to_config(c, args)
+    assert c.rate_limiting_enabled is False
