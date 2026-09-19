@@ -498,7 +498,7 @@ def _overview_fixtures(holder: FakeConn) -> None:
             "tokens_out": 800,
             "cache_read": 600,
             "cache_write": 25,
-            "cache_hit_pct": 30.0,
+            "cache_hit_pct": 0.3,
             "cost_usd": 0.0123,
         }
     }
@@ -526,7 +526,7 @@ async def test_fetch_overview_shapes_payload_and_windows_the_reads():
         "cache_read": 600,
         "cache_write": 25,
         # 600 / (600 + 1400) — real input is cache_read + fresh-only tokens_in.
-        "cache_hit_pct": 30.0,
+        "cache_hit_pct": 0.3,
         "cost_usd": 0.0123,
     }
     assert payload["daily_agents"][0] == {

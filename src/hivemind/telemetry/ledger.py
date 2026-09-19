@@ -217,8 +217,11 @@ SELECT count(*) AS requests,
        sum(coalesce(cache_write, 0))::bigint AS cache_write,
        -- tokens_in is fresh-only on the dominant provider, so the real input
        -- is cache_read + tokens_in and the ratio is the cache-hit share.
-       round(100.0 * sum(coalesce(cache_read, 0)) /
-             nullif(sum(coalesce(cache_read, 0)) + sum(coalesce(tokens_in, 0)), 0), 1)
+       -- 0-1 scale, matching error_rate: the payload carries ONE scale so
+       -- a UI formatter can never multiply the wrong field by 100 (the
+       -- 8450.0% bug: a 0-100 value through the 0-1 percent formatter).
+       round(sum(coalesce(cache_read, 0))::numeric /
+             nullif(sum(coalesce(cache_read, 0)) + sum(coalesce(tokens_in, 0)), 0), 4)
              AS cache_hit_pct,
        coalesce(sum(cost_usd), 0)::double precision AS cost_usd
 FROM mesh_telemetry.usage_cost
@@ -232,8 +235,8 @@ SELECT provider, model, count(*) AS requests,
        sum(coalesce(tokens_in, 0))::bigint AS tokens_in,
        sum(coalesce(tokens_out, 0))::bigint AS tokens_out,
        sum(coalesce(cache_read, 0))::bigint AS cache_read,
-       round(100.0 * sum(coalesce(cache_read, 0)) /
-             nullif(sum(coalesce(cache_read, 0)) + sum(coalesce(tokens_in, 0)), 0), 1)
+       round(sum(coalesce(cache_read, 0))::numeric /
+             nullif(sum(coalesce(cache_read, 0)) + sum(coalesce(tokens_in, 0)), 0), 4)
              AS cache_hit_pct,
        round(coalesce(sum(cost_usd), 0), 6) AS cost_usd
 FROM mesh_telemetry.usage_cost
