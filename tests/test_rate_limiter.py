@@ -532,3 +532,33 @@ def test_disabled_limiter_stats_reports_the_switch():
     limiter = RateLimiter(enabled=False)
     assert limiter.stats["enabled"] is False
     assert RateLimiter().stats["enabled"] is True
+
+
+def test_every_rate_limiter_construction_passes_enabled():
+    """Wiring contract: EVERY RateLimiter(...) call site in the package must
+    pass enabled=, so config.rate_limiting_enabled cannot be silently
+    dropped by an entrypoint (regression: `hivemind proxy` built its own
+    limiter without the kwarg while `serve` had it — the kill-switch was
+    dead code on the exact path manifold launches)."""
+    import inspect
+    import re
+    from pathlib import Path
+
+    import hivemind
+
+    pkg = Path(inspect.getfile(hivemind)).parent
+    pattern = re.compile(r"RateLimiter\(")
+    checked = 0
+    for py in pkg.rglob("*.py"):
+        src = py.read_text()
+        for m in pattern.finditer(src):
+            # capture the balanced call up to the closing paren
+            depth, i = 1, m.end()
+            while depth and i < len(src):
+                depth += src[i] == "("
+                depth -= src[i] == ")"
+                i += 1
+            call = src[m.start() : i]
+            assert "enabled=" in call, f"{py}:{src[:m.start()].count(chr(10)) + 1} builds RateLimiter without enabled="
+            checked += 1
+    assert checked >= 2, "expected at least the serve + proxy construction sites"

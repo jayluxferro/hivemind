@@ -640,6 +640,7 @@ def _build_proxy(config: HiveMindConfig) -> ProxyServer:
         scope=config.rate_limit_scope,
         agent_limits=config.agent_limit_overrides,
         max_wait_s=config.max_rate_wait_s,
+        enabled=config.rate_limiting_enabled,
     )
     if config.provider:
         from ..scheduler.providers import get_profile
