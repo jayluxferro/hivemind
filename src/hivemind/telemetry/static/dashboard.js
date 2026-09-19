@@ -1022,6 +1022,11 @@
       out.errors += r.errors || 0;
     }
     out.error_rate = out.requests > 0 ? out.errors / out.requests : 0;
+    // Same definition as the server tile: reads over reads + fresh input
+    // (tokens_in is fresh-only).  Without this the agents view rendered a
+    // permanent em dash on its Cache hit tile.
+    const input = out.cache_read + out.tokens_in;
+    out.cache_hit_pct = input > 0 ? out.cache_read / input : null;
     return out;
   }
 

@@ -139,7 +139,7 @@ _SCHEMA_DDL = (
          <> (SELECT count(*) FROM information_schema.columns
               WHERE table_schema = 'mesh_telemetry' AND table_name = 'token_usage') + 1
       THEN
-        EXECUTE 'DROP VIEW mesh_telemetry.usage_cost';
+        EXECUTE 'DROP VIEW IF EXISTS mesh_telemetry.usage_cost';
       END IF;
     END $$;
     """,
@@ -219,7 +219,8 @@ SELECT count(*) AS requests,
        -- is cache_read + tokens_in and the ratio is the cache-hit share.
        -- 0-1 scale, matching error_rate: the payload carries ONE scale so
        -- a UI formatter can never multiply the wrong field by 100 (the
-       -- 8450.0% bug: a 0-100 value through the 0-1 percent formatter).
+       -- 8450-tile bug: a 0-100 value through the 0-1 percent formatter;
+       -- no bare percent signs in SQL text -- psycopg scans comments too).
        round(sum(coalesce(cache_read, 0))::numeric /
              nullif(sum(coalesce(cache_read, 0)) + sum(coalesce(tokens_in, 0)), 0), 4)
              AS cache_hit_pct,
@@ -1102,7 +1103,8 @@ def _shape_overview(
             "tokens_out": _int((totals or {}).get("tokens_out")),
             "cache_read": _int((totals or {}).get("cache_read")),
             "cache_write": _int((totals or {}).get("cache_write")),
-            "cache_hit_pct": None if (totals or {}).get("cache_hit_pct") is None
+            "cache_hit_pct": None
+            if (totals or {}).get("cache_hit_pct") is None
             else float((totals or {})["cache_hit_pct"]),
             "cost_usd": _cost((totals or {}).get("cost_usd")),
         },
@@ -1125,8 +1127,7 @@ def _shape_overview(
                 "tokens_in": int(row["tokens_in"]),
                 "tokens_out": int(row["tokens_out"]),
                 "cache_read": _int(row.get("cache_read")),
-                "cache_hit_pct": None if row.get("cache_hit_pct") is None
-                else float(row["cache_hit_pct"]),
+                "cache_hit_pct": None if row.get("cache_hit_pct") is None else float(row["cache_hit_pct"]),
                 "cost_usd": _cost(row["cost_usd"]),
             }
             for row in top_models

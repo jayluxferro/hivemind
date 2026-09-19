@@ -755,9 +755,7 @@ def test_conversation_hash_prefers_the_first_session_header():
         "x-claude-code-session-id": "sess-aaa",
         "x-cursor-session-id": "sess-bbb",
     }
-    assert _conversation_hash(headers) == _conversation_hash(
-        {"x-claude-code-session-id": "sess-aaa"}
-    )
+    assert _conversation_hash(headers) == _conversation_hash({"x-claude-code-session-id": "sess-aaa"})
     # Deterministic and hashed, never the raw value.
     import hashlib
 
@@ -783,17 +781,16 @@ async def test_usage_row_carries_conversation_hash(components):
     await interceptor.start()
     try:
         row = interceptor._usage_row(
-            _result(), body=b'{"model": "m"}', agent_id="a", rate_key=None,
+            _result(),
+            body=b'{"model": "m"}',
+            agent_id="a",
+            rate_key=None,
             headers={"x-claude-code-session-id": "sess-1"},
         )
         from hivemind.proxy.interceptor import _conversation_hash
 
-        assert row["conversation_hash"] == _conversation_hash(
-            {"x-claude-code-session-id": "sess-1"}
-        )
-        assert interceptor._usage_row(
-            _result(), body=b'{}', agent_id="a", rate_key=None
-        )["conversation_hash"] is None
+        assert row["conversation_hash"] == _conversation_hash({"x-claude-code-session-id": "sess-1"})
+        assert interceptor._usage_row(_result(), body=b"{}", agent_id="a", rate_key=None)["conversation_hash"] is None
     finally:
         await interceptor.stop()
 

@@ -1093,3 +1093,67 @@ def test_schema_ddl_parses_against_real_postgres():
             cur.execute("ROLLBACK")
     finally:
         conn.close()
+
+
+# --- Read-SQL guards (regression: the 8450-fix comment broke every read) ----
+
+
+def test_no_bare_percent_in_any_sql_constant():
+    """psycopg scans the WHOLE statement for placeholders, comments
+    included: a literal percent that is not %s or %% raises
+    'incomplete placeholder' at execute time.  The 8450-tile fix shipped
+    exactly that in a SQL comment and would have killed every read on
+    restart.  Static lint: no bare percent anywhere in SQL text."""
+    import re
+
+    from hivemind.telemetry import ledger as L
+
+    constants = [getattr(L, name) for name in dir(L) if name.startswith("_SQL_") and isinstance(getattr(L, name), str)]
+    assert len(constants) >= 8, "expected the read constants to exist"
+    for sql in constants:
+        offenders = re.findall(r"%(?!s)(?!%)", sql.replace("%%", ""))
+        assert not offenders, f"bare percent in SQL constant: {sql[:120]!r}"
+
+
+def test_every_read_sql_constant_parses_on_real_postgres():
+    """The fake-connection tests only record strings; the trailing-comma
+    incident added a DDL smoke test, and the 8450-fix comment proved the
+    READ queries need the same.  Each constant executes (parameterized,
+    inside a rolled-back transaction) against local Postgres; skips when
+    unavailable."""
+    pytest.importorskip("psycopg")
+    import psycopg
+
+    from hivemind.telemetry import ledger as L
+    from hivemind.telemetry.ledger import _SQL_TOTALS
+
+    try:
+        conn = psycopg.connect("postgresql://hivemind@localhost:5432/hivemind", connect_timeout=3)
+    except Exception:
+        pytest.skip("local Postgres unavailable")
+    window = ("2026-01-01", "2026-01-02")
+    cases = [
+        ("TOTALS", _SQL_TOTALS),
+        ("TOP_MODELS", L._SQL_TOP_MODELS),
+        ("AGENTS", L._SQL_AGENTS),
+        ("DAILY_AGENTS", L._SQL_DAILY_AGENTS),
+        ("LATENCY", L._SQL_LATENCY),
+        ("STATUS", L._SQL_STATUS),
+        ("LATENCY_MODELS", L._SQL_LATENCY_MODELS),
+        ("SERIES_HOUR", L._SQL_SERIES_HOUR.format(where=L._RANGE)),
+        ("SERIES_DAY", L._SQL_SERIES_DAY.format(where=L._RANGE)),
+    ]
+    try:
+        conn.autocommit = True
+        cur = conn.cursor()
+        cur.execute("BEGIN")
+        try:
+            for name, sql in cases:
+                cur.execute(sql, window)
+                cur.fetchall()
+        except Exception as exc:
+            pytest.fail(f"read SQL does not parse ({name}): {exc}")
+        finally:
+            cur.execute("ROLLBACK")
+    finally:
+        conn.close()

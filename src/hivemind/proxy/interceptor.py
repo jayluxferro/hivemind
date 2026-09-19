@@ -287,9 +287,7 @@ class Interceptor:
         (including a hostile ledger) is logged at DEBUG and swallowed.
         """
         try:
-            row = self._usage_row(
-                result, body=body, agent_id=agent_id, rate_key=rate_key, headers=headers
-            )
+            row = self._usage_row(result, body=body, agent_id=agent_id, rate_key=rate_key, headers=headers)
             ledger = get_ledger()
             task = asyncio.get_running_loop().create_task(ledger.record(row))
             task.add_done_callback(_discard_task_exception)

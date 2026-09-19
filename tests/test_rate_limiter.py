@@ -559,6 +559,6 @@ def test_every_rate_limiter_construction_passes_enabled():
                 depth -= src[i] == ")"
                 i += 1
             call = src[m.start() : i]
-            assert "enabled=" in call, f"{py}:{src[:m.start()].count(chr(10)) + 1} builds RateLimiter without enabled="
+            assert "enabled=" in call, f"{py}:{src[: m.start()].count(chr(10)) + 1} builds RateLimiter without enabled="
             checked += 1
     assert checked >= 2, "expected at least the serve + proxy construction sites"
