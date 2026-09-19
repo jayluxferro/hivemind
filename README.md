@@ -164,6 +164,7 @@ hivemind setup all         # Show all configs
 | `--rate-limit-scope` | `per_agent` | `per_agent` buckets rate limits by session; `global` shares one window |
 | `--agent-limit` | none | Per-agent override (repeatable): `AGENT:rpm=N,tpm=M` |
 | `--max-rate-wait` | `240` | Max seconds a rate-limited request holds inside HiveMind before a 429 (`HIVEMIND_MAX_RATE_WAIT_S`) |
+| `--no-rate-limiting` | off | Disable ALL rate limiting — never wait, never record, ignore rate-limit headers. The guard lives inside the limiter, so no call site can bypass it. Admission control and budgets still apply. Escape hatch for benchmarks/incidents. `/_stats` reports `rate_limiter.enabled` |
 | `--insecure` | off | Disable upstream TLS certificate verification (dev only) |
 | `--log-level` | `INFO` | **`hivemind-proxy` only** — logging verbosity |
 
@@ -282,6 +283,19 @@ Dashboard, served by the proxy (same port as the agents' upstream):
 |---|---|
 | `/_telemetry` | Single self-contained HTML page (inline CSS/JS, no CDN) |
 | `/_telemetry/data?days=N` | JSON aggregates (`N` clamps to 1–365, default 14) |
+
+Metric semantics worth knowing when reading the payload or the dashboard:
+
+- **`tokens_in` is FRESH-only** on DeepSeek's Anthropic-compatible shim —
+  cache reads are reported separately in `cache_read` and excluded.  Real
+  input is `cache_read + tokens_in`.
+- **`cache_hit_pct`** is the cache-hit share `cache_read / (cache_read +
+  tokens_in)` on a **0–1 scale** (like `error_rate`) — one scale across
+  the whole payload so formatters can't misread a field.
+- **`conversation_hash`** is the sha256-truncated client session header
+  (`x-claude-code-session-id` et al.), letting analysis separate
+  new-session starts from mid-session cache misses.  NULL when the client
+  sends none.
 
 Fail-open contract: if Postgres is unreachable — or `--telemetry-dsn` is
 unset — the proxy behaves exactly as before.  Writes are fire-and-forget
