@@ -1019,11 +1019,21 @@ async def test_schema_ddl_executes_against_real_postgres():
     now = datetime.now(timezone.utc)
 
     async def _cleanup() -> None:
+        from hivemind.telemetry.ledger import _SCHEMA_DDL
+
         conn = await psycopg.AsyncConnection.connect(dsn)
         try:
             await conn.set_autocommit(True)
+            # CI's database is FRESH: the pre-cleanup used to DELETE from a
+            # table that did not exist yet (the author's machine had stale
+            # tables from earlier runs).  All DDL statements are idempotent
+            # (IF NOT EXISTS / OR REPLACE), so ensure the schema first.
+            for statement in _SCHEMA_DDL:
+                await conn.execute(statement)
             for tag in (fresh_tag, old_tag):
-                await conn.execute("DELETE FROM mesh_telemetry.token_usage WHERE agent_hash = %s", (tag,))
+                await conn.execute(
+                    "DELETE FROM mesh_telemetry.token_usage WHERE agent_hash = %s", (tag,)
+                )
         finally:
             await conn.close()
 
