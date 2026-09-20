@@ -25,11 +25,21 @@ class StreamingResult:
     headers: dict[str, str] = field(default_factory=dict)
     tokens_in: int = 0
     tokens_out: int = 0
+    #: Provider-REPORTED input tokens (None when none were reported) — what
+    #: the ledger row records.  ``tokens_in`` above is padded with the request
+    #: estimate for rate limiting and budgets; that guess must not reach the
+    #: ledger as if the provider had sent it (usage columns are observations).
+    observed_tokens_in: int | None = None
     latency_first_chunk_ms: float = 0.0
     latency_total_ms: float = 0.0
     chunks_sent: int = 0
     retries: int = 0
     error: str | None = None
+    #: Gate-2 marker: the committed SSE stream died mid-flight.  The wire
+    #: status was frozen at 200 before the failure (it is already on the
+    #: wire and cannot change), so the LEDGER row records 502 instead —
+    #: error_rate must see every abort, not just pre-commit failures.
+    stream_aborted: bool = False
 
 
 def is_streaming_request(headers: dict[str, str], body: bytes) -> bool:

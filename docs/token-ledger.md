@@ -192,6 +192,11 @@ hivemind command (operator's choice).
 9. **Dashboard read failures** surface as HTTP 200 with
    `{"error": "telemetry unavailable"}` (renders the page's error state);
    `days` clamps to 1–365, default 14.
+10. **Mid-stream aborts record 502 in the LEDGER only.**  A Gate-2 failure
+   happens after the SSE status was frozen at 200 on the wire; the row is
+   written with 502 (via `StreamingResult.stream_aborted`) so `error_rate`
+   counts every abort — rewriting the ledger row does not touch what the
+   client already received.
 
 ## 9. Success metrics
 

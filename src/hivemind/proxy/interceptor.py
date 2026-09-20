@@ -311,7 +311,9 @@ class Interceptor:
         body.  Usage columns are optional — providers vary; missing or zero
         counts record as NULL rather than a guessed number.
         ``conversation_hash`` comes from the client session header when one
-        was sent (see :func:`_conversation_hash`).
+        was sent (see :func:`_conversation_hash`).  A mid-stream abort on a
+        committed SSE stream records 502 while the client-facing status stays
+        at its frozen 200 (``StreamingResult.stream_aborted``).
         """
         cache_read = getattr(result, "_cache_read_tokens", None)
         cache_write = getattr(result, "_cache_write_tokens", None)
@@ -328,6 +330,14 @@ class Interceptor:
         def _count(value) -> int | None:
             return value if isinstance(value, int) and value > 0 else None
 
+        # Ledger-only status rewrite: a committed SSE stream froze the wire
+        # status at 200 before the upstream died (Gate 2).  What the client
+        # received is done and must not change — but the row records 502 so
+        # error_rate counts the abort instead of filing it under 200.
+        status = getattr(result, "status_code", None) or 200
+        if getattr(result, "stream_aborted", False):
+            status = 502
+
         return {
             "agent_hash": (rate_key or agent_id) or "anonymous",
             "provider": self.provider.name if self.provider else "unknown",
@@ -338,7 +348,7 @@ class Interceptor:
             "cache_write": cache_write,
             "reasoning": None,  # no provider in the chain reports it separately yet
             "latency_ms": latency or None,
-            "status": getattr(result, "status_code", None) or 200,
+            "status": status,
             "conversation_hash": _conversation_hash(headers) if headers else None,
         }
 
@@ -554,6 +564,13 @@ class Interceptor:
                                     detail,
                                 )
                                 result.error = detail
+                                # Gate 2 bookkeeping for the ledger: the wire
+                                # status is frozen at 200 (already committed),
+                                # so the abort is marked on the result and
+                                # _usage_row records it as 502 — error_rate
+                                # must count mid-stream deaths, not hide them
+                                # inside 200s.
+                                result.stream_aborted = True
                                 result.tokens_in = total_tokens_in or est_request_tokens
                                 result.tokens_out = total_tokens_out
                                 result._cache_read_tokens = cache_read_tokens or None

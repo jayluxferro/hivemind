@@ -645,6 +645,7 @@ async def test_telemetry_streaming_full_drain_records_one_row(components, record
         await _settle()
 
         assert final is not None and final.status_code == 200
+        assert final.stream_aborted is False  # clean stream: the row's 200 is real
         assert final.tokens_in == 12
         assert final.tokens_out == 7
         assert recording_ledger.record_calls == 1
@@ -707,7 +708,8 @@ async def test_telemetry_streaming_early_error_aclose_records_once(components, r
 
 @pytest.mark.asyncio
 async def test_telemetry_streaming_mid_stream_abort_records_once(components, recording_ledger):
-    """Gate-2 abort after committed bytes still lands exactly one row."""
+    """Gate-2 abort after committed bytes still lands exactly one row —
+    with the ledger status rewritten to 502 (the wire status stays 200)."""
 
     class _AbruptSSE(httpx.AsyncByteStream):
         async def __aiter__(self):
@@ -734,10 +736,15 @@ async def test_telemetry_streaming_mid_stream_abort_records_once(components, rec
 
         assert final is not None and final.status_code == 200  # committed status frozen
         assert final.error and "ReadError" in final.error
+        assert final.stream_aborted is True
         assert recording_ledger.record_calls == 1
         assert len(recording_ledger.rows) == 1
         row = recording_ledger.rows[0]
-        assert row["status"] == 200
+        # The LEDGER row must say 502: the wire status was frozen at 200
+        # before the upstream died, and error_rate was blind to every abort
+        # while rows parroted the frozen status.
+        assert row["status"] == 502
+        # Real (observed) token counts still travel with the abort.
         assert row["tokens_in"] == 10
         assert row["tokens_out"] is None
         assert row["agent_hash"] == "agent-1"
