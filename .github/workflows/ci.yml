@@ -49,6 +49,11 @@ jobs:
         run: python -m pytest tests/ -v --tb=short
         env:
           HIVEMIND_TEST_DB_URL: postgresql://hivemind:hivemind@localhost:5432/hivemind_test
+          # The OLD real-PG convention (behavioral: record→overview round-trip,
+          # named-cursor export loop, prune-by-age) — never ran in CI because
+          # only the NEW convention's env var was set; a cursor-loop or prune
+          # regression would have shipped invisible (cross-cutting finding).
+          MESH_TEST_DSN: postgresql://hivemind:hivemind@localhost:5432/hivemind_test
 
       - name: Lint
         if: matrix.python-version == '3.12'
