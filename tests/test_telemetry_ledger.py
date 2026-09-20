@@ -1136,16 +1136,86 @@ def test_no_bare_percent_in_any_sql_constant():
     included: a literal percent that is not %s or %% raises
     'incomplete placeholder' at execute time.  The 8450-tile fix shipped
     exactly that in a SQL comment and would have killed every read on
-    restart.  Static lint: no bare percent anywhere in SQL text."""
+    restart.
+
+    Collection is by CONTENT, not name: an earlier version filtered
+    dir(L) by ``name.startswith("_SQL_")`` and silently missed
+    _INSERT_SQL and the _REQUEST_FILTERS fragments — a commit message
+    claimed those were covered and the claim was false (the hostile
+    verifier planted a bare percent in a filter fragment, nothing caught
+    it, and that SQL runs WITH params at runtime).  So this lint covers
+    three layers: every module-level string containing a SQL keyword,
+    the explicit whitelist of keyword-free fragments/identifiers, and
+    the DYNAMIC path — the exact statements the drill-down/export
+    readers assemble at call time."""
     import re
 
     from hivemind.telemetry import ledger as L
 
-    constants = [getattr(L, name) for name in dir(L) if name.startswith("_SQL_") and isinstance(getattr(L, name), str)]
-    assert len(constants) >= 8, "expected the read constants to exist"
-    for sql in constants:
+    keyword = re.compile(r"\b(?:select|insert|delete|create)\b|do\s*\$\$", re.IGNORECASE)
+
+    def _walk(value, out: list[str]) -> None:
+        if isinstance(value, str):
+            out.append(value)
+        elif isinstance(value, (tuple, list, frozenset)):
+            for item in value:
+                _walk(item, out)
+        elif isinstance(value, dict):
+            for key, item in value.items():
+                _walk(key, out)
+                _walk(item, out)
+
+    everything: list[str] = []
+    for name in dir(L):
+        if not name.startswith("__"):  # skip dunders (module docstring et al.)
+            _walk(getattr(L, name), everything)
+    by_content = [s for s in everything if keyword.search(s)]
+
+    # Fragments and identifiers too small to carry a keyword: the filter
+    # clauses, the sort/order whitelists, the range predicate itself.
+    explicit: list[str] = []
+    for name in dir(L):
+        if name.startswith("_SQL_") or name in {
+            "_INSERT_SQL",
+            "_SCHEMA_DDL",
+            "_RANGE",
+            "_REQUEST_FILTERS",
+            "_REQUEST_SORTS",
+            "_REQUEST_ORDERS",
+        }:
+            _walk(getattr(L, name), explicit)
+    explicit = [s for s in explicit if s not in by_content]
+
+    # The dynamic path, assembled exactly the way fetch_requests /
+    # count_requests / export_rows / fetch_series build it — all filters
+    # enabled, so every _REQUEST_FILTERS clause appears in context.
+    from_dt = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    to_dt = datetime(2026, 1, 14, tzinfo=timezone.utc)
+    all_filters = {"agent_hash": "b", "model": "m", "provider": "p", "status": 200}
+    where_all, _ = L._build_request_where(from_dt, to_dt, all_filters)
+    series_where, _ = L._build_request_where(from_dt, to_dt, {k: v for k, v in all_filters.items() if k != "status"})
+    columns = ", ".join(L._REQUEST_COLUMNS)
+    dynamic = [
+        L._SQL_REQUESTS.format(columns=columns, where=where_all, order_by=L._order_by("tokens", "desc")),
+        L._SQL_REQUESTS_COUNT.format(where=where_all),
+        L._SQL_REQUESTS_EXPORT.format(columns=columns, where=where_all, order_by=L._order_by("status", "asc")),
+        L._SQL_SERIES_HOUR.format(where=series_where),
+        L._SQL_SERIES_DAY.format(where=series_where),
+    ]
+
+    linted = by_content + explicit + dynamic
+    # Pins for the false-claim incident: the write statement, a filter
+    # fragment and the DDL must all be IN the linted set — the name-based
+    # scan missed every one of them.
+    assert L._INSERT_SQL in linted
+    assert "agent_hash = %s" in linted
+    assert any("CREATE TABLE" in s for s in linted)
+    assert any("DELETE FROM" in s for s in linted)
+    assert len(linted) >= 20, "expected SQL constants + fragments + dynamic variants in the linted set"
+
+    for sql in linted:
         offenders = re.findall(r"%(?!s)(?!%)", sql.replace("%%", ""))
-        assert not offenders, f"bare percent in SQL constant: {sql[:120]!r}"
+        assert not offenders, f"bare percent in SQL text: {sql[:120]!r}"
 
 
 def test_every_read_sql_constant_parses_on_real_postgres():
@@ -1153,7 +1223,14 @@ def test_every_read_sql_constant_parses_on_real_postgres():
     incident added a DDL smoke test, and the 8450-fix comment proved the
     READ queries need the same.  Each constant executes (parameterized,
     inside a rolled-back transaction) against local Postgres; skips when
-    unavailable."""
+    unavailable.
+
+    The dynamic drill-down/export statements parse too — the templates
+    formatted by ``_build_request_where`` with EVERY filter enabled, the
+    exact strings those readers run WITH params (where a planted bare
+    percent is a live incident, not a lint nit).  The all-filters WHERE
+    bodies are also how each _REQUEST_FILTERS fragment gets exercised:
+    a fragment alone is not a statement."""
     pytest.importorskip("psycopg")
     import psycopg
 
@@ -1168,19 +1245,41 @@ def test_every_read_sql_constant_parses_on_real_postgres():
     except Exception:
         pytest.skip("local Postgres unavailable")
     window = ("2026-01-01", "2026-01-02")
-    cases = [
-        ("TOTALS", _SQL_TOTALS),
-        ("TOP_MODELS", L._SQL_TOP_MODELS),
-        ("AGENTS", L._SQL_AGENTS),
-        ("DAILY_AGENTS", L._SQL_DAILY_AGENTS),
-        ("LATENCY", L._SQL_LATENCY),
-        ("STATUS", L._SQL_STATUS),
-        ("LATENCY_MODELS", L._SQL_LATENCY_MODELS),
-        ("SERIES_HOUR", L._SQL_SERIES_HOUR.format(where=L._RANGE)),
-        ("SERIES_DAY", L._SQL_SERIES_DAY.format(where=L._RANGE)),
-        ("FACET_AGENTS", L._SQL_FACET_AGENTS),
-        ("FACET_MODELS", L._SQL_FACET_MODELS),
-        ("FACET_PROVIDERS", L._SQL_FACET_PROVIDERS),
+    columns = ", ".join(L._REQUEST_COLUMNS)
+    from_dt = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    to_dt = datetime(2026, 1, 14, tzinfo=timezone.utc)
+    all_filters = {"agent_hash": "bucket-1", "model": "m", "provider": "p", "status": 200}
+    where_all, params_all = L._build_request_where(from_dt, to_dt, all_filters)
+    series_where, series_params = L._build_request_where(
+        from_dt, to_dt, {k: v for k, v in all_filters.items() if k != "status"}
+    )
+    cases: list[tuple[str, str, tuple]] = [
+        ("TOTALS", _SQL_TOTALS, window),
+        ("TOP_MODELS", L._SQL_TOP_MODELS, window),
+        ("AGENTS", L._SQL_AGENTS, window),
+        ("DAILY_AGENTS", L._SQL_DAILY_AGENTS, window),
+        ("LATENCY", L._SQL_LATENCY, window),
+        ("STATUS", L._SQL_STATUS, window),
+        ("LATENCY_MODELS", L._SQL_LATENCY_MODELS, window),
+        ("SERIES_HOUR", L._SQL_SERIES_HOUR.format(where=L._RANGE), window),
+        ("SERIES_DAY", L._SQL_SERIES_DAY.format(where=L._RANGE), window),
+        ("FACET_AGENTS", L._SQL_FACET_AGENTS, window),
+        ("FACET_MODELS", L._SQL_FACET_MODELS, window),
+        ("FACET_PROVIDERS", L._SQL_FACET_PROVIDERS, window),
+        # One representative fully-filtered variant per dynamic template.
+        (
+            "REQUESTS+ALL_FILTERS",
+            L._SQL_REQUESTS.format(columns=columns, where=where_all, order_by=L._order_by("status", "asc")),
+            params_all + (100, 0),  # trailing LIMIT/OFFSET placeholders
+        ),
+        ("REQUESTS_COUNT+ALL_FILTERS", L._SQL_REQUESTS_COUNT.format(where=where_all), params_all),
+        (
+            "REQUESTS_EXPORT+ALL_FILTERS",
+            L._SQL_REQUESTS_EXPORT.format(columns=columns, where=where_all, order_by=L._order_by("ts", "desc")),
+            params_all,
+        ),
+        ("SERIES_HOUR+ALL_FILTERS", L._SQL_SERIES_HOUR.format(where=series_where), series_params),
+        ("SERIES_DAY+ALL_FILTERS", L._SQL_SERIES_DAY.format(where=series_where), series_params),
     ]
     # The one statement that runs WITH params from the write path — a bare
     # percent here passes every other guard while breaking every real write
@@ -1200,8 +1299,8 @@ def test_every_read_sql_constant_parses_on_real_postgres():
             # schema appears, every statement parses, nothing persists.
             for statement in L._SCHEMA_DDL:
                 cur.execute(statement)
-            for name, sql in cases:
-                cur.execute(sql, window)
+            for name, sql, params in cases:
+                cur.execute(sql, params)
                 cur.fetchall()
             cur.execute(L._INSERT_SQL, insert_params)  # no records to fetch
         except Exception as exc:
