@@ -286,9 +286,15 @@ Dashboard, served by the proxy (same port as the agents' upstream):
 
 Metric semantics worth knowing when reading the payload or the dashboard:
 
-- **`tokens_in` is FRESH-only** on DeepSeek's Anthropic-compatible shim —
-  cache reads are reported separately in `cache_read` and excluded.  Real
-  input is `cache_read + tokens_in`.
+- **`tokens_in` is FRESH-only (uncached input) for every provider** — an
+  enforced ingest invariant, not a reporting quirk.  Anthropic-shape
+  upstreams (incl. DeepSeek's shim) report it directly; OpenAI-shape
+  upstreams report `prompt_tokens` including cached tokens, and hivemind
+  subtracts `cache_read` before the row is written (clamped at 0 if a
+  provider glitch reports more cached than total).  Without this, cached
+  tokens would be priced twice.  Real input is `cache_read + tokens_in`;
+  the operational counters (rate limiter, budgets, `x-hivemind-tokens-*`
+  headers) keep the provider's raw totals.
 - **`cache_hit_pct`** is the cache-hit share `cache_read / (cache_read +
   tokens_in)` on a **0–1 scale** (like `error_rate`) — one scale across
   the whole payload so formatters can't misread a field.

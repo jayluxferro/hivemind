@@ -23,6 +23,7 @@ import pytest
 from hivemind.telemetry.ledger import (
     _COLUMN_ORDER,
     _SCHEMA_DDL,
+    _INSERT_SQL,
     _insert_params,
     _PRUNE_INTERVAL_S,
     _QUEUE_MAX,
@@ -1031,9 +1032,7 @@ async def test_schema_ddl_executes_against_real_postgres():
             for statement in _SCHEMA_DDL:
                 await conn.execute(statement)
             for tag in (fresh_tag, old_tag):
-                await conn.execute(
-                    "DELETE FROM mesh_telemetry.token_usage WHERE agent_hash = %s", (tag,)
-                )
+                await conn.execute("DELETE FROM mesh_telemetry.token_usage WHERE agent_hash = %s", (tag,))
         finally:
             await conn.close()
 
@@ -1134,6 +1133,91 @@ def test_schema_ddl_parses_against_real_postgres():
             cur.execute("ROLLBACK")
     finally:
         conn.close()
+
+
+def test_usage_cost_view_prices_both_provider_shapes_identically():
+    """The hostile verifier's numbers, priced through the REAL view: 100k
+    fresh + 400k cache-read input at the seed prices ('Anthropic',
+    'deepseek-chat' = 0.27 / 0.07 per 1M) must cost $0.055000.
+
+    Both provider shapes write IDENTICAL ledger rows once the ingest
+    normalization ran (OpenAI-shape 500k total is reduced by its 400k
+    cached before the INSERT), so both price at $0.055000.  The raw
+    total-shape row — what shipped before the fix — prices at $0.163000
+    (+196%): every cached token billed twice, at price_in AND
+    price_cache_read.  That number is pinned as the hole this closes.
+    Skips (not fails) when no local Postgres is available."""
+    from decimal import Decimal
+
+    pytest.importorskip("psycopg")
+    import psycopg
+
+    dsn = os.environ.get("HIVEMIND_TEST_DB_URL", "postgresql://hivemind@localhost:5432/hivemind_test")
+    try:
+        conn = psycopg.connect(dsn, connect_timeout=3)
+    except Exception:
+        pytest.skip("local Postgres unavailable")
+    tag = "cost-view-shape-probe"
+    try:
+        conn.autocommit = True
+        cur = conn.cursor()
+        cur.execute("BEGIN")
+        try:
+            for statement in _SCHEMA_DDL:
+                cur.execute(statement)
+            # Force the seed numbers inside this transaction: a stale
+            # pricing row for the pair must not skew the hand-computed math.
+            cur.execute(
+                """
+                INSERT INTO mesh_telemetry.model_pricing
+                    (provider, model, price_in, price_cache_read, price_cache_write, price_out)
+                VALUES ('Anthropic', 'deepseek-chat', 0.27, 0.07, 0.27, 1.10)
+                ON CONFLICT (provider, model) DO UPDATE SET
+                    price_in = 0.27, price_cache_read = 0.07,
+                    price_cache_write = 0.27, price_out = 1.10
+                """
+            )
+            cur.execute("DELETE FROM mesh_telemetry.token_usage WHERE agent_hash = %s", (tag,))
+            # _INSERT_SQL column order: agent/provider/model, in, out,
+            # cache_read, cache_write, reasoning, latency, status, conversation.
+            rows = [
+                # fresh-shape provider (DeepSeek shim): input already excludes cache
+                (tag, "Anthropic", "deepseek-chat", 100_000, 0, 400_000, None, None, None, 200, None),
+                # total-shape provider (OpenAI) AFTER ingest normalization:
+                # recorded 500k - 400k cached = the identical fresh-only row
+                (tag, "Anthropic", "deepseek-chat", 100_000, 0, 400_000, None, None, None, 200, None),
+                # total-shape provider BEFORE the fix: raw 500k recorded
+                (tag, "Anthropic", "deepseek-chat", 500_000, 0, 400_000, None, None, None, 200, None),
+            ]
+            for row in rows:
+                cur.execute(_INSERT_SQL, row)
+            cur.execute(
+                """
+                SELECT tokens_in, cache_read, cost_usd,
+                       round(cache_read::numeric / nullif(cache_read + tokens_in, 0), 4) AS cache_hit_pct
+                FROM mesh_telemetry.usage_cost
+                WHERE agent_hash = %s
+                ORDER BY id
+                """,
+                (tag,),
+            )
+            priced = cur.fetchall()
+        finally:
+            cur.execute("ROLLBACK")
+    finally:
+        conn.close()
+
+    assert len(priced) == 3
+    correct = Decimal("0.055000")  # 100k*0.27 + 400k*0.07 = 55000 / 1e6
+    hole = Decimal("0.163000")  # 500k*0.27 + 400k*0.07 = 163000 / 1e6
+    # Plain-connection rows are tuples: (tokens_in, cache_read, cost_usd, cache_hit_pct).
+    assert priced[0][2] == correct  # fresh shape, verbatim row
+    assert priced[1][2] == correct  # normalized total shape: identical row
+    assert priced[2][2] == hole  # the +196% double-pricing, pinned dead
+    # cache_hit_pct reads 0.8 on the normalized rows for BOTH shapes:
+    # denominator (cache_read + tokens_in) is right once tokens_in is fresh.
+    assert priced[0][3] == Decimal("0.8000")
+    assert priced[1][3] == Decimal("0.8000")
 
 
 # --- Read-SQL guards (regression: the 8450-fix comment broke every read) ----

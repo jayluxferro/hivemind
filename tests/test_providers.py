@@ -2,7 +2,9 @@
 
 from hivemind.scheduler.providers import (
     ANTHROPIC,
+    AZURE_OPENAI,
     GENERIC,
+    GOOGLE,
     OLLAMA,
     OPENAI,
     ProviderType,
@@ -96,6 +98,19 @@ def test_anthropic_profile_defaults():
 def test_openai_profile_defaults():
     assert OPENAI.default_max_concurrent == 10
     assert OPENAI.auth_header == "authorization"
+
+
+def test_input_shape_flags_split_the_contracts():
+    """The ledger's fresh-only ingest normalization rides this flag: True
+    means reported input INCLUDES cached tokens (OpenAI contract —
+    prompt_tokens counts the cached subset inside itself), False means
+    FRESH-only (Anthropic contract, incl. DeepSeek's shim, whose
+    input_tokens excludes cache_read_input_tokens).  The ANTHROPIC profile
+    is the only documented fresh-shape contract hivemind detects; everything
+    else is OpenAI-compat by shape or by convention."""
+    assert ANTHROPIC.input_includes_cached is False
+    for profile in (OPENAI, AZURE_OPENAI, GOOGLE, OLLAMA, GENERIC):
+        assert profile.input_includes_cached is True, profile.name
 
 
 def test_ollama_profile_high_limits():

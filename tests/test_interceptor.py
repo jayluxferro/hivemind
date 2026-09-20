@@ -869,6 +869,239 @@ async def test_telemetry_streaming_without_usage_records_null_tokens(components,
         await interceptor.stop()
 
 
+# --- fresh-only ingest normalization (provider usage shapes) -----------------
+#
+# The hole this closes: the ledger prices ``tokens_in`` as the FRESH input
+# portion, which is what Anthropic-shape providers report — but OpenAI-shape
+# providers report prompt_tokens INCLUDING cached_tokens while hivemind ALSO
+# records their cached_tokens in ``cache_read``.  Left alone, every cached
+# token is priced twice (price_in + price_cache_read): the attacker's probe
+# showed 100k fresh + 400k cached at the seed prices must cost $0.0550, while
+# the raw total-shape row read $0.1630 (+196%).
+
+
+def _openai_interceptor(components, **kwargs):
+    return Interceptor(
+        upstream_url="https://api.openai.com",
+        provider=OPENAI,
+        **components,
+        **kwargs,
+    )
+
+
+def _openai_usage_response(prompt: int, cached: int, completion: int = 10) -> bytes:
+    """OpenAI-shape chat completion: prompt_tokens INCLUDES cached_tokens."""
+    return json.dumps(
+        {
+            "choices": [{"message": {"role": "assistant", "content": "Hello"}}],
+            "usage": {
+                "prompt_tokens": prompt,
+                "completion_tokens": completion,
+                "total_tokens": prompt + completion,
+                "prompt_tokens_details": {"cached_tokens": cached},
+            },
+        }
+    ).encode()
+
+
+@pytest.mark.asyncio
+async def test_telemetry_openai_total_shape_normalizes_cached_out_of_tokens_in(components, recording_ledger):
+    """Buffered fake provider, OpenAI usage shape: 500k prompt_tokens of
+    which 400k cached must record tokens_in == 100k — the fresh portion —
+    with cache_read carrying the 400k.  The operational counters keep the
+    provider's raw totals (normalization is ledger-row only)."""
+    body = json.dumps({"model": "gpt-4o", "messages": [{"role": "user", "content": "Hi"}]}).encode()
+    interceptor = _openai_interceptor(components)
+    mock_client = AsyncMock()
+    mock_client.request = AsyncMock(
+        return_value=_make_response(body=_openai_usage_response(prompt=500_000, cached=400_000))
+    )
+    interceptor._client = mock_client
+
+    result = await interceptor.handle_request(
+        method="POST",
+        path="/v1/chat/completions",
+        headers={"content-type": "application/json", "authorization": "Bearer test"},
+        body=body,
+        agent_id="agent-1",
+    )
+    await _settle()
+
+    assert len(recording_ledger.rows) == 1
+    row = recording_ledger.rows[0]
+    assert row["provider"] == "OpenAI"
+    assert row["model"] == "gpt-4o"
+    assert row["tokens_in"] == 100_000  # 500k reported total - 400k cached
+    assert row["cache_read"] == 400_000
+    assert row["tokens_out"] == 10
+
+    # The result itself still carries the RAW observation: only the row is
+    # normalized (rate limiter / budgets / headers keep provider totals).
+    assert result.observed_tokens_in == 500_000
+    assert result.tokens_in == 500_000
+
+
+@pytest.mark.asyncio
+async def test_telemetry_streaming_openai_total_shape_normalizes_cached_out_of_tokens_in(components, recording_ledger):
+    """Committed SSE stream, OpenAI shape (usage rides the final chunk):
+    the accumulated prompt total is normalized against the per-key maxima
+    of cached_tokens exactly as the buffered path normalizes its snapshot."""
+
+    class _OpenAIUsageSSE(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b'data: {"choices": [{"delta": {"content": "Hi"}}]}\n\n'
+            yield b'data: {"choices": [{"delta": {}, "finish_reason": "stop"}]}\n\n'
+            yield (
+                b'data: {"choices": [], "usage": {"prompt_tokens": 500000, "completion_tokens": 10, '
+                b'"prompt_tokens_details": {"cached_tokens": 400000}}}\n\n'
+            )
+            yield b"data: [DONE]\n\n"
+
+    def handler(request):
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=_OpenAIUsageSSE())
+
+    interceptor = _openai_interceptor(components)
+    interceptor._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        final = None
+        async for _chunk, result in interceptor.handle_streaming_request(
+            "POST",
+            "/v1/chat/completions",
+            {"content-type": "application/json", "accept": "text/event-stream"},
+            json.dumps({"model": "gpt-4o", "stream": True, "messages": [{"role": "user", "content": "hi"}]}).encode(),
+            agent_id="agent-1",
+        ):
+            if result is not None:
+                final = result
+        await _settle()
+
+        assert final is not None and final.status_code == 200
+        # Operational counter: the provider's raw 500k (rate limiter sees it).
+        assert final.tokens_in == 500_000
+        assert len(recording_ledger.rows) == 1
+        row = recording_ledger.rows[0]
+        assert row["tokens_in"] == 100_000  # fresh portion after normalization
+        assert row["cache_read"] == 400_000  # SSE per-key maxima
+        assert row["tokens_out"] == 10
+    finally:
+        await interceptor.stop()
+
+
+@pytest.mark.asyncio
+async def test_telemetry_fresh_shape_rows_pass_through_untouched(components, recording_ledger):
+    """Anthropic/DeepSeek shape parity: input_tokens is ALREADY fresh-only
+    (cache reads reported separately), so the ANTHROPIC profile must NOT be
+    reduced — same real traffic as the OpenAI-shape tests records the
+    identical fresh-only row (100k / 400k) with no normalization applied."""
+    body = json.dumps({"model": "deepseek-chat", "messages": [{"role": "user", "content": "Hi"}]}).encode()
+    resp_body = json.dumps(
+        {
+            "content": [{"type": "text", "text": "Hello"}],
+            "usage": {
+                "input_tokens": 100_000,
+                "output_tokens": 10,
+                "cache_read_input_tokens": 400_000,
+            },
+        }
+    ).encode()
+    interceptor = _anthropic_interceptor(components)
+    mock_client = AsyncMock()
+    mock_client.request = AsyncMock(return_value=_make_response(body=resp_body))
+    interceptor._client = mock_client
+
+    await interceptor.handle_request(
+        method="POST",
+        path="/v1/messages",
+        headers={"content-type": "application/json", "x-api-key": "test"},
+        body=body,
+        agent_id="agent-1",
+    )
+    await _settle()
+
+    assert len(recording_ledger.rows) == 1
+    row = recording_ledger.rows[0]
+    assert row["provider"] == "Anthropic"
+    assert row["tokens_in"] == 100_000  # already fresh: untouched
+    assert row["cache_read"] == 400_000
+
+
+@pytest.mark.asyncio
+async def test_telemetry_normalization_clamps_impossible_cache_counts(components, recording_ledger, caplog):
+    """A provider glitch that reports more cached tokens than total input
+    must never write a negative tokens_in — the usage_cost view would price
+    it as negative money.  Clamped to 0 with a warning; all-cached (fresh
+    exactly 0) is a real observation and also records 0, not NULL."""
+    import logging
+
+    body = json.dumps({"model": "gpt-4o", "messages": [{"role": "user", "content": "Hi"}]}).encode()
+    interceptor = _openai_interceptor(components)
+    mock_client = AsyncMock()
+    mock_client.request = AsyncMock(
+        return_value=_make_response(body=_openai_usage_response(prompt=100_000, cached=400_000))
+    )
+    interceptor._client = mock_client
+
+    with caplog.at_level(logging.WARNING, logger="hivemind.proxy.interceptor"):
+        await interceptor.handle_request(
+            method="POST",
+            path="/v1/chat/completions",
+            headers={"content-type": "application/json"},
+            body=body,
+            agent_id="agent-1",
+        )
+    await _settle()
+
+    assert len(recording_ledger.rows) == 1
+    row = recording_ledger.rows[0]
+    assert row["tokens_in"] == 0  # clamped: 100k total - 400k cached < 0
+    assert row["cache_read"] == 400_000
+    assert any("usage glitch" in r.message and r.levelno == logging.WARNING for r in caplog.records)
+
+    # Boundary case at exactly zero: 400k of 400k cached is all-cached, not
+    # a glitch — records 0 without the warning.
+    mock_client.request = AsyncMock(
+        return_value=_make_response(body=_openai_usage_response(prompt=400_000, cached=400_000))
+    )
+    await interceptor.handle_request(
+        method="POST",
+        path="/v1/chat/completions",
+        headers={"content-type": "application/json"},
+        body=body,
+        agent_id="agent-1",
+    )
+    await _settle()
+
+    assert len(recording_ledger.rows) == 2
+    assert recording_ledger.rows[1]["tokens_in"] == 0
+
+
+@pytest.mark.asyncio
+async def test_telemetry_without_a_profile_cannot_normalize(components, recording_ledger):
+    """No profile, no shape knowledge: the row passes the raw observation
+    through verbatim rather than guessing whether input includes cache.
+    (Production interceptors always carry a profile — detect_provider never
+    returns None — so this only guards direct constructions.)"""
+    interceptor = Interceptor(upstream_url="https://example.internal", **components)
+    mock_client = AsyncMock()
+    mock_client.request = AsyncMock(
+        return_value=_make_response(body=_openai_usage_response(prompt=500_000, cached=400_000))
+    )
+    interceptor._client = mock_client
+
+    await interceptor.handle_request(
+        method="POST",
+        path="/v1/chat/completions",
+        headers={"content-type": "application/json"},
+        body=b"{}",
+        agent_id="agent-1",
+    )
+    await _settle()
+
+    assert len(recording_ledger.rows) == 1
+    assert recording_ledger.rows[0]["provider"] == "unknown"
+    assert recording_ledger.rows[0]["tokens_in"] == 500_000  # verbatim
+
+
 # --- conversation hash (ledger attribution) --------------------------------
 
 

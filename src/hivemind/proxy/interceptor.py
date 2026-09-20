@@ -359,6 +359,17 @@ class Interceptor:
         was sent (see :func:`_conversation_hash`).  A mid-stream abort on a
         committed SSE stream records 502 while the client-facing status stays
         at its frozen 200 (``StreamingResult.stream_aborted``).
+
+        Fresh-only ingest normalization: for total-shape providers (profile
+        flag ``input_includes_cached`` — OpenAI-compat contracts report
+        ``prompt_tokens`` INCLUDING ``cached_tokens``) the recorded
+        ``tokens_in`` is reduced by ``cache_read`` so the ledger column is
+        the FRESH portion for every provider shape.  Otherwise every cached
+        token is priced twice (at ``price_in`` AND ``price_cache_read``):
+        100k fresh + 400k cached at the seed prices must cost $0.0550, but
+        the raw total-shape row read $0.1630 (+196%).  This rewrite is
+        ledger-row only — the operational counters (rate limiter, budgets,
+        ``x-hivemind-tokens-*`` headers) keep the provider's raw totals.
         """
         cache_read = getattr(result, "_cache_read_tokens", None)
         cache_write = getattr(result, "_cache_write_tokens", None)
@@ -375,6 +386,33 @@ class Interceptor:
         def _count(value) -> int | None:
             return value if isinstance(value, int) and value > 0 else None
 
+        tokens_in = _count(getattr(result, "observed_tokens_in", None))
+        profile = self.provider
+        if tokens_in is not None and cache_read and profile is not None and profile.input_includes_cached:
+            # Fresh-only ingest normalization: this provider's reported
+            # input INCLUDES the cached tokens already recorded separately
+            # in ``cache_read`` — leave both intact and every cached token
+            # is priced twice (price_in AND price_cache_read).  Reduce to
+            # the fresh portion so the column means one thing for every
+            # shape (module docstring in telemetry/ledger.py).
+            fresh = tokens_in - cache_read
+            if fresh < 0:
+                # Provider glitch (cached > total must be impossible):
+                # clamp so no negative ever reaches the ledger — the view
+                # would price a negative token count as negative money.
+                logger.warning(
+                    "usage glitch: %s reported cached_tokens=%d above the %d reported "
+                    "total input (model=%r); recording tokens_in=0",
+                    profile.name,
+                    cache_read,
+                    tokens_in,
+                    _model_from_request_body(body),
+                )
+                fresh = 0
+            # 0 stays 0 (all-cached is a real observation, distinct from the
+            # NULL "provider reported nothing" sentinel).
+            tokens_in = fresh
+
         # Ledger-only status rewrite: a committed SSE stream froze the wire
         # status at 200 before the upstream died (Gate 2).  What the client
         # received is done and must not change — but the row records 502 so
@@ -390,12 +428,13 @@ class Interceptor:
         # but those guesses never enter the ledger: unreported stays NULL,
         # distinguishable from zero, instead of masquerading as an
         # observation (D2).  The streaming path never estimates, so its
-        # observed fields mirror its totals.
+        # observed fields mirror its totals.  ``tokens_in`` above is then
+        # normalized to the fresh portion for total-shape providers.
         return {
             "agent_hash": (rate_key or agent_id) or "anonymous",
             "provider": self.provider.name if self.provider else "unknown",
             "model": _model_from_request_body(body),
-            "tokens_in": _count(getattr(result, "observed_tokens_in", None)),
+            "tokens_in": tokens_in,
             "tokens_out": _count(getattr(result, "observed_tokens_out", None)),
             "cache_read": cache_read,
             "cache_write": cache_write,

@@ -27,14 +27,20 @@ cancelled in ``shutdown()`` before the writer connection is reset.  The
 pruner (re)arms on every successful (re)connect — a failed startup connect
 no longer leaves retention disabled for the process lifetime.
 
-Token semantics: ``tokens_in`` is the FRESH (uncached) input portion on
-DeepSeek's Anthropic-compatible shim — cache reads are reported in
-``cache_read`` and excluded from ``tokens_in``.  Real input is therefore
-``cache_read + tokens_in``, and the cache-hit share is
+Token semantics: ``tokens_in`` is the FRESH (uncached) input portion for
+EVERY provider — an enforced ingest invariant, not an observation.
+Anthropic-shape upstreams (incl. DeepSeek's Anthropic-compatible shim)
+report input already fresh-only (cache reads arrive separately in
+``cache_read``); OpenAI-shape upstreams report ``prompt_tokens`` INCLUDING
+``cached_tokens``, and the interceptor's record hook subtracts ``cache_read``
+before the row is written (profiles carry ``input_includes_cached``; a
+provider glitch that reports more cached than total clamps to 0).  Real
+input is therefore ``cache_read + tokens_in``, and the cache-hit share is
 ``cache_read / (cache_read + tokens_in)`` (exposed as ``cache_hit_pct``
-in the dashboard payload).  ``conversation_hash`` is the sha256-truncated
-client session header, so new-session starts are distinguishable from
-mid-session cache misses in analysis.
+in the dashboard payload) — identical for both shapes, which is the point.
+``conversation_hash`` is the sha256-truncated client session header, so
+new-session starts are distinguishable from mid-session cache misses in
+analysis.
 
 Schema is self-managed (D6): connect() runs CREATE SCHEMA/TABLE/INDEX/VIEW
 IF NOT EXISTS per SPEC §3.  NOTE: the usage_cost view DDL in SPEC §3 does
@@ -98,10 +104,9 @@ _SCHEMA_DDL = (
         agent_hash   TEXT NOT NULL,          -- hivemind rate-limit bucket (already hashed)
         provider     TEXT NOT NULL,          -- observed (detect_provider profile name)
         model        TEXT NOT NULL,          -- observed from the request body
-        tokens_in    BIGINT,                 -- FRESH input tokens: DeepSeek's Anthropic shim
-                                             -- reports cache reads separately, so tokens_in
-                                             -- excludes them; other providers vary (see module
-                                             -- docstring)
+        tokens_in    BIGINT,                 -- FRESH input tokens for every provider (ingest
+                                             -- invariant: total-shape providers are normalized
+                                             -- at record time; see module docstring)
         tokens_out   BIGINT,
         cache_read   BIGINT,
         cache_write  BIGINT,
@@ -152,7 +157,10 @@ _SCHEMA_DDL = (
     # NEGATIVE for all-cached rows (tokens_in NULL → fresh term 0 minus
     # cache_read * price_in residual — found by the cross-cutting review).
     # Fresh term is simply tokens_in; each cache class priced at its own
-    # rate.  Prices are per 1M tokens: products / 1e6, 6 decimals.
+    # rate.  tokens_in is fresh-only for EVERY provider shape since the
+    # ingest normalization (total-shape providers reduced by cache_read at
+    # record time), so no shape term belongs in this formula.
+    # Prices are per 1M tokens: products / 1e6, 6 decimals.
     """
     CREATE OR REPLACE VIEW mesh_telemetry.usage_cost AS
     SELECT u.*,
@@ -221,8 +229,10 @@ SELECT count(*) AS requests,
        sum(coalesce(tokens_out, 0))::bigint AS tokens_out,
        sum(coalesce(cache_read, 0))::bigint AS cache_read,
        sum(coalesce(cache_write, 0))::bigint AS cache_write,
-       -- tokens_in is fresh-only on the dominant provider, so the real input
-       -- is cache_read + tokens_in and the ratio is the cache-hit share.
+       -- tokens_in is fresh-only for every provider (ingest normalization:
+       -- total-shape rows were reduced by cache_read before the INSERT), so
+       -- the real input is cache_read + tokens_in and the ratio is the
+       -- cache-hit share regardless of the provider's reporting contract.
        -- 0-1 scale, matching error_rate: the payload carries ONE scale so
        -- a UI formatter can never multiply the wrong field by 100 (the
        -- 8450-tile bug: a 0-100 value through the 0-1 percent formatter;

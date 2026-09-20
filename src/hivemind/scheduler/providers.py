@@ -59,6 +59,18 @@ class ProviderProfile:
     aimd_additive_increase: float = 0.5
     aimd_multiplicative_decrease: float = 0.5
 
+    # Usage-shape flag for the token ledger's fresh-only billing invariant
+    # (telemetry/ledger.py): True when the provider's reported input count
+    # INCLUDES cached tokens — the OpenAI contract, where usage.prompt_tokens
+    # counts every input token and usage.prompt_tokens_details.cached_tokens
+    # names the cached subset of it.  False when reported input is FRESH-only
+    # — the Anthropic contract (incl. DeepSeek's Anthropic-compatible shim),
+    # where usage.input_tokens excludes cache_read_input_tokens.  Profiles
+    # with True get their ledger rows normalized at record time
+    # (tokens_in = reported_total - cache_read); without this, cached tokens
+    # are priced twice (once at price_in, once at price_cache_read).
+    input_includes_cached: bool = False
+
     def to_dict(self) -> dict:
         return {
             "provider_type": self.provider_type.value,
@@ -67,6 +79,7 @@ class ProviderProfile:
             "default_tokens_per_minute": self.default_tokens_per_minute,
             "default_max_concurrent": self.default_max_concurrent,
             "latency_target_ms": self.latency_target_ms,
+            "input_includes_cached": self.input_includes_cached,
         }
 
 
@@ -114,6 +127,7 @@ OPENAI = ProviderProfile(
     latency_target_ms=2000.0,
     aimd_additive_increase=1.0,
     aimd_multiplicative_decrease=0.5,
+    input_includes_cached=True,  # prompt_tokens includes cached_tokens
 )
 
 OLLAMA = ProviderProfile(
@@ -130,6 +144,10 @@ OLLAMA = ProviderProfile(
     latency_target_ms=10000.0,  # Local models are slower
     aimd_additive_increase=0.5,
     aimd_multiplicative_decrease=0.7,
+    # OpenAI-compatible response shape; the flag is moot in practice (Ollama
+    # does no prompt caching, so no cached_tokens ever arrives) but the shape
+    # is what it responds with.
+    input_includes_cached=True,
 )
 
 AZURE_OPENAI = ProviderProfile(
@@ -148,6 +166,7 @@ AZURE_OPENAI = ProviderProfile(
     default_retry_after_seconds=2.0,
     auth_header="api-key",
     latency_target_ms=3000.0,
+    input_includes_cached=True,  # Azure OpenAI speaks the OpenAI usage contract
 )
 
 GOOGLE = ProviderProfile(
@@ -162,6 +181,9 @@ GOOGLE = ProviderProfile(
     completions_path="/v1beta/models",
     auth_header="x-goog-api-key",
     latency_target_ms=2000.0,
+    # Gemini's OpenAI-compat layer reports prompt_tokens INCLUDING the cached
+    # subset (prompt_tokens_details.cached_tokens), not a fresh-only count.
+    input_includes_cached=True,
 )
 
 GENERIC = ProviderProfile(
@@ -170,6 +192,14 @@ GENERIC = ProviderProfile(
     default_requests_per_minute=60,
     default_tokens_per_minute=100_000,
     default_max_concurrent=5,
+    # Unknown upstream: assume the OpenAI-compatible norm (vLLM, LiteLLM,
+    # OpenRouter and friends all report prompt_tokens including cached).
+    # The flag only bites when the response actually carries cache fields —
+    # a generic upstream that reports cached_tokens is speaking the OpenAI
+    # contract, where those tokens sit INSIDE prompt_tokens.  The known
+    # Anthropic-shape exception is exactly what detect_provider maps onto
+    # the ANTHROPIC profile (False).
+    input_includes_cached=True,
 )
 
 # Registry
