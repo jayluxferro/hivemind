@@ -739,6 +739,11 @@
     // One row per stored column, in the ledger's own order (_REQUEST_COLUMNS).
     // This list is the whole schema on purpose: "metadata only" is a claim the
     // operator can check, and there is no prompt column to leak.
+    // The status line wears the same ink as the requests table's status cell
+    // (same threshold, same classes): a 502 must not read like a 200 just
+    // because the row was clicked open. An optional fourth tuple element
+    // carries that class past the mono flag.
+    const statusCls = row.status != null && row.status >= 400 ? "status-bad" : "status-ok";
     const fields = [
       ["id", C.fmtInt(row.id), false],
       ["ts", row.ts == null ? "—" : String(row.ts), true],
@@ -750,12 +755,12 @@
       ["cache_read", C.fmtInt(row.cache_read), false],
       ["cache_write", C.fmtInt(row.cache_write), false],
       ["latency_ms", C.fmtMs(row.latency_ms), false],
-      ["status", row.status == null ? "—" : String(row.status), false],
+      ["status", row.status == null ? "—" : String(row.status), false, statusCls],
     ];
     const list = el("dl", "kv");
-    for (const [key, value, mono] of fields) {
+    for (const [key, value, mono, cls] of fields) {
       list.appendChild(el("dt", null, key));
-      list.appendChild(el("dd", mono ? "mono" : null, value));
+      list.appendChild(el("dd", cls || (mono ? "mono" : null), value));
     }
     box.appendChild(list);
 

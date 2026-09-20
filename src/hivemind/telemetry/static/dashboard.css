@@ -223,9 +223,12 @@ a.btn { text-decoration: none; display: inline-block; }
 .datatable tbody tr.clickable:focus-visible { outline: 1px solid #5a5a5a; outline-offset: -1px; }
 .cell-ts { font-variant-numeric: tabular-nums; color: #cfcfcf; }
 /* A status cell wears the fact, not a traffic light: only the failing band
-   gets ink, and it is muted — status is never a Set2 hue. */
-.status-ok { color: #cfcfcf; }
-.status-bad { color: #e0a08c; font-weight: 600; }
+   gets ink, and it is muted — status is never a Set2 hue.  The `.kv dd`
+   variants exist because the detail panel's dd rule sets its own color at
+   higher specificity; without them the panel's status line would go bold
+   but stay beige. */
+.status-ok, .kv dd.status-ok { color: #cfcfcf; }
+.status-bad, .kv dd.status-bad { color: #e0a08c; font-weight: 600; }
 
 /* --- pagination --------------------------------------------------------- */
 .pager { display: flex; align-items: center; gap: 10px; margin-top: 12px; }
