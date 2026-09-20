@@ -308,6 +308,11 @@ def hivemind_config_from_proxy_cli_args(args: argparse.Namespace) -> HiveMindCon
         config.normalize_runtime_limits()  # re-validate the merged registry loudly
     if getattr(args, "max_rate_wait", None) is not None:
         config.max_rate_wait_s = args.max_rate_wait
+        # Post-construction attribute sets bypass dataclass validation —
+        # normalize here (the same call the serve path makes) so a bad
+        # --max-rate-wait fails at config-build instead of later at
+        # rate-limiter build time.
+        config.normalize_runtime_limits()
     if getattr(args, "no_rate_limiting", False):
         config.rate_limiting_enabled = False
         config.normalize_runtime_limits()  # fail loudly on a bad value

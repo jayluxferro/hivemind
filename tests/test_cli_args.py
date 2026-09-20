@@ -115,6 +115,28 @@ def test_max_rate_wait_default_and_validation():
         HiveMindConfig(max_rate_wait_s=-1)
 
 
+def test_proxy_cli_max_rate_wait_zero_fails_at_config_build():
+    """The proxy path must validate --max-rate-wait at apply time, like the
+    serve path does: `--max-rate-wait 0` used to pass config-build silently
+    and only die later at rate-limiter build (the serve path applied the
+    same normalize call immediately)."""
+    parser = argparse.ArgumentParser()
+    register_proxy_cli_arguments(parser)
+    for bad in ("0", "-1"):
+        args = parser.parse_args(["--max-rate-wait", bad])
+        with pytest.raises(ValueError):
+            hivemind_config_from_proxy_cli_args(args)
+
+
+def test_serve_cli_max_rate_wait_zero_fails_at_apply():
+    """Pins the serve-path behavior the proxy path now matches."""
+    parser = argparse.ArgumentParser()
+    register_serve_cli_arguments(parser)
+    args = parser.parse_args(["--max-rate-wait", "0"])
+    with pytest.raises(ValueError):
+        apply_serve_cli_args_to_config(HiveMindConfig(), args)
+
+
 # --- token ledger DSN (SPEC-token-ledger §5) ----------------------------------
 
 
