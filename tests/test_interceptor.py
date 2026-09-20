@@ -7,7 +7,7 @@ import httpx
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
-from hivemind.proxy.interceptor import Interceptor
+from hivemind.proxy.interceptor import Interceptor, _observed_output_tokens
 from hivemind.proxy.latency_tracker import LatencyTracker
 from hivemind.proxy.retry import RetryPolicy
 from hivemind.proxy.token_counter import count_request_tokens
@@ -521,6 +521,10 @@ async def test_telemetry_non_streaming_records_one_row(components, recording_led
     assert row["model"] == "claude-sonnet-4-20250514"
     assert row["tokens_in"] == 100
     assert row["tokens_out"] == 50
+    # The row's numbers ARE the provider-reported counts, carried on the
+    # result as explicit observations (not the padded operational totals).
+    assert result.observed_tokens_in == 100
+    assert result.observed_tokens_out == 50
     assert row["cache_read"] == 40
     assert row["cache_write"] == 5
     assert row["reasoning"] is None
@@ -599,15 +603,24 @@ async def test_telemetry_recorder_failure_never_breaks_request(components, monke
 
 
 @pytest.mark.asyncio
-async def test_telemetry_estimate_stays_out_of_the_row_but_reaches_the_limiter(
+async def test_telemetry_estimates_stay_out_of_the_row_but_reach_the_limiter_and_budget(
     components, recording_ledger, monkeypatch
 ):
-    """A response with NO usage block: the ledger row records tokens_in=NULL
-    (rows are observations — D2), while the rate limiter still counts the
-    estimate-padded operational total, because unreported traffic must count
-    against the window."""
+    """A response with NO usage block: the ledger row records both token
+    columns as NULL (rows are observations — D2), while the rate limiter and
+    the budget still count the estimate-padded operational totals, because
+    unreported traffic must count against the window (and against the
+    wallet).  The output estimate is the sneaky one: count_response_tokens
+    fabricates it from the response text, so the row would otherwise carry a
+    guess indistinguishable from a provider-reported count."""
     recorded: list[int] = []
     monkeypatch.setattr(RateLimiter, "record_tokens", lambda self, count, agent_id=None: recorded.append(count))
+    budget_calls: list[tuple] = []
+
+    async def _record_usage(self, agent_id, tokens_in, tokens_out):
+        budget_calls.append((agent_id, tokens_in, tokens_out))
+
+    monkeypatch.setattr(BudgetManager, "record_usage", _record_usage)
 
     body = json.dumps({"model": "claude-sonnet-4-20250514", "messages": [{"role": "user", "content": "Hi"}]}).encode()
     resp_body = json.dumps({"content": [{"type": "text", "text": "Hello"}]}).encode()  # no "usage" block
@@ -625,13 +638,31 @@ async def test_telemetry_estimate_stays_out_of_the_row_but_reaches_the_limiter(
     )
     await _settle()
 
-    # The operational counter on the result is estimate-padded...
+    # The operational counters on the result are estimate-padded...
     assert result.tokens_in == count_request_tokens(body)
-    # ...and that padded total is what reached the rate limiter...
+    assert result.observed_tokens_in is None and result.observed_tokens_out is None
+    # ...and those padded totals are what reached the rate limiter...
     assert recorded == [result.tokens_in + result.tokens_out]
-    # ...but the row records the observation: nothing reported -> NULL, not the guess.
+    # ...and the budget.
+    assert budget_calls == [("agent-1", result.tokens_in, result.tokens_out)]
+    # But the row records the observations: nothing reported -> NULL, not the guess.
     assert len(recording_ledger.rows) == 1
     assert recording_ledger.rows[0]["tokens_in"] is None
+    assert recording_ledger.rows[0]["tokens_out"] is None
+
+
+def test_observed_output_tokens_reads_the_usage_block_only():
+    """The ledger's observance check for buffered ``tokens_out``: only what
+    the usage block says counts (both provider formats).  Everything else —
+    no usage, unparseable body, a reported zero — is None, the NULL sentinel
+    that keeps guesses out of the same column as real counts."""
+    anthropic = json.dumps({"content": [], "usage": {"input_tokens": 3, "output_tokens": 9}}).encode()
+    openai = json.dumps({"choices": [], "usage": {"prompt_tokens": 3, "completion_tokens": 9}}).encode()
+    assert _observed_output_tokens(anthropic) == 9
+    assert _observed_output_tokens(openai) == 9
+    assert _observed_output_tokens(b'{"content": [{"type": "text", "text": "Hello"}]}') is None
+    assert _observed_output_tokens(b"not json at all") is None
+    assert _observed_output_tokens(json.dumps({"usage": {"output_tokens": 0}}).encode()) is None
 
 
 class _CacheSSEStream(httpx.AsyncByteStream):
@@ -685,6 +716,11 @@ async def test_telemetry_streaming_full_drain_records_one_row(components, record
         assert final.stream_aborted is False  # clean stream: the row's 200 is real
         assert final.tokens_in == 12
         assert final.tokens_out == 7
+        # Parity pin: the streaming path never estimates, so the observed
+        # fields mirror the totals — the row rule (observed only) holds here
+        # without the estimate-padding the buffered path needs.
+        assert final.observed_tokens_in == 12
+        assert final.observed_tokens_out == 7
         assert recording_ledger.record_calls == 1
         assert len(recording_ledger.rows) == 1
         row = recording_ledger.rows[0]

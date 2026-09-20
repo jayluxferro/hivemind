@@ -30,6 +30,11 @@ class StreamingResult:
     #: estimate for rate limiting and budgets; that guess must not reach the
     #: ledger as if the provider had sent it (usage columns are observations).
     observed_tokens_in: int | None = None
+    #: Same split for output.  Streaming never estimates ``tokens_out`` — the
+    #: total above is already the observed sum — so this mirrors it as an
+    #: explicit observation (None when nothing was reported) to keep the row's
+    #: rule uniform: both token columns read the observed_ fields only.
+    observed_tokens_out: int | None = None
     latency_first_chunk_ms: float = 0.0
     latency_total_ms: float = 0.0
     chunks_sent: int = 0

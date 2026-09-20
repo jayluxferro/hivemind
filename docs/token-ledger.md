@@ -197,12 +197,17 @@ hivemind command (operator's choice).
    written with 502 (via `StreamingResult.stream_aborted`) so `error_rate`
    counts every abort — rewriting the ledger row does not touch what the
    client already received.
-11. **Rows carry provider-observed token counts only.**  The request-token
-   estimate still pads the OPERATIONAL counters (`result.tokens_in` — rate
-   limiter windows, budgets, the `x-hivemind-tokens-*` headers), but the
-   ledger records `observed_tokens_in`: a provider that reported nothing
-   produces a NULL row, distinguishable from zero, instead of a guess
-   sitting in the same column as real counts.
+11. **Rows carry provider-observed token counts only.**  The token estimates
+   still pad the OPERATIONAL counters (`result.tokens_in`/`result.tokens_out`
+   — rate limiter windows, budgets, the `x-hivemind-tokens-*` headers), but
+   the ledger records `observed_tokens_in` / `observed_tokens_out`: a
+   provider that reported nothing produces a NULL row, distinguishable from
+   zero, instead of a guess sitting in the same column as real counts.  The
+   two counters differ in where the estimate comes from: `tokens_in` is
+   padded with the request-body estimate, while buffered `tokens_out` is
+   `count_response_tokens`'s estimate from the response text — so its
+   observance is re-read from the usage block at the call site, a step the
+   streaming path never needs (its totals are observed sums or zero).
 
 ## 9. Success metrics
 

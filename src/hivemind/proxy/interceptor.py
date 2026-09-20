@@ -99,6 +99,29 @@ def _model_from_request_body(body: bytes) -> str:
     return model if isinstance(model, str) and model else "unknown"
 
 
+def _observed_output_tokens(body: bytes) -> int | None:
+    """Provider-REPORTED output tokens from a buffered response; None if unreported.
+
+    :func:`count_response_tokens` ESTIMATES the output count from the
+    response text when the usage block is missing or empty, and its
+    ``(in, out)`` return cannot say which happened — the ledger's
+    observance check therefore re-reads the usage block here (same formats,
+    Anthropic ``output_tokens`` then OpenAI ``completion_tokens``).  The
+    ledger must be able to tell "the provider said nothing" (NULL) apart
+    from "the provider said zero" and from a local guess (D2).
+    """
+    try:
+        data = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    usage = data.get("usage") or {}
+    if not isinstance(usage, dict):
+        return None
+    return usage.get("output_tokens") or usage.get("completion_tokens") or None
+
+
 def _discard_task_exception(task: asyncio.Task) -> None:
     """Consume a fire-and-forget task's exception so it never logs as unretrieved.
 
@@ -122,6 +145,7 @@ class InterceptResult:
         "tokens_in",
         "tokens_out",
         "observed_tokens_in",
+        "observed_tokens_out",
         "latency_ms",
         "retries",
     )
@@ -134,6 +158,7 @@ class InterceptResult:
         tokens_in: int = 0,
         tokens_out: int = 0,
         observed_tokens_in: int | None = None,
+        observed_tokens_out: int | None = None,
         latency_ms: float = 0.0,
         retries: int = 0,
     ) -> None:
@@ -145,6 +170,10 @@ class InterceptResult:
         # Provider-REPORTED input tokens (None when the response carried no
         # usage): the ledger records this, never the padded ``tokens_in``.
         self.observed_tokens_in = observed_tokens_in
+        # Same split for output: ``tokens_out`` carries count_response_tokens's
+        # text-length estimate when the provider reported nothing (operational
+        # counters still consume it), while the ledger records this field.
+        self.observed_tokens_out = observed_tokens_out
         self.latency_ms = latency_ms
         self.retries = retries
 
@@ -322,10 +351,10 @@ class Interceptor:
         else agent_id, else ``"anonymous"``.  Provider/model are OBSERVED
         values (D2): the profile display name, and the model from the request
         body.  Usage columns are optional — providers vary; missing or zero
-        counts record as NULL rather than a guessed number.  ``tokens_in``
-        comes from ``observed_tokens_in`` (provider-reported only): the
-        request estimate that pads ``tokens_in`` for rate limiting and
-        budgets never reaches the row.
+        counts record as NULL rather than a guessed number.  Both token
+        columns come from the ``observed_tokens_*`` fields (provider-reported
+        only): the estimates that pad ``tokens_in``/``tokens_out`` for rate
+        limiting and budgets never reach the row.
         ``conversation_hash`` comes from the client session header when one
         was sent (see :func:`_conversation_hash`).  A mid-stream abort on a
         committed SSE stream records 502 while the client-facing status stays
@@ -354,18 +383,20 @@ class Interceptor:
         if getattr(result, "stream_aborted", False):
             status = 502
 
-        # tokens_in is the provider-REPORTED count only.  ``result.tokens_in``
-        # is padded with the request estimate on both paths (streaming and
-        # buffered) for the rate limiter and budgets — an operational need —
-        # but that guess never enters the ledger: unreported stays NULL,
+        # Both token columns are the provider-REPORTED counts only.
+        # ``result.tokens_in``/``tokens_out`` are padded with estimates on
+        # the buffered path (request-estimate for in, response-text estimate
+        # for out) for the rate limiter and budgets — an operational need —
+        # but those guesses never enter the ledger: unreported stays NULL,
         # distinguishable from zero, instead of masquerading as an
-        # observation (D2).
+        # observation (D2).  The streaming path never estimates, so its
+        # observed fields mirror its totals.
         return {
             "agent_hash": (rate_key or agent_id) or "anonymous",
             "provider": self.provider.name if self.provider else "unknown",
             "model": _model_from_request_body(body),
             "tokens_in": _count(getattr(result, "observed_tokens_in", None)),
-            "tokens_out": _count(getattr(result, "tokens_out", 0)),
+            "tokens_out": _count(getattr(result, "observed_tokens_out", None)),
             "cache_read": cache_read,
             "cache_write": cache_write,
             "reasoning": None,  # no provider in the chain reports it separately yet
@@ -596,6 +627,7 @@ class Interceptor:
                                 result.tokens_in = total_tokens_in or est_request_tokens
                                 result.observed_tokens_in = total_tokens_in or None
                                 result.tokens_out = total_tokens_out
+                                result.observed_tokens_out = total_tokens_out or None
                                 result._cache_read_tokens = cache_read_tokens or None
                                 result._cache_write_tokens = cache_write_tokens or None
                                 yield sse_terminal_error_frame(path, result.error), None
@@ -633,6 +665,7 @@ class Interceptor:
                         result.tokens_in = total_tokens_in or est_request_tokens
                         result.observed_tokens_in = total_tokens_in or None
                         result.tokens_out = total_tokens_out
+                        result.observed_tokens_out = total_tokens_out or None
                         result._cache_read_tokens = cache_read_tokens or None
                         result._cache_write_tokens = cache_write_tokens or None
 
@@ -780,12 +813,16 @@ class Interceptor:
 
                 # 7. Count tokens
                 tokens_in, tokens_out = count_response_tokens(response.content)
-                # The provider-reported input count, captured BEFORE the
-                # estimate padding below: the rate limiter and budgets must
-                # count unreported traffic, but the ledger row records
+                # Provider-REPORTED counts, captured BEFORE the estimate
+                # padding below: the rate limiter and budgets must count
+                # unreported traffic, but the ledger row records
                 # observations only (unreported stays NULL, distinguishable
-                # from zero — D2).
+                # from zero — D2).  ``tokens_in`` is already 0 when the
+                # provider reported nothing, but ``tokens_out`` came out of
+                # count_response_tokens as a text-length estimate in that
+                # case, so its observance is re-read from the usage block.
                 observed_tokens_in = tokens_in or None
+                observed_tokens_out = _observed_output_tokens(response.content)
                 if self.cache_telemetry:
                     self.cache_telemetry.observe_response(response.content)
                 if not tokens_in:
@@ -809,6 +846,7 @@ class Interceptor:
                     tokens_in=tokens_in,
                     tokens_out=tokens_out,
                     observed_tokens_in=observed_tokens_in,
+                    observed_tokens_out=observed_tokens_out,
                     latency_ms=latency_ms,
                     retries=retries,
                 )
