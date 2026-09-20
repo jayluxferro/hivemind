@@ -1106,9 +1106,7 @@ def test_schema_ddl_parses_against_real_postgres():
     pytest.importorskip("psycopg")
     import psycopg
 
-    dsn = os.environ.get(
-        "HIVEMIND_TEST_DB_URL", "postgresql://hivemind@localhost:5432/hivemind_test"
-    )
+    dsn = os.environ.get("HIVEMIND_TEST_DB_URL", "postgresql://hivemind@localhost:5432/hivemind_test")
     try:
         conn = psycopg.connect(dsn, connect_timeout=3)
     except Exception:
@@ -1237,9 +1235,7 @@ def test_every_read_sql_constant_parses_on_real_postgres():
     from hivemind.telemetry import ledger as L
     from hivemind.telemetry.ledger import _SQL_TOTALS
 
-    dsn = os.environ.get(
-        "HIVEMIND_TEST_DB_URL", "postgresql://hivemind@localhost:5432/hivemind_test"
-    )
+    dsn = os.environ.get("HIVEMIND_TEST_DB_URL", "postgresql://hivemind@localhost:5432/hivemind_test")
     try:
         conn = psycopg.connect(dsn, connect_timeout=3)
     except Exception:
