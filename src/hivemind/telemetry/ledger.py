@@ -23,7 +23,9 @@ a label never shifts with the server's timezone.
 
 Retention (D10): a background pruner deletes rows older than
 ``retention_days`` once on connect and then every 24h.  It is fail-open and
-cancelled in ``shutdown()`` before the writer connection is reset.
+cancelled in ``shutdown()`` before the writer connection is reset.  The
+pruner (re)arms on every successful (re)connect — a failed startup connect
+no longer leaves retention disabled for the process lifetime.
 
 Token semantics: ``tokens_in`` is the FRESH (uncached) input portion on
 DeepSeek's Anthropic-compatible shim — cache reads are reported in
@@ -552,14 +554,18 @@ class TelemetryLedger:
 
         The pruner only starts once a connection actually succeeded: with no
         schema there is nothing to prune, and a failed connect must stay as
-        quiet as it did before retention existed.
+        quiet as it did before retention existed.  It arms itself again on
+        every later successful (re)connect (see :meth:`_connection`), so a
+        failed startup connect cannot silently disable retention for the
+        whole process lifetime.
         """
         try:
             await self._connection()
         except Exception:
-            _log.debug("telemetry connect failed (fail-open; next write retries)", exc_info=True)
-            return
-        self._start_pruner()
+            _log.debug(
+                "telemetry connect failed (fail-open; the next write reconnects and re-arms the pruner)",
+                exc_info=True,
+            )
 
     async def shutdown(self) -> None:
         """Stop the pruner, drain queued rows (bounded wait), stop the worker, close.
@@ -643,6 +649,13 @@ class TelemetryLedger:
                 await _safe_close(conn)
                 raise
             self._conn = conn
+            # Every successful (re)connect re-arms retention.  If the FIRST
+            # connect failed (DB down at startup), the pruner used to stay
+            # dead for the whole process lifetime — retention silently off
+            # even after Postgres came back and writes resumed.  Idempotent
+            # (a live pruner task is left alone) and fail-open (prune()
+            # swallows its own errors).
+            self._start_pruner()
         return self._conn
 
     async def _reset_connection(self) -> None:
@@ -676,6 +689,11 @@ class TelemetryLedger:
             _log.debug("telemetry prune failed (fail-open)", exc_info=True)
 
     def _start_pruner(self) -> None:
+        # _closed guard: shutdown() captured and cancelled the pruner task
+        # before draining; a connection landing in that window must not spin
+        # up a replacement shutdown will never cancel.
+        if self._closed:
+            return
         if self._pruner is None or self._pruner.done():
             self._pruner = asyncio.create_task(self._prune_loop())
 

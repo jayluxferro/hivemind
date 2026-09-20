@@ -937,6 +937,36 @@ async def test_prune_swallows_failures(caplog):
     assert any("prune failed" in r.getMessage() for r in caplog.records)
 
 
+async def test_pruner_retries_after_a_failed_startup_connect(monkeypatch):
+    """If the ledger's FIRST connect fails, retention must not stay silently
+    disabled for the process lifetime: the pruner re-arms on the next
+    successful connection (here, a write's lazy reconnect) and a DELETE
+    eventually runs (D10, fail-open throughout)."""
+    monkeypatch.setattr("hivemind.telemetry.ledger._PRUNE_INTERVAL_S", 0.01)
+    state = {"up": False}
+    pool = FakePool()
+
+    async def flaky(dsn: str):
+        if not state["up"]:
+            raise ConnectionError("pg down")
+        return await pool(dsn)
+
+    ledger = TelemetryLedger("postgresql://fake", conn_factory=flaky)
+    await ledger.connect()  # swallowed (D4)
+    assert ledger._pruner is None  # nothing armed without a connection
+
+    state["up"] = True  # Postgres comes back
+    await ledger.record({"agent_hash": "a", "provider": "p", "model": "m", "status": 200})
+    for _ in range(200):
+        if pool.prunes() >= 1:
+            break
+        await asyncio.sleep(0.01)
+
+    assert pool.prunes() >= 1  # a prune statement ran on a later connection
+    assert ledger._pruner is not None
+    await ledger.shutdown()
+
+
 async def test_pruner_runs_on_connect_then_stops_on_shutdown(monkeypatch):
     monkeypatch.setattr("hivemind.telemetry.ledger._PRUNE_INTERVAL_S", 0.01)
     pool = FakePool()
