@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock
 from hivemind.proxy.interceptor import Interceptor
 from hivemind.proxy.latency_tracker import LatencyTracker
 from hivemind.proxy.retry import RetryPolicy
+from hivemind.proxy.token_counter import count_request_tokens
 from hivemind.scheduler.admission import AdmissionController
 from hivemind.scheduler.backpressure import BackpressureController
 from hivemind.scheduler.budget import BudgetManager
@@ -597,6 +598,42 @@ async def test_telemetry_recorder_failure_never_breaks_request(components, monke
     assert ledger.record_calls == 1  # hook fired; the raise stayed inside the task
 
 
+@pytest.mark.asyncio
+async def test_telemetry_estimate_stays_out_of_the_row_but_reaches_the_limiter(
+    components, recording_ledger, monkeypatch
+):
+    """A response with NO usage block: the ledger row records tokens_in=NULL
+    (rows are observations — D2), while the rate limiter still counts the
+    estimate-padded operational total, because unreported traffic must count
+    against the window."""
+    recorded: list[int] = []
+    monkeypatch.setattr(RateLimiter, "record_tokens", lambda self, count, agent_id=None: recorded.append(count))
+
+    body = json.dumps({"model": "claude-sonnet-4-20250514", "messages": [{"role": "user", "content": "Hi"}]}).encode()
+    resp_body = json.dumps({"content": [{"type": "text", "text": "Hello"}]}).encode()  # no "usage" block
+    interceptor = _anthropic_interceptor(components)
+    mock_client = AsyncMock()
+    mock_client.request = AsyncMock(return_value=_make_response(body=resp_body))
+    interceptor._client = mock_client
+
+    result = await interceptor.handle_request(
+        method="POST",
+        path="/v1/messages",
+        headers={"content-type": "application/json", "x-api-key": "test"},
+        body=body,
+        agent_id="agent-1",
+    )
+    await _settle()
+
+    # The operational counter on the result is estimate-padded...
+    assert result.tokens_in == count_request_tokens(body)
+    # ...and that padded total is what reached the rate limiter...
+    assert recorded == [result.tokens_in + result.tokens_out]
+    # ...but the row records the observation: nothing reported -> NULL, not the guess.
+    assert len(recording_ledger.rows) == 1
+    assert recording_ledger.rows[0]["tokens_in"] is None
+
+
 class _CacheSSEStream(httpx.AsyncByteStream):
     """Anthropic lifecycle with cache usage carried in message_start."""
 
@@ -748,6 +785,50 @@ async def test_telemetry_streaming_mid_stream_abort_records_once(components, rec
         assert row["tokens_in"] == 10
         assert row["tokens_out"] is None
         assert row["agent_hash"] == "agent-1"
+    finally:
+        await interceptor.stop()
+
+
+@pytest.mark.asyncio
+async def test_telemetry_streaming_without_usage_records_null_tokens(components, recording_ledger):
+    """A committed stream that never reports usage: the row's tokens_in is
+    NULL — the request estimate that pads result.tokens_in (and feeds the
+    rate limiter) must not masquerade as an observation in the ledger."""
+
+    class _NoUsageSSE(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b'event: message_start\ndata: {"type": "message_start", "message": {"role": "assistant"}}\n\n'
+            yield b'event: content_block_delta\ndata: {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Hi"}}\n\n'
+            yield b'event: message_stop\ndata: {"type": "message_stop"}\n\n'
+
+    def handler(request):
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=_NoUsageSSE())
+
+    interceptor = _anthropic_interceptor(components)
+    interceptor._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        final = None
+        async for _chunk, result in interceptor.handle_streaming_request(
+            "POST",
+            "/v1/messages",
+            {"content-type": "application/json", "accept": "text/event-stream"},
+            _stream_body(),
+            agent_id="agent-1",
+        ):
+            if result is not None:
+                final = result
+        await _settle()
+
+        assert final is not None and final.status_code == 200
+        # Operational counter is estimate-padded, exactly as before...
+        assert final.tokens_in == count_request_tokens(_stream_body())
+        assert final.observed_tokens_in is None
+        # ...but the row records the honest NULL on both counters.
+        assert len(recording_ledger.rows) == 1
+        row = recording_ledger.rows[0]
+        assert row["tokens_in"] is None
+        assert row["tokens_out"] is None
+        assert row["status"] == 200
     finally:
         await interceptor.stop()
 
