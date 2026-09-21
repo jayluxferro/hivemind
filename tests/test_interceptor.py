@@ -1318,7 +1318,9 @@ def test_rebind_without_profile_warns_on_shape_flip(components, caplog):
     operator override).  The flip must WARN, naming both shapes."""
     import logging
 
-    interceptor = Interceptor(upstream_url="https://api.anthropic.com", **components)
+    interceptor = Interceptor(
+        upstream_url="https://api.anthropic.com", provider=ANTHROPIC, **components
+    )
     assert interceptor.provider.input_includes_cached is False
 
     with caplog.at_level(logging.WARNING, logger="hivemind.proxy.interceptor"):
