@@ -13,8 +13,9 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
+from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
 
@@ -212,13 +213,13 @@ _PROFILES: dict[ProviderType, ProviderProfile] = {
     ProviderType.GENERIC: GENERIC,
 }
 
-# URL patterns for auto-detection
+# URL patterns for auto-detection.  Domains listed in _DUAL_SHAPE_HOSTS
+# below are deliberately NOT here: their shape depends on the URL path, so
+# a flat domain match cannot decide it.
 _URL_PATTERNS: list[tuple[str, ProviderType]] = [
     (r"api\.anthropic\.com", ProviderType.ANTHROPIC),
-    (r"api\.deepseek\.com", ProviderType.ANTHROPIC),
     (r"api\.myapi\.world", ProviderType.ANTHROPIC),
     (r"api\.kimi\.com", ProviderType.ANTHROPIC),
-    (r"api\.z\.ai", ProviderType.ANTHROPIC),
     (r"api\.openai\.com", ProviderType.OPENAI),
     (r"api\.doubleword\.ai", ProviderType.OPENAI),
     (r"openai\.azure\.com", ProviderType.AZURE_OPENAI),
@@ -227,13 +228,71 @@ _URL_PATTERNS: list[tuple[str, ProviderType]] = [
     (r"127\.0\.0\.1:11434", ProviderType.OLLAMA),
 ]
 
+# Domains that host BOTH wire shapes under one host — the URL path picks
+# the contract, so detection must be path-aware for them.  DeepSeek serves
+# its Anthropic-compatible shim at /anthropic and its OpenAI-compatible
+# API at the bare domain and /v1; Z.AI serves the shim at /api/anthropic
+# and its OpenAI-compatible API at /api/paas/v4.  A flat domain→ANTHROPIC
+# match silently mis-flagged the OpenAI-shape endpoints as fresh-only,
+# which is exactly the double-billing bug the ledger normalization fixed
+# (commit 2cf6e4d) — the flag suppressed the subtraction, and the clamp
+# only runs for True profiles, so nothing else would catch it either.
+_DUAL_SHAPE_HOSTS: tuple[str, ...] = (
+    r"api\.deepseek\.com",
+    r"api\.z\.ai",
+)
+
+
+def _dual_shape_profile(upstream_url: str) -> ProviderProfile:
+    """Resolve a dual-shape host by URL path.
+
+    ``/anthropic`` anywhere in the path is the provider's Anthropic shim
+    (fresh-only input).  Everything else — bare domain, ``/v1``, any other
+    prefix — speaks the OpenAI contract (``prompt_tokens`` INCLUDES the
+    cached subset), which is those hosts' documented default.
+    """
+    try:
+        path = urlsplit(upstream_url).path or ""
+    except ValueError:  # unparseable URL — judge it by its literal text
+        path = upstream_url
+    if "/anthropic" in path:
+        return _PROFILES[ProviderType.ANTHROPIC]
+    return _PROFILES[ProviderType.OPENAI]
+
 
 def detect_provider(upstream_url: str) -> ProviderProfile:
     """Auto-detect provider from upstream URL."""
     for pattern, provider_type in _URL_PATTERNS:
         if re.search(pattern, upstream_url):
             return _PROFILES[provider_type]
+    for pattern in _DUAL_SHAPE_HOSTS:
+        if re.search(pattern, upstream_url):
+            return _dual_shape_profile(upstream_url)
     return _PROFILES[ProviderType.GENERIC]
+
+
+def resolve_provider_profile(
+    upstream_url: str,
+    input_includes_cached: bool | None = None,
+) -> ProviderProfile:
+    """detect_provider plus the operator's usage-shape escape hatch.
+
+    The ledger's fresh-only ingest normalization keys off the profile's
+    ``input_includes_cached`` flag, which detection derives from the URL.
+    Detection can be wrong for an unlisted gateway (an Anthropic-shape
+    proxy that detects GENERIC/True clamps every cached request to
+    tokens_in=0), so the operator can force the shape explicitly:
+    ``--input-includes-cached`` / ``--input-excludes-cached`` land here as
+    True/False; None keeps the profile-derived default.
+
+    Returns a copy when overriding — profiles are shared singletons and
+    must never be mutated.  The copy shares the singleton's rate-limit
+    header tables (read-only by convention, as on the singleton itself).
+    """
+    profile = detect_provider(upstream_url)
+    if input_includes_cached is None or input_includes_cached == profile.input_includes_cached:
+        return profile
+    return replace(profile, input_includes_cached=input_includes_cached)
 
 
 def get_profile(provider_type: ProviderType | str) -> ProviderProfile:

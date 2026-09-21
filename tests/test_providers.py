@@ -1,5 +1,7 @@
 """Tests for provider profiles."""
 
+import pytest
+
 from hivemind.scheduler.providers import (
     ANTHROPIC,
     AZURE_OPENAI,
@@ -11,6 +13,7 @@ from hivemind.scheduler.providers import (
     detect_provider,
     get_profile,
     list_providers,
+    resolve_provider_profile,
 )
 
 
@@ -132,3 +135,96 @@ def test_profile_to_dict():
     d = ANTHROPIC.to_dict()
     assert d["provider_type"] == "anthropic"
     assert "default_requests_per_minute" in d
+
+
+# --- dual-shape hosts: the URL path picks the contract ------------------------
+#
+# DeepSeek and Z.AI each serve BOTH wire shapes under one domain (Anthropic
+# shim at */anthropic, OpenAI-compat everywhere else).  A flat domain match
+# flagged every one of those URLs fresh-only, so a config pointed at the
+# OpenAI-shape endpoint silently reintroduced the double-billing bug commit
+# 2cf6e4d fixed — the ingest normalization never ran, and the ledger clamp
+# only guards True profiles, so nothing else would catch it either.
+
+
+def test_deepseek_anthropic_shim_detects_fresh_shape():
+    p = detect_provider("https://api.deepseek.com/anthropic")
+    assert p.provider_type == ProviderType.ANTHROPIC
+    assert p.input_includes_cached is False
+
+
+def test_deepseek_openai_shape_detects_total_shape():
+    """The footgun: /v1 and the bare domain are DeepSeek's DOCUMENTED OpenAI
+    base — prompt_tokens INCLUDES cached_tokens there.  Detection must say
+    OPENAI (True) so the ledger normalization runs; ANTHROPIC here is what
+    double-billed every cached token."""
+    for url in ("https://api.deepseek.com/v1", "https://api.deepseek.com"):
+        p = detect_provider(url)
+        assert p.provider_type == ProviderType.OPENAI, url
+        assert p.input_includes_cached is True, url
+
+
+def test_zai_path_decides_the_shape():
+    """Z.AI hosts the Anthropic shim at /api/anthropic and its OpenAI-compat
+    API at /api/paas/v4 — same domain, opposite contracts."""
+    p = detect_provider("https://api.z.ai/api/anthropic")
+    assert p.provider_type == ProviderType.ANTHROPIC
+    assert p.input_includes_cached is False
+
+    p = detect_provider("https://api.z.ai/api/paas/v4")
+    assert p.provider_type == ProviderType.OPENAI
+    assert p.input_includes_cached is True
+
+
+# Every fallback_upstream hivemind can inherit across the production
+# manifold*.yaml set (hivemind is the LAST pipeline service in each, so the
+# gateway's fallback_upstream IS what the interceptor detects on).  These
+# pins are the no-regression contract for the path-aware detection change:
+# each URL must keep detecting exactly the same shape as before it.
+@pytest.mark.parametrize(
+    ("upstream", "expected_type", "expected_flag", "manifold_config"),
+    [
+        ("https://api.deepseek.com/anthropic", ProviderType.ANTHROPIC, False, "manifold.yaml"),
+        ("https://api.z.ai/api/anthropic", ProviderType.ANTHROPIC, False, "manifold-zai.yaml"),
+        ("https://api.myapi.world", ProviderType.ANTHROPIC, False, "manifold-myapi-world.yaml"),
+        ("https://api.kimi.com/coding/", ProviderType.ANTHROPIC, False, "manifold-anthropic-kimi.yaml"),
+        ("https://api.anthropic.com", ProviderType.ANTHROPIC, False, "manifold-anthropic-new.yaml"),
+        ("https://api.doubleword.ai", ProviderType.OPENAI, True, "manifold-doublewordai.yaml"),
+    ],
+)
+def test_production_manifold_endpoints_detect_unchanged(upstream, expected_type, expected_flag, manifold_config):
+    p = detect_provider(upstream)
+    assert p.provider_type == expected_type, manifold_config
+    assert p.input_includes_cached is expected_flag, manifold_config
+
+
+# --- the operator's usage-shape escape hatch ---------------------------------
+
+
+def test_resolve_provider_profile_default_follows_detection():
+    """No override (None) returns the detected singleton itself."""
+    assert resolve_provider_profile("https://api.anthropic.com", None) is ANTHROPIC
+    assert resolve_provider_profile("https://api.openai.com", None) is OPENAI
+
+
+def test_resolve_provider_profile_forces_flag_against_the_profile():
+    """An explicit True/False wins over whatever detection derived — the
+    unlisted-Anthropic-shape-gateway victim detects GENERIC/True and needs
+    False; an OpenAI-shape endpoint detected as fresh-only needs True."""
+    p = resolve_provider_profile("https://api.anthropic.com", True)
+    assert p is not ANTHROPIC  # singletons are shared — never mutate them
+    assert p.name == "Anthropic"
+    assert p.provider_type == ProviderType.ANTHROPIC
+    assert p.input_includes_cached is True
+    assert ANTHROPIC.input_includes_cached is False  # the singleton is untouched
+
+    p = resolve_provider_profile("https://gw.example.com", False)
+    assert p.provider_type == ProviderType.GENERIC
+    assert p.input_includes_cached is False
+    assert GENERIC.input_includes_cached is True  # singleton untouched
+
+
+def test_resolve_provider_profile_matching_override_returns_singleton():
+    """Forcing the value the profile already has needs no copy."""
+    assert resolve_provider_profile("https://api.anthropic.com", False) is ANTHROPIC
+    assert resolve_provider_profile("https://api.openai.com", True) is OPENAI
