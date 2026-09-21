@@ -638,6 +638,19 @@ def _build_proxy(config: HiveMindConfig) -> ProxyServer:
         config.upstream_url,
         config.max_concurrency,
     )
+    # Ledger pricing shape, named at startup: a --input-excludes-cached
+    # override on a total-shape upstream silently misprices ~4x with zero
+    # log evidence (round-eight finding) — the operator sees the resolved
+    # semantics here, in one line, before a single request is priced.
+    _resolved = resolve_provider_profile(config.upstream_url, config.input_includes_cached)
+    logger.info(
+        "Ledger shape: provider=%s input_includes_cached=%s (override=%s) — "
+        "tokens_in is recorded %s",
+        _resolved.provider_type,
+        _resolved.input_includes_cached,
+        config.input_includes_cached,
+        "TOTAL minus cache_read" if _resolved.input_includes_cached else "as reported (fresh-only)",
+    )
 
     admission = AdmissionController(config.max_concurrency)
     rate_limiter = RateLimiter(

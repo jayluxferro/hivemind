@@ -219,9 +219,32 @@ class Interceptor:
         self._client: httpx.AsyncClient | None = None
 
     def rebind_upstream(self, upstream_url: str, provider: ProviderProfile | None = None) -> None:
-        """Point the interceptor at a new upstream (URL and provider profile)."""
+        """Point the interceptor at a new upstream (URL and provider profile).
+
+        Callers that configured an input-shape override MUST pass the
+        resolved profile: the ``provider=None`` default re-detects from the
+        URL alone and silently drops the operator's override (round-eight
+        latent trap — the one production caller passes it; this warning
+        catches the next one).
+        """
         self.upstream_url = upstream_url.rstrip("/")
-        self.provider = provider if provider is not None else detect_provider(self.upstream_url)
+        if provider is None:
+            detected = detect_provider(self.upstream_url)
+            old_shape = getattr(self.provider, "input_includes_cached", None)
+            new_shape = getattr(detected, "input_includes_cached", None)
+            if self.provider is not None and old_shape != new_shape:
+                logger.warning(
+                    "rebind_upstream(%s) without a profile: ledger input-shape "
+                    "semantics change input_includes_cached %s -> %s — if an "
+                    "operator override was set, it has been DROPPED (pass the "
+                    "resolved profile to preserve it)",
+                    upstream_url,
+                    old_shape,
+                    new_shape,
+                )
+            self.provider = detected
+        else:
+            self.provider = provider
 
     async def set_tls_verify(self, verify: bool) -> None:
         """Toggle TLS certificate verification; recreates the httpx client if running."""

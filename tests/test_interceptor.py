@@ -1310,3 +1310,34 @@ def _result():
     from hivemind.proxy.interceptor import InterceptResult
 
     return InterceptResult(status_code=200, headers={}, body=b"{}")
+
+
+def test_rebind_without_profile_warns_on_shape_flip(components, caplog):
+    """Round-eight visibility finding: a bare rebind_upstream re-detects
+    from the URL and can silently change ledger pricing shape (dropping an
+    operator override).  The flip must WARN, naming both shapes."""
+    import logging
+
+    interceptor = Interceptor(upstream_url="https://api.anthropic.com", **components)
+    assert interceptor.provider.input_includes_cached is False
+
+    with caplog.at_level(logging.WARNING, logger="hivemind.proxy.interceptor"):
+        interceptor.rebind_upstream("https://api.openai.com/v1")  # no profile
+
+    assert interceptor.provider.input_includes_cached is True
+    assert any("input_includes_cached False -> True" in r.message for r in caplog.records)
+
+
+def test_rebind_with_profile_never_warns(components, caplog):
+    import logging
+
+    from hivemind.scheduler.providers import OPENAI, resolve_provider_profile
+
+    interceptor = Interceptor(upstream_url="https://api.anthropic.com", **components)
+    with caplog.at_level(logging.WARNING, logger="hivemind.proxy.interceptor"):
+        # The production caller's shape: resolved profile passed explicitly.
+        resolved = resolve_provider_profile("https://api.openai.com/v1", None)
+        assert resolved is OPENAI
+        interceptor.rebind_upstream("https://api.openai.com/v1", resolved)
+    assert not [r for r in caplog.records if "input_includes_cached" in r.message]
+    assert interceptor.provider is OPENAI
