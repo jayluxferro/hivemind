@@ -165,6 +165,8 @@ hivemind setup all         # Show all configs
 | `--agent-limit` | none | Per-agent override (repeatable): `AGENT:rpm=N,tpm=M` |
 | `--max-rate-wait` | `240` | Max seconds a rate-limited request holds inside HiveMind before a 429 (`HIVEMIND_MAX_RATE_WAIT_S`) |
 | `--no-rate-limiting` | off | Disable ALL rate limiting — never wait, never record, ignore rate-limit headers. The guard lives inside the limiter, so no call site can bypass it. Admission control and budgets still apply. Escape hatch for benchmarks/incidents. `/_stats` reports `rate_limiter.enabled` |
+| `--input-includes-cached` | auto | Force the total-shape usage contract for the upstream: reported input INCLUDES cached tokens (OpenAI contract), so the ledger subtracts cache reads at ingest. Overrides the provider auto-detection — escape hatch for an unlisted gateway detected as the wrong shape |
+| `--input-excludes-cached` | auto | Force the fresh-shape usage contract for the upstream: reported input EXCLUDES cached tokens (Anthropic contract, incl. DeepSeek's `/anthropic` shim), so the ledger records it verbatim. Overrides the provider auto-detection |
 | `--insecure` | off | Disable upstream TLS certificate verification (dev only) |
 | `--log-level` | `INFO` | **`hivemind-proxy` only** — logging verbosity |
 
@@ -184,6 +186,8 @@ hivemind setup all         # Show all configs
 | `--rate-limit-scope` | `per_agent` | `per_agent` buckets rate limits by session; `global` shares one window |
 | `--agent-limit` | none | Per-agent override (repeatable): `AGENT:rpm=N,tpm=M` |
 | `--max-rate-wait` | `240` | Max seconds a rate-limited request holds inside HiveMind before a 429 (`HIVEMIND_MAX_RATE_WAIT_S`) |
+| `--input-includes-cached` | auto | Force the total-shape usage contract (reported input INCLUDES cached tokens). Overrides the provider auto-detection |
+| `--input-excludes-cached` | auto | Force the fresh-shape usage contract (reported input EXCLUDES cached tokens). Overrides the provider auto-detection |
 | `--insecure` | off | Disable upstream TLS certificate verification (dev only) |
 
 ### MCP Tools

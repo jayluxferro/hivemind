@@ -259,3 +259,104 @@ def test_serve_cli_no_rate_limiting_flag():
     c = HiveMindConfig()
     apply_serve_cli_args_to_config(c, args)
     assert c.rate_limiting_enabled is False
+
+
+# --- usage-shape escape hatch (--input-includes-cached / --input-excludes-cached)
+
+
+def test_proxy_cli_input_shape_flags_force_the_override():
+    parser = argparse.ArgumentParser()
+    register_proxy_cli_arguments(parser)
+    args = parser.parse_args(["--input-includes-cached"])
+    assert hivemind_config_from_proxy_cli_args(args).input_includes_cached is True
+
+    parser = argparse.ArgumentParser()
+    register_proxy_cli_arguments(parser)
+    args = parser.parse_args(["--input-excludes-cached"])
+    assert hivemind_config_from_proxy_cli_args(args).input_includes_cached is False
+
+
+def test_proxy_cli_input_shape_default_follows_the_profile():
+    """No flag -> config stays None -> the normalization site uses the
+    profile-derived shape untouched."""
+    parser = argparse.ArgumentParser()
+    register_proxy_cli_arguments(parser)
+    c = hivemind_config_from_proxy_cli_args(parser.parse_args([]))
+    assert c.input_includes_cached is None
+
+
+def test_serve_cli_input_shape_flags_force_the_override():
+    parser = argparse.ArgumentParser()
+    register_serve_cli_arguments(parser)
+    args = parser.parse_args(["--input-excludes-cached"])
+    c = HiveMindConfig()
+    apply_serve_cli_args_to_config(c, args)
+    assert c.input_includes_cached is False
+
+    parser = argparse.ArgumentParser()
+    register_serve_cli_arguments(parser)
+    args = parser.parse_args(["--input-includes-cached"])
+    c = HiveMindConfig()
+    apply_serve_cli_args_to_config(c, args)
+    assert c.input_includes_cached is True
+
+
+def test_input_shape_flags_are_mutually_exclusive():
+    parser = argparse.ArgumentParser()
+    register_proxy_cli_arguments(parser)
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--input-includes-cached", "--input-excludes-cached"])
+
+
+def test_config_to_dict_carries_the_shape_override():
+    c = HiveMindConfig()
+    assert c.to_dict()["input_includes_cached"] is None
+    c.input_includes_cached = False
+    assert c.to_dict()["input_includes_cached"] is False
+
+
+def test_config_rejects_non_bool_shape_override():
+    for bad in ("true", 1, 1.0):
+        with pytest.raises(ValueError):
+            HiveMindConfig(input_includes_cached=bad)
+
+
+def test_proxy_server_wires_the_shape_override_into_the_interceptor():
+    """The normalization site: the interceptor's profile is what the ledger's
+    fresh-only ingest keys off, so the operator flag must land there.  The
+    test upstream detects GENERIC (whose profile is True); the override
+    forces False against that profile."""
+    from hivemind.scheduler.admission import AdmissionController
+    from hivemind.scheduler.backpressure import BackpressureController
+    from hivemind.scheduler.budget import BudgetManager
+    from hivemind.scheduler.rate_limiter import RateLimiter
+    from hivemind.proxy.server import ProxyServer
+
+    config = HiveMindConfig(
+        upstream_url="http://test-upstream",
+        max_retries=0,
+        retry_base_delay=0.01,
+        retry_max_delay=0.05,
+    )
+    assert config.input_includes_cached is None
+    proxy = ProxyServer(
+        config=config,
+        admission=AdmissionController(5),
+        rate_limiter=RateLimiter(),
+        backpressure=BackpressureController(5),
+        budget_manager=BudgetManager(),
+        db=None,
+    )
+    assert proxy.interceptor.provider.input_includes_cached is True  # GENERIC default
+
+    config.input_includes_cached = False  # --input-excludes-cached
+    proxy = ProxyServer(
+        config=config,
+        admission=AdmissionController(5),
+        rate_limiter=RateLimiter(),
+        backpressure=BackpressureController(5),
+        budget_manager=BudgetManager(),
+        db=None,
+    )
+    assert proxy.interceptor.provider.provider_type.value == "generic"  # same detection...
+    assert proxy.interceptor.provider.input_includes_cached is False  # ...forced shape

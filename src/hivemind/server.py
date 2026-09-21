@@ -16,7 +16,7 @@ from .proxy.server import ProxyServer
 from .scheduler.admission import AdmissionController
 from .scheduler.backpressure import BackpressureController
 from .scheduler.budget import BudgetManager
-from .scheduler.providers import detect_provider, get_profile
+from .scheduler.providers import get_profile, resolve_provider_profile
 from .scheduler.queue import PriorityQueue
 from .scheduler.rate_limiter import RateLimiter, validate_agent_limits
 from .tools.setup import setup_tool, SUPPORTED_TOOLS
@@ -410,7 +410,10 @@ class HiveMindServer:
             if self.config.provider:
                 self.rate_limiter.configure_from_profile(get_profile(self.config.provider))
 
-            profile = detect_provider(self.config.upstream_url)
+            # Same normalization as ProxyServer construction: the operator's
+            # usage-shape override (None = profile-derived) rides along when
+            # the upstream is rebound at runtime.
+            profile = resolve_provider_profile(self.config.upstream_url, self.config.input_includes_cached)
             self.proxy.interceptor.rebind_upstream(self.config.upstream_url, profile)
             await self._sync_concurrency_and_backpressure_from_config()
             updates["upstream_url"] = self.config.upstream_url

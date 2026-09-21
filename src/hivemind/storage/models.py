@@ -264,6 +264,17 @@ class HiveMindConfig:
     # Provider (auto-detected from upstream_url if not set)
     provider: str | None = None  # anthropic, openai, ollama, etc.
 
+    # Operator escape hatch for the ledger's usage-shape flag (CLI:
+    # --input-includes-cached / --input-excludes-cached).  None = derive the
+    # shape from the detected provider profile (the default); True/False
+    # FORCE the contract for the detected upstream regardless of its profile:
+    # True when reported input INCLUDES cached tokens (OpenAI contract),
+    # False when it is fresh-only (Anthropic contract).  The common victim
+    # without this is an unlisted Anthropic-shape gateway that detects
+    # GENERIC/True — every cached request then clamps to tokens_in=0 with a
+    # warning and its fresh input goes unbilled; the operator pins False.
+    input_includes_cached: bool | None = None
+
     # MCP
     mcp_host: str = "127.0.0.1"
     mcp_port: int = 8766
@@ -325,6 +336,8 @@ class HiveMindConfig:
             raise ValueError(
                 f"telemetry_retention_days must be a whole number of days >= 1, got {self.telemetry_retention_days!r}"
             )
+        if self.input_includes_cached is not None and not isinstance(self.input_includes_cached, bool):
+            raise ValueError(f"input_includes_cached must be a bool or None, got {self.input_includes_cached!r}")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -352,4 +365,5 @@ class HiveMindConfig:
             "telemetry_dsn": self.telemetry_dsn,
             "telemetry_retention_days": self.telemetry_retention_days,
             "http_tls_verify": self.http_tls_verify,
+            "input_includes_cached": self.input_includes_cached,
         }

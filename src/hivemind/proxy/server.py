@@ -25,7 +25,7 @@ from ..scheduler.admission import AdmissionController
 from ..scheduler.backpressure import BackpressureController
 from ..scheduler.budget import BudgetManager
 from ..scheduler.rate_limiter import RateLimiter
-from ..scheduler.providers import detect_provider
+from ..scheduler.providers import resolve_provider_profile
 from ..storage.db import Database
 from ..storage.models import HiveMindConfig
 from ..telemetry import query as tq
@@ -67,7 +67,11 @@ class ProxyServer:
             base_delay=config.retry_base_delay,
             max_delay=config.retry_max_delay,
         )
-        provider = detect_provider(config.upstream_url)
+        # Normalization site for the usage-shape escape hatch: the profile
+        # the ledger keys its fresh-only ingest off comes from detection,
+        # then the operator's --input-includes-cached/--input-excludes-cached
+        # (config.input_includes_cached, None = no override) is applied.
+        provider = resolve_provider_profile(config.upstream_url, config.input_includes_cached)
         self.cache_telemetry = CacheTelemetry()
         self.interceptor = Interceptor(
             upstream_url=config.upstream_url,

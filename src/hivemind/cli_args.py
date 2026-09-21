@@ -37,6 +37,46 @@ def parse_agent_limit_specs(specs: list[str] | None) -> dict[str, dict[str, int]
     return overrides
 
 
+def register_input_shape_arguments(parser: argparse.ArgumentParser) -> None:
+    """Register the usage-shape escape hatch (shared proxy/serve parity).
+
+    Detecting the provider from the upstream URL usually derives the usage
+    contract correctly, but an unlisted gateway can detect the wrong shape
+    (an Anthropic-shape proxy under a generic domain lands on GENERIC/True,
+    and every cached request then clamps to tokens_in=0).  These flags let
+    the operator FORCE the contract; leaving both unset keeps the
+    profile-derived default (config value stays None).
+    """
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--input-includes-cached",
+        action="store_true",
+        default=None,
+        help="Force the total-shape usage contract for the upstream: reported input "
+        "INCLUDES cached tokens (OpenAI contract — prompt_tokens counts the cached "
+        "subset inside itself), so the ledger subtracts cache reads at ingest. "
+        "Overrides the auto-detected provider profile.",
+    )
+    group.add_argument(
+        "--input-excludes-cached",
+        action="store_true",
+        default=None,
+        help="Force the fresh-shape usage contract for the upstream: reported input "
+        "EXCLUDES cached tokens (Anthropic contract — input_tokens and "
+        "cache_read_input_tokens are disjoint), so the ledger records it verbatim. "
+        "Overrides the auto-detected provider profile.",
+    )
+
+
+def input_shape_override(args: argparse.Namespace) -> bool | None:
+    """Collapse the mutually exclusive flag pair into the tri-state config value."""
+    if getattr(args, "input_includes_cached", False):
+        return True
+    if getattr(args, "input_excludes_cached", False):
+        return False
+    return None
+
+
 def register_serve_cli_arguments(parser: argparse.ArgumentParser) -> None:
     """Register flags for `hivemind serve` (MCP stdio server tuning)."""
     parser.add_argument(
@@ -112,6 +152,7 @@ def register_serve_cli_arguments(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="Days of token-ledger history to keep (pruned 24h; default 90, HIVEMIND_TELEMETRY_RETENTION_DAYS env)",
     )
+    register_input_shape_arguments(parser)
 
 
 def apply_serve_cli_args_to_config(config: HiveMindConfig, args: argparse.Namespace) -> None:
@@ -153,6 +194,10 @@ def apply_serve_cli_args_to_config(config: HiveMindConfig, args: argparse.Namesp
     if getattr(args, "telemetry_retention_days", None) is not None:
         config.telemetry_retention_days = args.telemetry_retention_days
         config.normalize_runtime_limits()  # fail loudly on a bad value
+
+    override = input_shape_override(args)
+    if override is not None:
+        config.input_includes_cached = override
 
 
 def register_proxy_cli_arguments(
@@ -266,6 +311,7 @@ def register_proxy_cli_arguments(
         default=None,
         help="Max seconds a rate-limited request holds before a 429 (default: 240)",
     )
+    register_input_shape_arguments(parser)
 
 
 def hivemind_config_from_proxy_cli_args(args: argparse.Namespace) -> HiveMindConfig:
@@ -319,6 +365,10 @@ def hivemind_config_from_proxy_cli_args(args: argparse.Namespace) -> HiveMindCon
     if getattr(args, "telemetry_retention_days", None) is not None:
         config.telemetry_retention_days = args.telemetry_retention_days
         config.normalize_runtime_limits()  # fail loudly on a bad value
+
+    override = input_shape_override(args)
+    if override is not None:
+        config.input_includes_cached = override
 
     # Token ledger: explicit flag wins; MESH_TELEMETRY_DSN env is the fallback;
     # otherwise default to the same local Postgres DB as the request log

@@ -207,7 +207,9 @@ hivemind command (operator's choice).
    padded with the request-body estimate, while buffered `tokens_out` is
    `count_response_tokens`'s estimate from the response text — so its
    observance is re-read from the usage block at the call site, a step the
-   streaming path never needs (its totals are observed sums or zero).
+   streaming path never needs (its totals are observed usage maxima or
+   zero — usage blocks are cumulative snapshots, so the merge takes
+   per-key maxima rather than sums).
 12. **`tokens_in` is normalized to fresh-only AT INGEST for every provider
    shape.**  §4's "tokens from the existing counters" is shape-dependent as
    reported: Anthropic-shape upstreams (incl. DeepSeek's shim) report
@@ -219,6 +221,17 @@ hivemind command (operator's choice).
    now subtracts `cache_read` when the detected profile carries
    `input_includes_cached` (True for every OpenAI-compat profile, False for
    ANTHROPIC), clamping at 0 when a glitch reports more cached than total.
+   Detection is path-aware for the dual-shape hosts (DeepSeek, Z.AI): their
+   `/anthropic` paths are the fresh-shape shims, their bare/`/v1` bases the
+   OpenAI contract — a flat domain match would flag the OpenAI-shape
+   endpoints fresh-only and silently reintroduce the double-billing.  For
+   an upstream detection gets wrong anyway (an unlisted Anthropic-shape
+   gateway under a generic domain), `--input-includes-cached` /
+   `--input-excludes-cached` (both `proxy` and `serve`) force the shape
+   against the profile; unset, the profile-derived shape applies.  The
+   clamp's warning fires once per (provider, model) per process and drops
+   to DEBUG after — a shape mismatch can trip it on every cached request,
+   and one line must not become a flood.
    The ledger row's `tokens_in` is therefore always the fresh portion, the
    view's fresh term stays `tokens_in` alone, and `cache_hit_pct`
    (`cache_read / (cache_read + tokens_in)`) is shape-independent.
