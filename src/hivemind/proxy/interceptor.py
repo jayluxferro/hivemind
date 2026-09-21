@@ -135,6 +135,17 @@ def _discard_task_exception(task: asyncio.Task) -> None:
         pass
 
 
+# "usage glitch" clamp warnings already emitted, as (provider, model) keys.
+# The clamp guards a real invariant (cached tokens can never exceed total
+# input), but a shape-mismatched upstream can trip it on EVERY cached
+# request — the streaming merge takes per-key MAXIMA for cache fields while
+# a mis-flagged profile subtracts them from a smaller input snapshot — so
+# an unguarded WARNING would put one line per request into the log for as
+# long as the mismatch lasts.  First sighting per (provider, model) logs at
+# WARNING (a flapping provider stays visible), repeats at DEBUG.
+_USAGE_GLITCH_WARNED: set[tuple[str, str]] = set()
+
+
 class InterceptResult:
     """Result of an intercepted request."""
 
@@ -400,13 +411,18 @@ class Interceptor:
                 # Provider glitch (cached > total must be impossible):
                 # clamp so no negative ever reaches the ledger — the view
                 # would price a negative token count as negative money.
-                logger.warning(
+                # WARNING once per (provider, model) per process, DEBUG
+                # after — see _USAGE_GLITCH_WARNED.
+                glitch_key = (profile.name, _model_from_request_body(body))
+                log_glitch = logger.debug if glitch_key in _USAGE_GLITCH_WARNED else logger.warning
+                _USAGE_GLITCH_WARNED.add(glitch_key)
+                log_glitch(
                     "usage glitch: %s reported cached_tokens=%d above the %d reported "
                     "total input (model=%r); recording tokens_in=0",
                     profile.name,
                     cache_read,
                     tokens_in,
-                    _model_from_request_body(body),
+                    glitch_key[1],
                 )
                 fresh = 0
             # 0 stays 0 (all-cached is a real observation, distinct from the
@@ -618,6 +634,21 @@ class Interceptor:
 
                         # Committed SSE path: from here on the status is frozen.
                         first_chunk = True
+                        # Usage merge: per-key MAXIMA, not sums.  Provider usage
+                        # blocks are cumulative snapshots, and modern Anthropic
+                        # streams carry the full block more than once
+                        # (message_start AND message_delta both report
+                        # input_tokens + output_tokens): summing counted the
+                        # same prompt twice (100+100 for a 100-token prompt)
+                        # and, on any cached stream with a total-shape profile,
+                        # pushed the inflated total under the fresh-only clamp
+                        # on an ORDINARY request.  Max is the correct fold for
+                        # cumulative snapshots — the final snapshot IS the
+                        # billed total — and is identical to summing for shapes
+                        # that report usage exactly once (OpenAI's final chunk),
+                        # so nothing else changes.  Same rule the cache fields
+                        # below already used.  (If a future provider ever
+                        # streams per-chunk DELTAS, this is the line to revisit.)
                         total_tokens_in = 0
                         total_tokens_out = 0
                         # Cache usage: Anthropic usage blocks are cumulative
@@ -681,8 +712,8 @@ class Interceptor:
                             result.chunks_sent += 1
 
                             tokens_in, tokens_out, is_final = parse_sse_chunk(chunk)
-                            total_tokens_in += tokens_in
-                            total_tokens_out += tokens_out
+                            total_tokens_in = max(total_tokens_in, tokens_in)
+                            total_tokens_out = max(total_tokens_out, tokens_out)
                             if b'"usage"' in chunk:
                                 if self.cache_telemetry:
                                     self.cache_telemetry.observe_response(chunk)

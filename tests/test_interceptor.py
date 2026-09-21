@@ -1075,6 +1075,160 @@ async def test_telemetry_normalization_clamps_impossible_cache_counts(components
     assert recording_ledger.rows[1]["tokens_in"] == 0
 
 
+class _ModernCumulativeSSE(httpx.AsyncByteStream):
+    """MODERN Anthropic lifecycle: BOTH usage snapshots are cumulative.
+
+    message_start and message_delta each carry the full usage block
+    (input_tokens + cache_read_input_tokens + output_tokens) — unlike the
+    legacy shape (_CacheSSEStream above) where input rode only message_start
+    and output only message_delta."""
+
+    async def __aiter__(self):
+        yield (
+            b'event: message_start\ndata: {"type": "message_start", "message": {"model": "deepseek-chat", "usage": '
+            b'{"input_tokens": 100, "cache_read_input_tokens": 400000, "output_tokens": 1}}}\n\n'
+        )
+        yield b'event: content_block_delta\ndata: {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Hello"}}\n\n'
+        yield (
+            b'event: message_delta\ndata: {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, '
+            b'"usage": {"input_tokens": 100, "cache_read_input_tokens": 400000, "output_tokens": 42}}\n\n'
+        )
+        yield b'event: message_stop\ndata: {"type": "message_stop"}\n\n'
+
+
+@pytest.mark.asyncio
+async def test_streaming_cumulative_usage_snapshots_merge_by_maxima(components, recording_ledger, caplog):
+    """An ORDINARY modern cached stream reports its usage block twice
+    (cumulative snapshots).  Summing the snapshots counted one prompt twice
+    (100+100 for a 100-token input) and inflated the ledger row verbatim on
+    fresh-shape upstreams; on total-shape upstreams the inflated total plus
+    the per-key cache maxima (400k) tripped the fresh-only clamp on every
+    cached request.  The merge must take per-key MAXIMA — the final snapshot
+    IS the billed total — matching the rule the cache fields already used."""
+    import logging
+
+    def handler(request):
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=_ModernCumulativeSSE())
+
+    interceptor = _anthropic_interceptor(components)
+    interceptor._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        final = None
+        with caplog.at_level(logging.DEBUG, logger="hivemind.proxy.interceptor"):
+            async for _chunk, result in interceptor.handle_streaming_request(
+                "POST",
+                "/v1/messages",
+                {"content-type": "application/json", "accept": "text/event-stream"},
+                _stream_body(),
+                agent_id="agent-1",
+            ):
+                if result is not None:
+                    final = result
+        await _settle()
+
+        assert final is not None and final.status_code == 200
+        # The provider billed 100 input / 42 output — NOT the summed 200/43.
+        assert final.tokens_in == 100
+        assert final.tokens_out == 42
+        assert final.observed_tokens_in == 100
+        assert final.observed_tokens_out == 42
+        assert len(recording_ledger.rows) == 1
+        row = recording_ledger.rows[0]
+        assert row["tokens_in"] == 100  # fresh shape: verbatim, no clamp ran
+        assert row["tokens_out"] == 42
+        assert row["cache_read"] == 400_000  # per-key maxima across snapshots
+        # And nothing about this ordinary stream is a "usage glitch".
+        assert not [r for r in caplog.records if "usage glitch" in r.getMessage()]
+    finally:
+        await interceptor.stop()
+
+
+@pytest.mark.asyncio
+async def test_usage_glitch_warning_fires_once_per_provider_model(components, recording_ledger, caplog, monkeypatch):
+    """A shape-mismatched upstream can trip the clamp on every cached
+    request (per-key cache maxima vs a smaller input snapshot), so the
+    WARNING is rate-limited to once per (provider, model) per process;
+    repeats drop to DEBUG — still visible, never a flood."""
+    import logging
+
+    from hivemind.proxy import interceptor as interceptor_module
+    from hivemind.proxy.streaming import StreamingResult
+
+    monkeypatch.setattr(interceptor_module, "_USAGE_GLITCH_WARNED", set())
+    interceptor = _openai_interceptor(components)
+
+    def _glitch_result() -> StreamingResult:
+        result = StreamingResult(
+            status_code=200,
+            tokens_in=100_000,
+            tokens_out=10,
+            observed_tokens_in=100_000,
+            observed_tokens_out=10,
+        )
+        result._cache_read_tokens = 400_000
+        result._cache_write_tokens = None
+        return result
+
+    body = json.dumps({"model": "glm-clamp-volume", "messages": [{"role": "user", "content": "Hi"}]}).encode()
+    with caplog.at_level(logging.DEBUG, logger="hivemind.proxy.interceptor"):
+        row1 = interceptor._usage_row(_glitch_result(), body=body, agent_id="a", rate_key="a")
+        row2 = interceptor._usage_row(_glitch_result(), body=body, agent_id="a", rate_key="a")
+        # A different model under the same provider is a separate key: warns again.
+        other_body = json.dumps({"model": "glm-clamp-other", "messages": []}).encode()
+        interceptor._usage_row(_glitch_result(), body=other_body, agent_id="a", rate_key="a")
+    await _settle()
+
+    assert row1["tokens_in"] == 0 and row2["tokens_in"] == 0  # clamp still bites every time
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING and "usage glitch" in r.getMessage()]
+    debugs = [r for r in caplog.records if r.levelno == logging.DEBUG and "usage glitch" in r.getMessage()]
+    assert len(warnings) == 2  # once per (OpenAI, glm-clamp-volume) and (OpenAI, glm-clamp-other)
+    assert len(debugs) == 1  # the repeat dropped to DEBUG
+
+
+@pytest.mark.asyncio
+async def test_shape_mismatched_upstream_warns_once_across_requests(components, recording_ledger, caplog, monkeypatch):
+    """The hostile probe's P2 flood, end to end: a modern cumulative cached
+    stream against a True-flagged profile.  With the maxima merge the input
+    snapshot is the true 100 (not the summed 200), the mismatch still clamps
+    (100 fresh-shape input vs 400k cache is a genuine shape error, and the
+    clamp is the last line of the ledger's defense), but the WARNING fires
+    on the FIRST request only — request two logs DEBUG, the log keeps one
+    line instead of one per request.  The operator fix for the mismatch
+    itself is --input-excludes-cached (Finding 3's escape hatch)."""
+    import logging
+
+    from hivemind.proxy import interceptor as interceptor_module
+
+    monkeypatch.setattr(interceptor_module, "_USAGE_GLITCH_WARNED", set())
+
+    def handler(request):
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=_ModernCumulativeSSE())
+
+    interceptor = _openai_interceptor(components)
+    interceptor._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        with caplog.at_level(logging.DEBUG, logger="hivemind.proxy.interceptor"):
+            for _request in range(2):
+                async for _chunk, _result in interceptor.handle_streaming_request(
+                    "POST",
+                    "/v1/messages",
+                    {"content-type": "application/json", "accept": "text/event-stream"},
+                    _stream_body(),
+                    agent_id="agent-1",
+                ):
+                    pass
+        await _settle()
+
+        assert len(recording_ledger.rows) == 2
+        assert all(row["tokens_in"] == 0 for row in recording_ledger.rows)  # clamped both times
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING and "usage glitch" in r.getMessage()]
+        debugs = [r for r in caplog.records if r.levelno == logging.DEBUG and "usage glitch" in r.getMessage()]
+        assert len(warnings) == 1  # one line, not a flood
+        assert len(debugs) == 1  # the second request still left a DEBUG trace
+    finally:
+        await interceptor.stop()
+
+
 @pytest.mark.asyncio
 async def test_telemetry_without_a_profile_cannot_normalize(components, recording_ledger):
     """No profile, no shape knowledge: the row passes the raw observation
