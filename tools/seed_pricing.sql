@@ -149,3 +149,14 @@ VALUES
     ('Ollama (local)', 'gemma4:e4b',      0, 0, 0, 0),
     ('Ollama (local)', 'qwen3-embedding', 0, 0, 0, 0)
 ON CONFLICT (provider, model) DO NOTHING;
+
+-- Z.ai GLM models (the mesh's dominant traffic; seeded 2026-09-22 from
+-- z.ai's published list rates — see the maintenance header above for the
+-- update procedure).  glm-4.7 via Requesty's listed rate; glm-5.2 official.
+-- Cached-input rate ~1/5 of input per z.ai's cache pricing page.
+INSERT INTO mesh_telemetry.model_pricing
+    (provider, model, price_in, price_cache_read, price_cache_write, price_out)
+VALUES
+    ('Anthropic', 'glm-4.7', 0.60, 0.12, 0.60, 2.20),
+    ('Anthropic', 'glm-5.2', 1.40, 0.26, 1.40, 4.40)
+ON CONFLICT (provider, model) DO NOTHING;
