@@ -153,10 +153,12 @@ ON CONFLICT (provider, model) DO NOTHING;
 -- Z.ai GLM models (the mesh's dominant traffic; seeded 2026-09-22 from
 -- z.ai's published list rates — see the maintenance header above for the
 -- update procedure).  glm-4.7 via Requesty's listed rate; glm-5.2 official.
--- Cached-input rate ~1/5 of input per z.ai's cache pricing page.
+-- Cache-write 0.00: z.ai publishes cached-input storage as free
+-- (round-ten verification); cache_read 0.11 is z.ai's own published
+-- figure for glm-4.7 (not the 0.12 a reseller listed).
 INSERT INTO mesh_telemetry.model_pricing
     (provider, model, price_in, price_cache_read, price_cache_write, price_out)
 VALUES
-    ('Anthropic', 'glm-4.7', 0.60, 0.12, 0.60, 2.20),
-    ('Anthropic', 'glm-5.2', 1.40, 0.26, 1.40, 4.40)
+    ('Anthropic', 'glm-4.7', 0.60, 0.11, 0.00, 2.20),
+    ('Anthropic', 'glm-5.2', 1.40, 0.26, 0.00, 4.40)
 ON CONFLICT (provider, model) DO NOTHING;
