@@ -644,8 +644,7 @@ def _build_proxy(config: HiveMindConfig) -> ProxyServer:
     # semantics here, in one line, before a single request is priced.
     _resolved = resolve_provider_profile(config.upstream_url, config.input_includes_cached)
     logger.info(
-        "Ledger shape: provider=%s input_includes_cached=%s (override=%s) — "
-        "tokens_in is recorded %s",
+        "Ledger shape: provider=%s input_includes_cached=%s (override=%s) — tokens_in is recorded %s",
         _resolved.provider_type,
         _resolved.input_includes_cached,
         config.input_includes_cached,

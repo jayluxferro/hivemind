@@ -305,6 +305,22 @@ LIMIT 15
 
 # Status distribution: bucketed by the *stored* status, so the overview can
 # show 4xx vs 5xx vs 429 without another endpoint.
+# Models that took traffic in the window but have no pricing row — the
+# glm situation ran invisible for a week (53% of the ledger unpriced) and
+# nothing surfaced it.  One row per (provider, model) with its share of
+# unpriced requests, so the dashboard can name the gap the day it opens.
+_SQL_UNPRICED = f"""
+SELECT u.provider, u.model, count(*) AS requests
+FROM mesh_telemetry.token_usage u
+LEFT JOIN mesh_telemetry.model_pricing p
+  ON p.provider = u.provider AND p.model = u.model
+WHERE {_RANGE}
+  AND p.provider IS NULL
+GROUP BY u.provider, u.model
+ORDER BY count(*) DESC
+LIMIT 20
+"""
+
 _SQL_STATUS = f"""
 SELECT status, count(*) AS requests
 FROM mesh_telemetry.token_usage
@@ -757,6 +773,7 @@ class TelemetryLedger:
             latency = await _fetch_all(conn, _SQL_LATENCY, params)
             status_codes = await _fetch_all(conn, _SQL_STATUS, params)
             latency_models = await _fetch_all(conn, _SQL_LATENCY_MODELS, params)
+            unpriced = await _fetch_all(conn, _SQL_UNPRICED, params)
         return _shape_overview(
             from_ts,
             to_ts,
@@ -767,6 +784,7 @@ class TelemetryLedger:
             latency,
             status_codes,
             latency_models,
+            unpriced=unpriced,
         )
 
     async def fetch_dashboard(self, days: int = 14) -> dict[str, Any]:
@@ -1089,6 +1107,7 @@ def _shape_overview(
     latency: list[dict],
     status_codes: list[dict],
     latency_models: list[dict],
+    unpriced: list[dict] | None = None,
 ) -> dict[str, Any]:
     """Normalize dict_row output into a JSON-safe payload (dates, Decimal-free).
 
@@ -1175,6 +1194,14 @@ def _shape_overview(
             for row in latency
         ],
         "status_codes": [{"status": int(row["status"]), "requests": int(row["requests"])} for row in status_codes],
+        "unpriced_models": [
+            {
+                "provider": row["provider"],
+                "model": row["model"],
+                "requests": int(row["requests"]),
+            }
+            for row in (unpriced or [])
+        ],
         "latency_models": [
             {
                 "provider": row["provider"],

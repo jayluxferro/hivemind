@@ -45,6 +45,7 @@ from hivemind.telemetry.ledger import (
     _SQL_STATUS,
     _SQL_TOP_MODELS,
     _SQL_TOTALS,
+    _SQL_UNPRICED,
     NullLedger,
     TelemetryLedger,
     get_ledger,
@@ -477,6 +478,9 @@ def _overview_fixtures(holder: FakeConn) -> None:
                 "p95_ms": None,
             },
         ],
+        _SQL_UNPRICED: [
+            {"provider": "Anthropic", "model": "mystery-9", "requests": 42},
+        ],
         _SQL_STATUS: [
             {"status": 200, "requests": 11},
             {"status": 500, "requests": 3},
@@ -530,6 +534,7 @@ async def test_fetch_overview_shapes_payload_and_windows_the_reads():
         "cache_hit_pct": 0.3,
         "cost_usd": 0.0123,
     }
+    assert payload["unpriced_models"] == [{"provider": "Anthropic", "model": "mystery-9", "requests": 42}]
     assert payload["daily_agents"][0] == {
         "day": "2026-09-01",
         "agent_hash": "fp-abc123",
@@ -572,10 +577,11 @@ async def test_fetch_overview_shapes_payload_and_windows_the_reads():
     # Everything must be JSON-serializable (no Decimal/date leakage).
     json.dumps(payload)
 
-    # Seven queries, every one on the same half-open window: the display `to`
-    # is a date the user sees, the SQL bound is exclusive (D7).
+    # Eight queries (7 + unpriced-models), every one on the same half-open
+    # window: the display `to` is a date the user sees, the SQL bound is
+    # exclusive (D7).
     reads = _reads(holder)
-    assert len(reads) == 7
+    assert len(reads) == 8
     assert all(params == WINDOW for _, params in reads)
     # Schema DDL also ran on the reader connection (self-healing view).  The
     # multi-line statements begin with a newline, so match on content.
@@ -637,7 +643,7 @@ async def test_fetch_dashboard_alias_maps_days_onto_a_range():
     payload = await ledger.fetch_dashboard(days=7)
 
     reads = _reads(holder)
-    assert len(reads) == 7
+    assert len(reads) == 8
     window_from, window_to = reads[0][1]
     # days=7 covers today plus the six before it, so the half-open window is
     # eight days wide (the +1 day on the exclusive bound).
