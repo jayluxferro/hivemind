@@ -1,5 +1,7 @@
 """Tests for retry logic."""
 
+import anyio
+import httpx
 import pytest
 
 from hivemind.proxy.retry import (
@@ -26,6 +28,15 @@ def test_retryable_errors():
     assert is_retryable_error(Exception("connection reset by peer")) is True
     assert is_retryable_error(TimeoutError("read timeout")) is True
     assert is_retryable_error(ValueError("invalid json")) is False
+
+
+def test_retryable_empty_str_transport_errors():
+    """Empty-str transport exceptions must retry by type, not by str()."""
+    assert is_retryable_error(httpx.ReadError("")) is True
+    assert is_retryable_error(httpx.ConnectError("")) is True
+    assert is_retryable_error(httpx.ReadTimeout("")) is True
+    assert is_retryable_error(httpx.ConnectTimeout("")) is True
+    assert is_retryable_error(anyio.EndOfStream()) is True
 
 
 def test_compute_delay():

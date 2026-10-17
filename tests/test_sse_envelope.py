@@ -103,6 +103,20 @@ class _ReadErrorEmpty(httpx.AsyncByteStream):
         raise httpx.ReadError("")
 
 
+class _ReadErrorBeforeFirstChunk(httpx.AsyncByteStream):
+    """Raise an empty-str ReadError before yielding any body bytes.
+
+    The upstream has committed to SSE headers, but the very first body read
+    dies — from the interceptor's perspective no byte has been forwarded to
+    the client yet, so this is safe to retry.
+    """
+
+    async def __aiter__(self):
+        if False:  # pragma: no cover — keep __aiter__ an async generator
+            yield b""
+        raise httpx.ReadError("")
+
+
 def _parse_sse(data: bytes) -> list[dict]:
     """Parse simple ``event/data`` SSE frames into a list of dicts."""
     events: list[dict] = []
@@ -253,6 +267,55 @@ async def test_streaming_mid_stream_empty_str_error_is_typed(caplog):
         assert events[-1]["event"] == "error"
         assert events[-1]["json"]["error"]["message"].startswith("ReadError")
         assert any("mid-stream failure" in r.getMessage() and "ReadError" in r.getMessage() for r in caplog.records)
+        assert any("mid-stream failure #1" in r.getMessage() for r in caplog.records)
+        assert proxy.interceptor.admission.active == 0
+    finally:
+        await proxy.interceptor.stop()
+
+
+@pytest.mark.asyncio
+async def test_streaming_read_error_before_first_chunk_retries():
+    """Pre-first-byte empty-str ReadError is retried and eventually succeeds.
+
+    Regression: httpx.ReadError wrapping anyio.EndOfStream has an EMPTY
+    str(), so the old string-pattern retry check classified it as
+    non-retryable and surfaced a 502 even though the client had received no
+    bytes yet.
+    """
+
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        if len(calls) == 1:
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                stream=_ReadErrorBeforeFirstChunk(),
+            )
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=_HappySSEStream(),
+        )
+
+    proxy = await _proxy(max_retries=2)
+    try:
+        _install_transport(proxy, handler)
+        response = await proxy._handle_streaming_request(
+            "POST",
+            "/v1/messages",
+            {"content-type": "application/json", "accept": "text/event-stream"},
+            _stream_body("/v1/messages"),
+            agent_id=None,
+        )
+
+        assert response.status_code == 200
+        assert "text/event-stream" in response.headers.get("content-type", "")
+        body = await _consume_response(response)
+        assert b"event: message_stop" in body
+        assert len(calls) == 2, "First attempt should fail and be retried once"
+        assert proxy.interceptor.retry_policy.stats["total_retries"] == 1
         assert proxy.interceptor.admission.active == 0
     finally:
         await proxy.interceptor.stop()

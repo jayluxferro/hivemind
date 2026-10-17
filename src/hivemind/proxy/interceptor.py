@@ -217,6 +217,9 @@ class Interceptor:
         self._tls_verify = tls_verify
         self.cache_telemetry = cache_telemetry
         self._client: httpx.AsyncClient | None = None
+        # Gate-2 abort counter: visible in the mid-stream warning so a
+        # flapping upstream is countable in the logs without a dashboard.
+        self._mid_stream_aborts = 0
 
     def rebind_upstream(self, upstream_url: str, provider: ProviderProfile | None = None) -> None:
         """Point the interceptor at a new upstream (URL and provider profile).
@@ -552,6 +555,10 @@ class Interceptor:
                 for attempt in range(self.retry_policy.max_retries + 1):
                     response: httpx.Response | None = None
                     chunk_queue: asyncio.Queue | None = None
+                    # A retried request must not carry the previous attempt's
+                    # error detail into its success result (the server logs
+                    # result.error for every completed request).
+                    result.error = None
                     try:
                         try:
                             await self.rate_limiter.wait_if_throttled(agent_id=bucket)
@@ -702,9 +709,11 @@ class Interceptor:
                                 result.latency_total_ms = latency_ms
                                 self.latency_tracker.record(latency_ms, result.status_code)
                                 await self.backpressure.record_error()
+                                self._mid_stream_aborts += 1
                                 detail = f"{type(chunk).__name__}: {chunk}".rstrip(": ")
                                 logger.warning(
-                                    "HiveMind: mid-stream failure after %.1fs / %d chunks: %s",
+                                    "HiveMind: mid-stream failure #%d after %.1fs / %d chunks: %s",
+                                    self._mid_stream_aborts,
                                     latency_ms / 1000,
                                     result.chunks_sent,
                                     detail,
@@ -788,6 +797,12 @@ class Interceptor:
                         # Pre-commit failures may be retried before the client sees anything.
                         if is_retryable_error(exc) and self.retry_policy.should_retry(attempt, error=exc):
                             await self.backpressure.record_error()
+                            logger.info(
+                                "retrying upstream after %s, attempt %d/%d",
+                                detail,
+                                attempt + 1,
+                                self.retry_policy.max_retries,
+                            )
                             await self.retry_policy.wait(attempt)
                             result.retries += 1
                             continue

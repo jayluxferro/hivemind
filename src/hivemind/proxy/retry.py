@@ -10,10 +10,30 @@ import asyncio
 import logging
 import random
 
+import anyio
+import httpx
+
 logger = logging.getLogger(__name__)
 
 # Status codes that should trigger a retry
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 529}
+
+# Transport exceptions whose str() is often EMPTY (ReadError wrapping
+# anyio.EndOfStream, ConnectTimeout, ...).  Retrying these by TYPE keeps the
+# pre-commit retry path from being defeated by an empty message — the
+# string-pattern check below can only see what str(exc) says.
+_RETRYABLE_EXCEPTION_TYPES: tuple[type[BaseException], ...] = (
+    httpx.ConnectError,
+    httpx.ReadError,
+    httpx.WriteError,
+    httpx.CloseError,
+    httpx.RemoteProtocolError,
+    httpx.ReadTimeout,
+    httpx.ConnectTimeout,
+    httpx.PoolTimeout,
+    httpx.WriteTimeout,
+    anyio.EndOfStream,
+)
 
 
 def is_retryable_status(status_code: int, retryable_codes: set[int] | None = None) -> bool:
@@ -23,6 +43,8 @@ def is_retryable_status(status_code: int, retryable_codes: set[int] | None = Non
 
 def is_retryable_error(error: Exception) -> bool:
     """Check if a connection error is retryable."""
+    if isinstance(error, _RETRYABLE_EXCEPTION_TYPES):
+        return True
     error_str = str(error).lower()
     retryable_patterns = [
         "econnreset",
